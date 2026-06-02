@@ -1,0 +1,31 @@
+From: Kamil Bienkiewicz <perceivalpercy@gmail.com>
+Date: Tue, 2 Jun 2026 12:30:00 +0000
+Subject: [PATCH] arm64: dts: qcom: ipq5332: add PCIe interconnects
+
+The pcie@18000000 node was missing the interconnect (NoC) path declarations.
+pcie-qcom.c's qcom_pcie_icc_init() does devm_of_icc_get(dev, "pcie-mem") and
+devm_of_icc_get(dev, "cpu-pcie") and sets bandwidth on them; without the DT
+properties those paths come back NULL and the CPU<->PCIe fabric path is never
+given bandwidth. The result is that config-space TLPs work during enumeration
+but stall the AXI/NoC once the link goes idle afterwards (e.g. when ath12k binds
+to the QCN6274 and reads its config space, hanging the SoC).
+
+The gcc-ipq5332 interconnect provider already maps MASTER_SNOC_PCIE3_2_M /
+SLAVE_SNOC_PCIE3_2_M and MASTER_ANOC_PCIE3_2_S / SLAVE_ANOC_PCIE3_2_S, matching
+the upstream v6.16 ipq5332 PCIe node. (This is the upstream-framework equivalent
+of the vendor qti,pcie-ipq5332 driver's manual system_noc/axi-halt poke.)
+
+Signed-off-by: Kamil Bienkiewicz <perceivalpercy@gmail.com>
+---
+--- a/arch/arm64/boot/dts/qcom/ipq5332.dtsi
++++ b/arch/arm64/boot/dts/qcom/ipq5332.dtsi
+@@ -561,5 +561,9 @@
+ 			phys = <&pcie1_phy>;
+ 			phy-names = "pciephy";
+
++			interconnects = <&gcc MASTER_SNOC_PCIE3_2_M &gcc SLAVE_SNOC_PCIE3_2_M>,
++					<&gcc MASTER_ANOC_PCIE3_2_S &gcc SLAVE_ANOC_PCIE3_2_S>;
++			interconnect-names = "pcie-mem", "cpu-pcie";
++
+ 			ranges = <0x01000000 0 0x00000000 0x18200000 0 0x00100000>,
+ 				 <0x02000000 0 0x18300000 0x18300000 0 0x07d00000>;
