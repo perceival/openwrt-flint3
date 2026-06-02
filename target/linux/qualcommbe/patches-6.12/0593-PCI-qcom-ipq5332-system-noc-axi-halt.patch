@@ -1,0 +1,78 @@
+From: Kamil Bienkiewicz <perceivalpercy@gmail.com>
+Date: Tue, 2 Jun 2026 11:30:00 +0000
+Subject: [PATCH] PCI: qcom: ipq5332: program system-NoC AXI-halt
+
+On IPQ5332 the PCIe controller's AXI master is routed through the SoC
+system NoC, which has a dedicated halt register the controller driver
+must program ("axi-halt-val"). Without it, config-space TLPs succeed
+during enumeration but stall the AXI bus once the link goes idle
+afterwards -- e.g. when a driver (ath12k for the QCN6274) binds and reads
+the endpoint's config space, hanging the SoC.
+
+The vendor qti,pcie-ipq5332 node exposes this as a 6th reg region
+"system_noc" (0x0059c210) plus an "axi-halt-val" property (0x1e). Other
+qcom SoCs using cfg_2_9_0 (ipq6018/ipq8074/ipq9574) lack this reg and
+handle the equivalent inside PARF, so the new reg is optional and the
+quirk is a no-op when absent.
+
+Signed-off-by: Kamil Bienkiewicz <perceivalpercy@gmail.com>
+---
+--- a/arch/arm64/boot/dts/qcom/ipq5332.dtsi
++++ b/arch/arm64/boot/dts/qcom/ipq5332.dtsi
+@@ -541,12 +541,15 @@
+ 			      <0x18000f20 0xa8>,
+ 			      <0x18001000 0x1000>,
+ 			      <0x00088000 0x3000>,
+-			      <0x18100000 0x1000>;
++			      <0x18100000 0x1000>,
++			      <0x0059c210 0x4>;
+ 			reg-names = "dbi",
+ 				    "elbi",
+ 				    "atu",
+ 				    "parf",
+-				    "config";
++				    "config",
++				    "system_noc";
++			axi-halt-val = <0x1e>;
+ 			device_type = "pci";
+ 			linux,pci-domain = <1>;
+ 			bus-range = <0x00 0xff>;
+--- a/drivers/pci/controller/dwc/pcie-qcom.c
++++ b/drivers/pci/controller/dwc/pcie-qcom.c
+@@ -1178,7 +1178,10 @@ static int qcom_pcie_post_init_2_9_0(struct qcom_pcie *pcie)
+ 	struct dw_pcie *pci = pcie->pci;
+ 	u16 offset = dw_pcie_find_capability(pci, PCI_CAP_ID_EXP);
+ 	u32 val;
+ 	int i;
++	struct resource *noc_res;
++	void __iomem *noc;
++	u32 halt_val = 0x1e;
+
+ 	val = readl(pcie->parf + PARF_PHY_CTRL);
+ 	val &= ~PHY_TEST_PWR_DOWN;
+@@ -1216,5 +1219,25 @@ static int qcom_pcie_post_init_2_9_0(struct qcom_pcie *pcie)
+ 	for (i = 0; i < 256; i++)
+ 		writel(0, pcie->parf + PARF_BDF_TO_SID_TABLE_N + (4 * i));
+
++	/*
++	 * IPQ5332: the PCIe master's AXI path on the system NoC needs the
++	 * "axi-halt-val" written to the external "system_noc" register, or
++	 * config TLPs stall the AXI bus once the link goes idle after
++	 * enumeration. Other qcom SoCs lack this reg and handle it in PARF.
++	 */
++	noc_res = platform_get_resource_byname(to_platform_device(pci->dev),
++					       IORESOURCE_MEM, "system_noc");
++	if (noc_res) {
++		noc = devm_ioremap(pci->dev, noc_res->start,
++				   resource_size(noc_res));
++		if (noc) {
++			of_property_read_u32(pci->dev->of_node, "axi-halt-val",
++					     &halt_val);
++			writel(halt_val, noc);
++			dev_info(pci->dev, "ipq5332: system_noc axi-halt-val=%#x\n",
++				 halt_val);
++		}
++	}
++
+ 	return 0;
+ }

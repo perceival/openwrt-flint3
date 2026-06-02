@@ -30,7 +30,7 @@ IOMMU, INTx/GIC mapping, clock/PD gating (`clk_ignore_unused pd_ignore_unused` n
 effect — clocks incl. the pipe clock are up), nohz. The PCIe support is the upstream
 IPQ5332 backport (`qcom,pcie-ipq5332`, `cfg_2_9_0`); no upstream IPQ5332 board exercises
 PCIe, so this may be the first real run on this SoC. Discussion / help wanted:
-**<FORUM-THREAD-LINK>**.
+**https://forum.openwrt.org/t/gl-inet-flint-3-exploration-gl-be9300-ipq5332/250267**.
 
 ath12k is **blacklisted by default** (`base-files/etc/modprobe.d/ath12k.conf`) so the
 device boots cleanly as a wired router until this is solved.
