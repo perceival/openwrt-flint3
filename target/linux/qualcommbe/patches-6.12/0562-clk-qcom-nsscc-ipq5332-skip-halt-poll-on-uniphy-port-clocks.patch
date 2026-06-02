@@ -1,0 +1,85 @@
+From: Kamil Bienkiewicz <perceivalpercy@gmail.com>
+Date: Fri, 22 May 2026 05:00:00 +0000
+Subject: [PATCH] clk: qcom: nsscc-ipq5332: use BRANCH_HALT_SKIP on
+ uniphy_port[12]_{rx,tx}_clk and port[12]_{rx,tx}_clk
+
+The mainline clk framework's BRANCH_HALT halt-check polls CLK_OFF after
+writing ENABLE, and times out with -EBUSY if CLK_OFF stays set within
+20ms.  On IPQ5332 with a 10GBASE-R link to an external switch (Flint 3
+/ RTL8372N), the recovered RX clock from the PCS only starts ticking
+after the far-end SerDes actually transmits a valid 10GR signal — which
+in turn requires the switch driver / external entity to bring the link
+up.  So at the moment the kernel tries to enable the branch, CLK_OFF
+genuinely IS set, and the framework gives up.
+
+Vendor's qca-nss-dp / qca-ssdk stack writes the same CBCR ENABLE bit
+without ever polling CLK_OFF, which is why their setup "works" — the
+data path then comes up once the link is up, asynchronously to the
+prepare/enable call.
+
+Replace BRANCH_HALT with BRANCH_HALT_SKIP on the port1/port2 RCG sink
+branches so mainline behaves the same way: write ENABLE, don't poll.
+The kernel's other invariants (refcount tracking, parent enable
+propagation) all still hold.
+
+This is a runtime-only behavior change; the actual register layout and
+semantics are unchanged.
+
+Signed-off-by: Kamil Bienkiewicz <perceivalpercy@gmail.com>
+---
+--- a/drivers/clk/qcom/nsscc-ipq5332.c
++++ b/drivers/clk/qcom/nsscc-ipq5332.c
+@@ -752,7 +752,7 @@
+
+ static struct clk_branch nss_cc_port1_rx_clk = {
+ 	.halt_reg = 0x4fc,
+-	.halt_check = BRANCH_HALT,
++	.halt_check = BRANCH_HALT_SKIP,
+ 	.clkr = {
+ 		.enable_reg = 0x4fc,
+ 		.enable_mask = BIT(0),
+@@ -770,7 +770,7 @@
+
+ static struct clk_branch nss_cc_port1_tx_clk = {
+ 	.halt_reg = 0x504,
+-	.halt_check = BRANCH_HALT,
++	.halt_check = BRANCH_HALT_SKIP,
+ 	.clkr = {
+ 		.enable_reg = 0x504,
+ 		.enable_mask = BIT(0),
+@@ -806,7 +806,7 @@
+
+ static struct clk_branch nss_cc_port2_rx_clk = {
+ 	.halt_reg = 0x50c,
+-	.halt_check = BRANCH_HALT,
++	.halt_check = BRANCH_HALT_SKIP,
+ 	.clkr = {
+ 		.enable_reg = 0x50c,
+ 		.enable_mask = BIT(0),
+@@ -824,7 +824,7 @@
+
+ static struct clk_branch nss_cc_port2_tx_clk = {
+ 	.halt_reg = 0x514,
+-	.halt_check = BRANCH_HALT,
++	.halt_check = BRANCH_HALT_SKIP,
+ 	.clkr = {
+ 		.enable_reg = 0x514,
+ 		.enable_mask = BIT(0),
+@@ -1004,7 +1004,7 @@
+
+ static struct clk_branch nss_cc_uniphy_port1_rx_clk = {
+ 	.halt_reg = 0x57c,
+-	.halt_check = BRANCH_HALT,
++	.halt_check = BRANCH_HALT_SKIP,
+ 	.clkr = {
+ 		.enable_reg = 0x57c,
+ 		.enable_mask = BIT(0),
+@@ -1022,7 +1022,7 @@
+
+ static struct clk_branch nss_cc_uniphy_port1_tx_clk = {
+ 	.halt_reg = 0x580,
+-	.halt_check = BRANCH_HALT,
++	.halt_check = BRANCH_HALT_SKIP,
+ 	.clkr = {
+ 		.enable_reg = 0x580,
+ 		.enable_mask = BIT(0),

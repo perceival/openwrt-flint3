@@ -1,0 +1,62 @@
+From: Kamil Bienkiewicz <perceivalpercy@gmail.com>
+Date: Sat, 16 May 2026 14:30:00 +0000
+Subject: [PATCH] net: ethernet: qualcomm: ppe: Tolerate missing optional ICC
+ paths
+
+The qcom-ppe driver was written for IPQ9574 which has a full mem_noc
+interconnect mesh. IPQ5332 has a simpler NSSNOC topology and doesn't
+expose the {nssnoc_memnoc,memnoc_nssnoc,memnoc_nssnoc_1} paths via DT.
+
+Replace the bulk-or-fail icc_get with a per-path loop that warns and
+continues for missing paths. The active paths (ppe/ppe_cfg/qos_gen/
+timeout_ref) still get their bandwidth set, and the missing ones are
+skipped — equivalent to "no bandwidth voting required" for those legs
+which is consistent with IPQ5332 not having those NoC stages.
+
+Signed-off-by: Kamil Bienkiewicz <perceivalpercy@gmail.com>
+---
+--- a/drivers/net/ethernet/qualcomm/ppe/ppe.c
++++ b/drivers/net/ethernet/qualcomm/ppe/ppe.c
+@@ -118,6 +118,7 @@
+ 	struct clk_bulk_data *clks;
+ 	struct clk *clk;
+ 	int ret, i;
++	int kept;
+
+ 	for (i = 0; i < ppe_dev->num_icc_paths; i++) {
+ 		ppe_dev->icc_paths[i].name = ppe_icc_data[i].name;
+@@ -127,12 +128,28 @@
+ 						Bps_to_icc(ppe_rate);
+ 	}
+
+-	ret = devm_of_icc_bulk_get(dev, ppe_dev->num_icc_paths,
+-				   ppe_dev->icc_paths);
+-	if (ret)
+-		return ret;
++	/* Per-path icc_get — tolerate missing paths (e.g. IPQ5332 has no
++	 * mem_noc <-> nssnoc legs). For optional paths we just skip the
++	 * bandwidth setup; the active ones still get configured.
++	 */
++	kept = 0;
++	for (i = 0; i < ppe_dev->num_icc_paths; i++) {
++		struct icc_path *p;
++
++		p = devm_of_icc_get(dev, ppe_dev->icc_paths[i].name);
++		if (IS_ERR(p)) {
++			dev_info(dev, "icc path %s not available (%ld) — skipping\n",
++				 ppe_dev->icc_paths[i].name, PTR_ERR(p));
++			continue;
++		}
++		ppe_dev->icc_paths[kept].path = p;
++		ppe_dev->icc_paths[kept].name = ppe_icc_data[i].name;
++		ppe_dev->icc_paths[kept].avg_bw = ppe_dev->icc_paths[i].avg_bw;
++		ppe_dev->icc_paths[kept].peak_bw = ppe_dev->icc_paths[i].peak_bw;
++		kept++;
++	}
+
+-	ret = icc_bulk_set_bw(ppe_dev->num_icc_paths, ppe_dev->icc_paths);
++	ret = icc_bulk_set_bw(kept, ppe_dev->icc_paths);
+ 	if (ret)
+-		return ret;
++		dev_warn(dev, "icc_bulk_set_bw failed: %d — continuing\n", ret);
+

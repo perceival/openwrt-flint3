@@ -1,0 +1,102 @@
+From: Kamil Bienkiewicz <perceivalpercy@gmail.com>
+Date: Fri, 15 May 2026 08:00:00 +0000
+Subject: [PATCH] arm64: dts: qcom: ipq5332: Add NSSCC node
+
+Add the nsscc clock-controller node at 0x39b00000 referencing the
+four real input clocks IPQ5332 has (cmn_pll xo / nss_200m / nss_300m
+and GCC's GPLL0_OUT_AUX) plus PCS-provided rx/tx clocks for the
+UNIPHY0/1 slots. The UNIPHY2 slot stays as a stub fixed-clock
+because IPQ5332 has only two PCS instances (UNIPHY2 is wired on
+IPQ9574 but not here).
+
+The PCS clocks are resolved lazily — at NSSCC probe time the PCS
+driver may not yet be probed, and the RCG2 parent reference becomes
+an orphan which gets reparented when pcs-qcom-ipq9574 registers its
+clocks via ipq_pcs_clk_register(). Without these real parents,
+NSSCC's port_rx/tx_clk_src RCG muxes can't switch from XO to UNIPHY
+on link-up (the RCG2 hardware waits for the selected parent to be
+pulsing, and the 0 Hz stub never pulses).
+
+Also expose the IPQ5332 cmn-pll and nsscc binding headers via
+ipq5332.dtsi #includes so consumers can use the symbolic clock IDs.
+
+Signed-off-by: Kamil Bienkiewicz <perceivalpercy@gmail.com>
+---
+--- a/arch/arm64/boot/dts/qcom/ipq5332.dtsi
++++ b/arch/arm64/boot/dts/qcom/ipq5332.dtsi
+@@ -6,9 +6,13 @@
+  */
+ 
+ #include <dt-bindings/clock/qcom,apss-ipq.h>
++#include <dt-bindings/clock/qcom,ipq5332-cmn-pll.h>
+ #include <dt-bindings/clock/qcom,ipq5332-gcc.h>
++#include <dt-bindings/clock/qcom,ipq5332-nsscc.h>
+ #include <dt-bindings/interconnect/qcom,ipq5332.h>
++#include <dt-bindings/net/qcom,ipq9574-pcs.h>
+ #include <dt-bindings/interrupt-controller/arm-gic.h>
++#include <dt-bindings/reset/qcom,ipq5332-nsscc.h>
+ 
+ / {
+ 	interrupt-parent = <&intc>;
+@@ -16,6 +20,18 @@
+ 	#size-cells = <2>;
+ 
+ 	clocks {
++		nss_uniphy_stub: nss-uniphy-fake-clk {
++			/* Placeholder for the UNIPHY2 parent slot — IPQ5332
++			 * has only two PCS instances, but the shared
++			 * nsscc-ipq5332 driver's parent_data tables include
++			 * UNIPHY2 rx/tx for IPQ9574 compatibility. The
++			 * port3 RCGs that select these aren't used here.
++			 */
++			compatible = "fixed-clock";
++			#clock-cells = <0>;
++			clock-frequency = <312500000>;
++		};
++
+ 		ref_48mhz_clk: ref-48mhz-clk {
+ 			compatible = "fixed-clock";
+ 			#clock-cells = <0>;
+@@ -602,6 +618,42 @@
+ 				ranges;
+ 			};
+ 		};
++
++		nsscc: clock-controller@39b00000 {
++			compatible = "qcom,ipq5332-nsscc";
++			reg = <0x39b00000 0x80000>;
++			clocks = <&cmn_pll IPQ5332_XO_24MHZ_CLK>,
++				 <&cmn_pll IPQ5332_NSS_300MHZ_CLK>,
++				 <&cmn_pll IPQ5332_NSS_200MHZ_CLK>,
++				 <&gcc GPLL0>,
++				 <&pcs0 PCS_RX_CLK>,
++				 <&pcs0 PCS_TX_CLK>,
++				 <&pcs1 PCS_RX_CLK>,
++				 <&pcs1 PCS_TX_CLK>,
++				 <&nss_uniphy_stub>,
++				 <&nss_uniphy_stub>,
++				 <&gcc GCC_NSSCC_CLK>,
++				 <&gcc GCC_NSSNOC_NSSCC_CLK>,
++				 <&gcc GCC_NSSNOC_SNOC_CLK>,
++				 <&gcc GCC_NSSNOC_SNOC_1_CLK>;
++			clock-names = "cmn_pll_xo_clk",
++				      "cmn_pll_nss_300m_clk",
++				      "cmn_pll_nss_200m_clk",
++				      "gcc_gpll0_out_aux",
++				      "uniphy0_nss_rx_clk",
++				      "uniphy0_nss_tx_clk",
++				      "uniphy1_nss_rx_clk",
++				      "uniphy1_nss_tx_clk",
++				      "uniphy2_nss_rx_clk",
++				      "uniphy2_nss_tx_clk",
++				      "bus",
++				      "nssnoc",
++				      "snoc",
++				      "snoc_1";
++			#clock-cells = <1>;
++			#reset-cells = <1>;
++			#interconnect-cells = <1>;
++		};
+ 	};
+ 
+ 	timer {

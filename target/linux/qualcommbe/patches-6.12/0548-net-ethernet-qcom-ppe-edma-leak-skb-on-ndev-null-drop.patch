@@ -1,0 +1,47 @@
+From: Kamil Bienkiewicz <perceivalpercy@gmail.com>
+Date: Sat, 23 May 2026 02:30:00 +0000
+Subject: [PATCH] net: ethernet: qcom: ppe: edma: leak skb on ndev-null drop
+
+The IPQ5332 EDMA occasionally emits descriptors whose buffer the HW
+is still actively DMA-ing into (PORTID-valid, src_port_num=1, real
+frame data — but the netdev for port 1 isn't yet registered at
+that point in boot). The previous behaviour `dev_kfree_skb_any(skb)`
+in `edma_rx_get_src_dev`'s failure path freed the skb while the
+slab page was still hot under HW writes; when the slab allocator
+later recycled that page, integrity checks blew up with a
+`__slab_free` BUG at `edma_rx_napi_poll+0x3cc` (also seen at
++0x3a0 with the cons_idx-keyed lookup variant — same bug, same
+trigger).
+
+Hardening: don't free the skb in the ndev-null drop path. Let it
+leak; the next call to `edma_rx_alloc_buffer_list` will refill
+the RXFILL slot with a fresh skb. The leaked one becomes
+unreachable but doesn't corrupt the slab.
+
+This is a temporary trade-off — once eth0's netdev is registered
+before the EDMA starts pumping RX (via correct DSA ordering, or
+by holding RX disabled until the netdev exists), this branch
+should not be hit during normal operation. Boot-time spurious
+frames hit this on the way to a functional steady state.
+
+Signed-off-by: Kamil Bienkiewicz <perceivalpercy@gmail.com>
+---
+--- a/drivers/net/ethernet/qualcomm/ppe/edma_rx.c
++++ b/drivers/net/ethernet/qualcomm/ppe/edma_rx.c
+@@ -516,7 +516,15 @@ static int edma_rx_reap(struct edma_rxdesc_ring *rxdesc_ring, int budget)
+ 		if (likely(!(rxdesc_ring->head))) {
+ 			ndev = edma_rx_get_src_dev(rxdesc_stats, rxdesc_pri, skb);
+ 			if (unlikely(!ndev)) {
+-				dev_kfree_skb_any(skb);
++				/* Hardening: don't free here. The IPQ5332
++				 * EDMA hands us valid-looking descriptors
++				 * whose backing buffer the HW is still
++				 * DMA-ing into; freeing the skb causes
++				 * slab corruption when the page is
++				 * recycled. Leak instead.
++				 */
++				if (net_ratelimit())
++					pr_warn_once("ndev-null drop: leaking skb (HW DMA still hot)\n");
+ 				goto next_rx_desc;
+ 			}
+

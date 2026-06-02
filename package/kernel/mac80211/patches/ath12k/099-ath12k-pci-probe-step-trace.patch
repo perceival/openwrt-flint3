@@ -1,0 +1,144 @@
+From: Kamil Bienkiewicz <perceivalpercy@gmail.com>
+Date: Mon, 1 Jun 2026 06:00:00 +0000
+Subject: [PATCH] wifi: ath12k: pci-probe step trace (debug only)
+
+Diagnostic-only patch. Insert pr_emerg-level dev_info() before each
+major step in ath12k_pci_probe so the console trace shows exactly
+where probe hangs. On Flint 3 (IPQ5332 + QCN9274), `insmod ath12k.ko`
+hangs the kernel with zero diagnostic output, so this patch turns on
+loud, step-numbered prints in the probe path.
+
+Remove before merge — pr_emerg-priority debug spam.
+
+Signed-off-by: Kamil Bienkiewicz <perceivalpercy@gmail.com>
+---
+--- a/drivers/net/wireless/ath/ath12k/pci.c
++++ b/drivers/net/wireless/ath/ath12k/pci.c
+@@ -1575,12 +1575,17 @@ static int ath12k_pci_probe(struct pci_dev *pdev,
+ 	u32 soc_hw_version_major, soc_hw_version_minor;
+ 	int ret;
+
++	dev_emerg(&pdev->dev, "PROBE-STEP[01] enter, vendor=0x%04x device=0x%04x\n",
++		  pdev->vendor, pdev->device);
++
+ 	ab = ath12k_core_alloc(&pdev->dev, sizeof(*ab_pci), ATH12K_BUS_PCI);
+ 	if (!ab) {
+ 		dev_err(&pdev->dev, "failed to allocate ath12k base\n");
+ 		return -ENOMEM;
+ 	}
+
++	dev_emerg(&pdev->dev, "PROBE-STEP[02] core_alloc ok, ab=%p\n", ab);
++
+ 	ab->dev = &pdev->dev;
+ 	pci_set_drvdata(pdev, ab);
+ 	ab_pci = ath12k_pci_priv(ab);
+@@ -1592,12 +1597,16 @@ static int ath12k_pci_probe(struct pci_dev *pdev,
+ 	pci_set_drvdata(pdev, ab);
+ 	spin_lock_init(&ab_pci->window_lock);
+
++	dev_emerg(&pdev->dev, "PROBE-STEP[03] calling pci_claim\n");
++
+ 	ret = ath12k_pci_claim(ab_pci, pdev);
+ 	if (ret) {
+ 		ath12k_err(ab, "failed to claim device: %d\n", ret);
+ 		goto err_free_core;
+ 	}
+
++	dev_emerg(&pdev->dev, "PROBE-STEP[04] pci_claim ok\n");
++
+ 	ath12k_dbg(ab, ATH12K_DBG_BOOT, "pci probe %04x:%04x %04x:%04x\n",
+ 		   pdev->vendor, pdev->device,
+ 		   pdev->subsystem_vendor, pdev->subsystem_device);
+@@ -1614,8 +1623,11 @@ static int ath12k_pci_probe(struct pci_dev *pdev,
+ 		ab->static_window_map = true;
+ 		ab_pci->pci_ops = &ath12k_pci_ops_qcn9274;
+ 		ab->hal_rx_ops = &hal_rx_qcn9274_ops;
++		dev_emerg(&pdev->dev, "PROBE-STEP[05] reading hw_version (QCN9274 path)\n");
+ 		ath12k_pci_read_hw_version(ab, &soc_hw_version_major,
+ 					   &soc_hw_version_minor);
++		dev_emerg(&pdev->dev, "PROBE-STEP[06] hw_version_major=%u minor=%u\n",
++			  soc_hw_version_major, soc_hw_version_minor);
+ 		ab->target_mem_mode = ath12k_core_get_memory_mode(ab);
+ 		switch (soc_hw_version_major) {
+ 		case ATH12K_PCI_SOC_HW_VERSION_2:
+@@ -1664,46 +1676,64 @@ static int ath12k_pci_probe(struct pci_dev *pdev,
+ 		goto err_pci_free_region;
+ 	}
+
++	dev_emerg(&pdev->dev, "PROBE-STEP[07] calling pci_msi_alloc\n");
++
+ 	ret = ath12k_pci_msi_alloc(ab_pci);
+ 	if (ret) {
+ 		ath12k_err(ab, "failed to alloc msi: %d\n", ret);
+ 		goto err_pci_free_region;
+ 	}
+
++	dev_emerg(&pdev->dev, "PROBE-STEP[08] msi_alloc ok\n");
++
+ 	ret = ath12k_core_pre_init(ab);
+ 	if (ret)
+ 		goto err_pci_msi_free;
+
++	dev_emerg(&pdev->dev, "PROBE-STEP[09] core_pre_init ok\n");
++
+ 	ret = ath12k_pci_set_irq_affinity_hint(ab_pci, cpumask_of(0));
+ 	if (ret) {
+ 		ath12k_err(ab, "failed to set irq affinity %d\n", ret);
+ 		goto err_pci_msi_free;
+ 	}
+
++	dev_emerg(&pdev->dev, "PROBE-STEP[10] irq_affinity ok; calling mhi_register\n");
++
+ 	ret = ath12k_mhi_register(ab_pci);
+ 	if (ret) {
+ 		ath12k_err(ab, "failed to register mhi: %d\n", ret);
+ 		goto err_irq_affinity_cleanup;
+ 	}
+
++	dev_emerg(&pdev->dev, "PROBE-STEP[11] mhi_register ok\n");
++
+ 	ret = ath12k_hal_srng_init(ab);
+ 	if (ret)
+ 		goto err_mhi_unregister;
+
++	dev_emerg(&pdev->dev, "PROBE-STEP[12] hal_srng_init ok\n");
++
+ 	ret = ath12k_ce_alloc_pipes(ab);
+ 	if (ret) {
+ 		ath12k_err(ab, "failed to allocate ce pipes: %d\n", ret);
+ 		goto err_hal_srng_deinit;
+ 	}
+
++	dev_emerg(&pdev->dev, "PROBE-STEP[13] ce_alloc_pipes ok\n");
++
+ 	ath12k_pci_init_qmi_ce_config(ab);
+
++	dev_emerg(&pdev->dev, "PROBE-STEP[14] init_qmi_ce_config ok; calling config_irq\n");
++
+ 	ret = ath12k_pci_config_irq(ab);
+ 	if (ret) {
+ 		ath12k_err(ab, "failed to config irq: %d\n", ret);
+ 		goto err_ce_free;
+ 	}
+
++	dev_emerg(&pdev->dev, "PROBE-STEP[15] config_irq ok\n");
++
+ 	/* kernel may allocate a dummy vector before request_irq and
+ 	 * then allocate a real vector when request_irq is called.
+ 	 * So get msi_data here again to avoid spurious interrupt
+@@ -1710,11 +1740,15 @@ static int ath12k_pci_probe(struct pci_dev *pdev,
+ 		goto err_free_irq;
+ 	}
+
++	dev_emerg(&pdev->dev, "PROBE-STEP[16] config_msi_data ok; calling core_init\n");
++
+ 	ret = ath12k_core_init(ab);
+ 	if (ret) {
+ 		ath12k_err(ab, "failed to init core: %d\n", ret);
+ 		goto err_free_irq;
+ 	}
++
++	dev_emerg(&pdev->dev, "PROBE-STEP[17] core_init ok — probe complete\n");
+ 	return 0;
+
+ err_free_irq:

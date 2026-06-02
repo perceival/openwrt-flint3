@@ -1,0 +1,46 @@
+From: Kamil Bienkiewicz <perceivalpercy@gmail.com>
+Date: Tue, 2 Jun 2026 08:40:00 +0000
+Subject: [PATCH] debug: pci-driver: trace pci_device_probe steps for ath12k
+
+Diagnostic-only. On Flint 3 (IPQ5332 + QCN6274) loading ath12k hangs inside
+pci_register_driver before ath12k_pci_probe runs. Bracket the pre-.probe steps
+in pci_device_probe (pci_assign_irq / pcibios_alloc_irq / __pci_device_probe)
+with pr_emerg, guarded to the ath12k driver only, so the last BIND[n] printed
+before the system wedges localizes the failing step.
+
+Remove before merge.
+
+Signed-off-by: Kamil Bienkiewicz <perceivalpercy@gmail.com>
+---
+--- a/drivers/pci/pci-driver.c
++++ b/drivers/pci/pci-driver.c
+@@ -435,18 +435,29 @@ static int pci_device_probe(struct device *dev)
+ 	int error;
+ 	struct pci_dev *pci_dev = to_pci_dev(dev);
+ 	struct pci_driver *drv = to_pci_driver(dev->driver);
++	bool ath_dbg = drv && drv->name && strstr(drv->name, "ath12k");
+
++	if (ath_dbg)
++		pr_emerg("BIND[1] pci_device_probe enter dev=%s\n", dev_name(dev));
+ 	if (!pci_device_can_probe(pci_dev))
+ 		return -ENODEV;
+
++	if (ath_dbg)
++		pr_emerg("BIND[2] calling pci_assign_irq\n");
+ 	pci_assign_irq(pci_dev);
++	if (ath_dbg)
++		pr_emerg("BIND[3] pci_assign_irq done; calling pcibios_alloc_irq\n");
+
+ 	error = pcibios_alloc_irq(pci_dev);
+ 	if (error < 0)
+ 		return error;
+
++	if (ath_dbg)
++		pr_emerg("BIND[4] alloc_irq=%d; calling __pci_device_probe\n", error);
+ 	pci_dev_get(pci_dev);
+ 	error = __pci_device_probe(drv, pci_dev);
++	if (ath_dbg)
++		pr_emerg("BIND[5] __pci_device_probe returned %d\n", error);
+ 	if (error) {
+ 		pcibios_free_irq(pci_dev);
+ 		pci_dev_put(pci_dev);

@@ -1,0 +1,46 @@
+From: Kamil Bienkiewicz <perceivalpercy@gmail.com>
+Date: Sat, 23 May 2026 06:30:00 +0000
+Subject: [PATCH] clk: qcom: rcg2: demote update-stuck WARN to ratelimited
+ pr_warn
+
+update_config() WARNs (with full backtrace) when CMD_UPDATE never
+self-clears after a CFG write — but on IPQ5332 this is an EXPECTED
+condition for the per-port uniphy RCGs (nss_cc_port{1,2}_{rx,tx}_clk_src)
+at link-up time: their parent PCS UNIPHY clock is gated until the link
+partner provides a recoverable RX clock, so an UPDATE issued before
+link-stable can never sync. Hardware ignores the write; the RCG sits
+at SRC_SEL=0=XO, matching vendor's running configuration.
+
+Cost of the WARN: ~40 lines of arm64 backtrace per failure, dumped
+through the 115200-baud serial console synchronously inside the
+phylink_resolve workqueue. On `ip link set eth0 up` this fires twice
+(RX + TX RCG) in immediate succession — ~5-6s of UART-blocked CPU
+per WARN. With other prints already queued, the HW watchdog feeder
+gets starved and the board hard-resets before link-up can finish.
+
+Demote the WARN to pr_warn_ratelimited (no stack dump). The -EBUSY
+return is unchanged; callers still see the failure and decide what
+to do.
+
+This is an OpenWrt-local change; not appropriate for upstream as-is
+since other SoCs may legitimately want the stack-dump for non-IPQ
+contexts. A proper upstream version would gate on a per-RCG flag.
+
+Signed-off-by: Kamil Bienkiewicz <perceivalpercy@gmail.com>
+---
+--- a/drivers/clk/qcom/clk-rcg2.c
++++ b/drivers/clk/qcom/clk-rcg2.c
+@@ -130,7 +130,12 @@ static int update_config(struct clk_rcg2 *rcg)
+ 		udelay(1);
+ 	}
+
+-	WARN(1, "%s: rcg didn't update its configuration.", name);
++	/* On IPQ5332 the per-port uniphy RCGs intentionally fail to update
++	 * before link-stable (parent PCS clock gated). The original WARN
++	 * dumps a backtrace per failure which floods the serial console
++	 * and can starve the HW watchdog feeder — see commit log.
++	 */
++	pr_warn_ratelimited("%s: rcg didn't update its configuration.\n", name);
+ 	return -EBUSY;
+ }
+

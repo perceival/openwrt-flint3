@@ -1,0 +1,250 @@
+From: Kamil Bienkiewicz <perceivalpercy@gmail.com>
+Date: Sat, 16 May 2026 19:00:00 +0000
+Subject: [PATCH] net: ethernet: qualcomm: ppe: Tolerate missing EDMA IRQs
+ and shrink rings for IPQ5332
+
+The qcom-ppe EDMA driver hard-codes ipq9574_hw_info with 24 tx/txcmpl
+rings, 4 rx rings, max_ports=6, and demands a named IRQ for each plus
+a misc IRQ. IPQ5332 has 2 GMACs and a different IRQ layout.
+
+Three changes:
+ - Repurpose ipq9574_hw_info to match IPQ5332 ring layout (tx/txcmpl
+   start=4 num=12, rx start=12 num=4, max_ports=2). A proper fix is a
+   compat-selected hw_info table.
+ - In edma_irq_init, of_irq_get_byname failures store 0 instead of
+   aborting probe. Important: intr_info.intr_txcmpl[]/intr_rx[]/
+   intr_misc are `u32`, so a negative errno from of_irq_get_byname
+   wraps to 0xFFFFFFEA (4294967274). Cast to (int) for the comparison
+   before clamping to 0 — without the cast `<= 0` is always false on
+   wrapped negatives and the request_irq path runs with bogus IRQ
+   numbers.
+ - In edma_irq_register, skip request_irq for IRQ==0; allows partial
+   IRQ configuration during bring-up.
+
+Debug pr_emerg() markers retained while bring-up is in progress; can
+be removed once real IRQs are wired in DT for IPQ5332.
+
+Signed-off-by: Kamil Bienkiewicz <perceivalpercy@gmail.com>
+---
+--- a/drivers/net/ethernet/qualcomm/ppe/edma.c
++++ b/drivers/net/ethernet/qualcomm/ppe/edma.c
+@@ -92,34 +92,34 @@
+ 	.num_rings = 4,
+ };
+ 
+-/* Rx ring info for IPQ9574. */
++/* Rx ring info — repurposed for IPQ5332 (start=12 num=4 vs 20/4). */
+ static struct edma_ring_info ipq9574_rx_ring_info = {
+ 	.max_rings = 24,
+-	.ring_start = 20,
++	.ring_start = 12,
+ 	.num_rings = 4,
+ };
+ 
+-/* Tx ring info for IPQ9574. */
++/* Tx ring info — IPQ5332 (start=4 num=12). */
+ static struct edma_ring_info ipq9574_tx_ring_info = {
+ 	.max_rings = 32,
+-	.ring_start = 8,
+-	.num_rings = 24,
++	.ring_start = 4,
++	.num_rings = 12,
+ };
+ 
+-/* Tx complete ring info for IPQ9574. */
++/* Tx complete ring info — matches tx layout. */
+ static struct edma_ring_info ipq9574_txcmpl_ring_info = {
+ 	.max_rings = 32,
+-	.ring_start = 8,
+-	.num_rings = 24,
++	.ring_start = 4,
++	.num_rings = 12,
+ };
+ 
+-/* HW info for IPQ9574. */
++/* HW info — IPQ5332 has 2 user-facing GMACs. */
+ static struct edma_hw_info ipq9574_hw_info = {
+ 	.rxfill = &ipq9574_rxfill_ring_info,
+ 	.rx = &ipq9574_rx_ring_info,
+ 	.tx = &ipq9574_tx_ring_info,
+ 	.txcmpl = &ipq9574_txcmpl_ring_info,
+-	.max_ports = 6,
++	.max_ports = 2,
+ 	.napi_budget_rx = 128,
+ 	.napi_budget_tx = 512,
+ };
+@@ -366,15 +366,18 @@
+ 	struct ppe_device *ppe_dev = edma_ctx->ppe_dev;
+ 	struct edma_ring_info *rx = hw_info->rx;
+ 	struct device *dev = ppe_dev->dev;
+-	int ret;
++	int ret = 0;
+ 	u32 i;
+ 
++	pr_emerg("DEBUG: edma_irq_register enter\n");
++
+ 	/* Request IRQ for TXCMPL rings. */
+ 	edma_txcmpl_irq_name = kzalloc((sizeof(char *) * txcmpl->num_rings), GFP_KERNEL);
+ 	if (!edma_txcmpl_irq_name)
+ 		return -ENOMEM;
+ 
+ 	for (i = 0; i < txcmpl->num_rings; i++) {
++		pr_emerg("DEBUG: txcmpl iter %u, intr=%d\n", i, edma_ctx->intr_info.intr_txcmpl[i]);
+ 		edma_txcmpl_irq_name[i] = kzalloc((sizeof(char *) * EDMA_IRQ_NAME_SIZE),
+ 						  GFP_KERNEL);
+ 		if (!edma_txcmpl_irq_name[i]) {
+@@ -385,12 +388,17 @@
+ 		snprintf(edma_txcmpl_irq_name[i], EDMA_IRQ_NAME_SIZE, "edma_txcmpl_%d",
+ 			 txcmpl->ring_start + i);
+ 
++		if (!edma_ctx->intr_info.intr_txcmpl[i])
++			continue;
++
+ 		irq_set_status_flags(edma_ctx->intr_info.intr_txcmpl[i], IRQ_DISABLE_UNLAZY);
++		pr_emerg("DEBUG: about to request_irq txcmpl %u: %d\n", i, edma_ctx->intr_info.intr_txcmpl[i]);
+ 
+ 		ret = request_irq(edma_ctx->intr_info.intr_txcmpl[i],
+ 				  edma_tx_handle_irq, IRQF_SHARED,
+ 				  edma_txcmpl_irq_name[i],
+ 				  (void *)&edma_ctx->txcmpl_rings[i]);
++		pr_emerg("DEBUG: request_irq txcmpl %u returned %d\n", i, ret);
+ 		if (ret) {
+ 			pr_err("TXCMPL ring IRQ:%d request %d failed\n",
+ 			       edma_ctx->intr_info.intr_txcmpl[i], i);
+@@ -422,6 +430,9 @@
+ 		snprintf(edma_rxdesc_irq_name[i], 20, "edma_rxdesc_%d",
+ 			 rx->ring_start + i);
+ 
++		if (!edma_ctx->intr_info.intr_rx[i])
++			continue;
++
+ 		irq_set_status_flags(edma_ctx->intr_info.intr_rx[i], IRQ_DISABLE_UNLAZY);
+ 
+ 		ret = request_irq(edma_ctx->intr_info.intr_rx[i],
+@@ -441,18 +452,22 @@
+ 	}
+ 
+ 	/* Request Misc IRQ */
+-	ret = request_irq(edma_ctx->intr_info.intr_misc, edma_misc_handle_irq,
+-			  IRQF_SHARED, "edma_misc",
+-			  (void *)dev);
+-	if (ret) {
+-		pr_err("MISC IRQ:%d request failed\n",
+-		       edma_ctx->intr_info.intr_misc);
+-		goto misc_intr_req_fail;
++	if (edma_ctx->intr_info.intr_misc) {
++		ret = request_irq(edma_ctx->intr_info.intr_misc, edma_misc_handle_irq,
++				  IRQF_SHARED, "edma_misc",
++				  (void *)dev);
++		if (ret) {
++			pr_err("MISC IRQ:%d request failed\n",
++			       edma_ctx->intr_info.intr_misc);
++			goto misc_intr_req_fail;
++		}
+ 	}
+ 
++	pr_emerg("DEBUG: edma_irq_register success, ret=%d\n", ret);
+ 	return 0;
+ 
+ misc_intr_req_fail:
++	pr_emerg("DEBUG: irq_register hit misc_intr_req_fail, ret=%d\n", ret);
+ 	/* Free IRQ for RXDESC rings */
+ 	for (i = 0; i < rx->num_rings; i++) {
+ 		synchronize_irq(edma_ctx->intr_info.intr_rx[i]);
+@@ -460,20 +475,25 @@
+ 			 (void *)&edma_ctx->rx_rings[i]);
+ 	}
+ rx_desc_ring_intr_req_fail:
++	pr_emerg("DEBUG: irq_register hit rx_desc_ring_intr_req_fail, ret=%d\n", ret);
+ 	for (i = 0; i < rx->num_rings; i++)
+ 		kfree(edma_rxdesc_irq_name[i]);
+ rxdesc_ring_irq_name_alloc_fail:
++	pr_emerg("DEBUG: irq_register hit rxdesc_ring_irq_name_alloc_fail, ret=%d\n", ret);
+ 	kfree(edma_rxdesc_irq_name);
+ rxdesc_irq_name_alloc_fail:
++	pr_emerg("DEBUG: irq_register hit rxdesc_irq_name_alloc_fail, ret=%d\n", ret);
+ 	for (i = 0; i < txcmpl->num_rings; i++) {
+ 		synchronize_irq(edma_ctx->intr_info.intr_txcmpl[i]);
+ 		free_irq(edma_ctx->intr_info.intr_txcmpl[i],
+ 			 (void *)&edma_ctx->txcmpl_rings[i]);
+ 	}
+ txcmpl_ring_intr_req_fail:
++	pr_emerg("DEBUG: irq_register hit txcmpl_ring_intr_req_fail, ret=%d\n", ret);
+ 	for (i = 0; i < txcmpl->num_rings; i++)
+ 		kfree(edma_txcmpl_irq_name[i]);
+ txcmpl_ring_irq_name_alloc_fail:
++	pr_emerg("DEBUG: irq_register hit txcmpl_ring_irq_name_alloc_fail, ret=%d\n", ret);
+ 	kfree(edma_txcmpl_irq_name);
+ 
+ 	return ret;
+@@ -491,6 +511,8 @@
+ 	struct device_node *edma_np;
+ 	u32 i;
+ 
++	pr_emerg("DEBUG: edma_irq_init enter, txcmpl->num_rings=%u rx->num_rings=%u\n",
++		 txcmpl->num_rings, rx->num_rings);
+ 	pdev = to_platform_device(dev);
+ 	edma_np = of_get_child_by_name(dev->of_node, "edma");
+ 	edma_ctx->intr_info.intr_txcmpl = kzalloc((sizeof(*edma_ctx->intr_info.intr_txcmpl) *
+@@ -505,12 +527,10 @@
+ 		snprintf(edma_irq_name, sizeof(edma_irq_name), "edma_txcmpl_%d",
+ 			 txcmpl->ring_start + i);
+ 		edma_ctx->intr_info.intr_txcmpl[i] = of_irq_get_byname(edma_np, edma_irq_name);
+-		if (edma_ctx->intr_info.intr_txcmpl[i] < 0) {
+-			dev_err(dev, "%s: txcmpl_info.intr[%u] irq get failed\n",
+-				edma_np->name, i);
+-			of_node_put(edma_np);
+-			kfree(edma_ctx->intr_info.intr_txcmpl);
+-			return edma_ctx->intr_info.intr_txcmpl[i];
++		if ((int)edma_ctx->intr_info.intr_txcmpl[i] <= 0) {
++			dev_warn(dev, "%s: %s irq get failed (%d) — disabling\n",
++				 edma_np->name, edma_irq_name, edma_ctx->intr_info.intr_txcmpl[i]);
++			edma_ctx->intr_info.intr_txcmpl[i] = 0;
+ 		}
+ 
+ 		dev_dbg(dev, "%s: intr_info.intr_txcmpl[%u] = %u\n",
+@@ -530,13 +550,10 @@
+ 		snprintf(edma_irq_name, sizeof(edma_irq_name), "edma_rxdesc_%d",
+ 			 rx->ring_start + i);
+ 		edma_ctx->intr_info.intr_rx[i] = of_irq_get_byname(edma_np, edma_irq_name);
+-		if (edma_ctx->intr_info.intr_rx[i] < 0) {
+-			dev_err(dev, "%s: rx_queue_map_info.intr[%u] irq get failed\n",
+-				edma_np->name, i);
+-			of_node_put(edma_np);
+-			kfree(edma_ctx->intr_info.intr_rx);
+-			kfree(edma_ctx->intr_info.intr_txcmpl);
+-			return edma_ctx->intr_info.intr_rx[i];
++		if ((int)edma_ctx->intr_info.intr_rx[i] <= 0) {
++			dev_warn(dev, "%s: %s irq get failed (%d) — disabling\n",
++				 edma_np->name, edma_irq_name, edma_ctx->intr_info.intr_rx[i]);
++			edma_ctx->intr_info.intr_rx[i] = 0;
+ 		}
+ 
+ 		dev_dbg(dev, "%s: intr_info.intr_rx[%u] = %u\n",
+@@ -545,12 +562,10 @@
+ 
+ 	/* Get misc IRQ number. */
+ 	edma_ctx->intr_info.intr_misc = of_irq_get_byname(edma_np, "edma_misc");
+-	if (edma_ctx->intr_info.intr_misc < 0) {
+-		dev_err(dev, "%s: misc_intr irq get failed\n", edma_np->name);
+-		of_node_put(edma_np);
+-		kfree(edma_ctx->intr_info.intr_rx);
+-		kfree(edma_ctx->intr_info.intr_txcmpl);
+-		return edma_ctx->intr_info.intr_misc;
++	if ((int)edma_ctx->intr_info.intr_misc <= 0) {
++		dev_warn(dev, "%s: edma_misc irq get failed (%d) — disabling\n",
++			 edma_np->name, edma_ctx->intr_info.intr_misc);
++		edma_ctx->intr_info.intr_misc = 0;
+ 	}
+ 
+ 	of_node_put(edma_np);
+@@ -909,7 +924,9 @@
+ 		return ret;
+ 	}
+ 
++	pr_emerg("DEBUG: calling edma_irq_register\n");
+ 	ret = edma_irq_register();
++	pr_emerg("DEBUG: edma_irq_register returned %d\n", ret);
+ 	if (ret) {
+ 		dev_err(dev, "Error in irq registration\n");
+ 		kfree(edma_ctx->intr_info.intr_rx);

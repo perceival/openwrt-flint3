@@ -1,0 +1,41 @@
+From: Kamil Bienkiewicz <perceivalpercy@gmail.com>
+Date: Thu, 14 May 2026 07:00:00 +0000
+Subject: [PATCH] dt-bindings: clock: qcom: Add CMN PLL support for IPQ5332 SoC
+
+The CMN PLL block in the IPQ5332 SoC supplies four fixed-rate output
+clocks: XO (24 MHz) and sleep (32 kHz) to GCC, and two NSS reference
+clocks (200 MHz and 300 MHz) to the NSSCC clock controller that drives
+the PPE/EDMA/UNIPHY ethernet stack.
+
+The reference input is the same on-board source the GCC 12gpll block
+consumes; for ipq5332-cmn-pll the driver locks the internal VCO and
+fans out these four fixed taps.
+
+Signed-off-by: Kamil Bienkiewicz <perceivalpercy@gmail.com>
+---
+ include/dt-bindings/clock/qcom,ipq5332-cmn-pll.h | 19 +++++++++++++++++++
+ 1 file changed, 19 insertions(+)
+ create mode 100644 include/dt-bindings/clock/qcom,ipq5332-cmn-pll.h
+
+--- /dev/null
++++ b/include/dt-bindings/clock/qcom,ipq5332-cmn-pll.h
+@@ -0,0 +1,19 @@
++/* SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause) */
++/*
++ * Copyright (c) 2026, GL.iNet Flint 3 mainline port.
++ */
++
++#ifndef _DT_BINDINGS_CLK_QCOM_IPQ5332_CMN_PLL_H
++#define _DT_BINDINGS_CLK_QCOM_IPQ5332_CMN_PLL_H
++
++/* CMN PLL core clock. */
++#define IPQ5332_CMN_PLL_CLK			0
++
++/* The fixed-rate output clocks from CMN PLL of IPQ5332. */
++#define IPQ5332_XO_24MHZ_CLK			1
++#define IPQ5332_SLEEP_32KHZ_CLK			2
++#define IPQ5332_NSS_200MHZ_CLK			3
++#define IPQ5332_NSS_300MHZ_CLK			4
++#define IPQ5332_ETH_50MHZ_CLK			5
++
++#endif

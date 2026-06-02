@@ -1,0 +1,29 @@
+From: Kamil Bienkiewicz <perceivalpercy@gmail.com>
+Date: Sun, 17 May 2026 14:05:00 +0000
+Subject: [PATCH] net: ethernet: qcom: ppe: call NSSCC force_port_pcs after reset
+ 
+Call qcom_nsscc_ipq5332_force_port_pcs() after the reset cycle and
+clk_set_rate calls in ppe_port_mac_reset_and_set_rate. Restores the
+originally-working IPQ5332 USXGMII link-up sequence verified earlier:
+eth1 came up at 1Gbps and TX worked (105 packets / 0 errors) with
+this call present; without it, link doesn't latch.
+ 
+Signed-off-by: Kamil Bienkiewicz <perceivalpercy@gmail.com>
+---
+--- a/drivers/net/ethernet/qualcomm/ppe/ppe_port.c	2026-05-17 19:03:13.015039687 +0200
++++ b/drivers/net/ethernet/qualcomm/ppe/ppe_port.c	2026-05-17 19:05:51.803239936 +0200
+@@ -840,6 +840,14 @@
+ 
+ 	clk_set_rate(ppe_port->clks[PPE_PORT_CLK_RST_RX], rate);
+ 	clk_set_rate(ppe_port->clks[PPE_PORT_CLK_RST_TX], rate);
++
++	/* Provided by drivers/clk/qcom/nsscc-ipq5332.c (patch 0990). */
++	{
++		extern int qcom_nsscc_ipq5332_force_port_pcs(unsigned int port,
++							     bool tx);
++		qcom_nsscc_ipq5332_force_port_pcs(ppe_port->port_id, false);
++		qcom_nsscc_ipq5332_force_port_pcs(ppe_port->port_id, true);
++	}
+ 	return 0;
+ }
+ 

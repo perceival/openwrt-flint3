@@ -1,0 +1,79 @@
+From: Kamil Bienkiewicz <perceivalpercy@gmail.com>
+Date: Sat, 23 May 2026 06:50:00 +0000
+Subject: [PATCH] net: ethernet: qcom: ppe: edma: skip null skb from stale
+ index
+
+After commit 0547 (index-based opaque skb tracking), edma_rx_reap
+looks up the per-descriptor skb via the ring index in word2:
+
+    next_skb = rxdesc_ring->rxfill->skbs[idx];
+    rxdesc_ring->rxfill->skbs[idx] = NULL;
+
+The slot is NULLed on each consume so duplicate / stale descriptors
+referring to the same index can't double-process. But the read result
+itself is never checked. When the IPQ5332 EDMA emits a phantom or
+duplicate descriptor whose index points to an already-consumed slot,
+`next_skb` is NULL.
+
+The next loop iteration does:
+
+    skb = next_skb;                       // skb = NULL
+    ...
+    skb->dev = ndev;                       // NULL deref at offset 16
+
+This trips the link-up-time crash captured in the kernel log:
+
+    Unable to handle kernel write to read-only memory at virtual
+      address 0000000000000010
+    pc : edma_rx_napi_poll+0x138
+    Internal error: Oops: 0000000096000045 [#1] SMP
+    Kernel panic - not syncing: Oops: Fatal exception in interrupt
+
+It reliably fires within ~20s of lan1 link-up on Flint 3.
+
+Guard each of the three skbs[] lookups: if the slot was already NULL,
+warn-once-rate-limited and stop processing the batch (or skip this
+descriptor in the inner-loop scatter case). The HW pointer/state
+mismatch is a separate issue but the kernel must not crash.
+
+Signed-off-by: Kamil Bienkiewicz <perceivalpercy@gmail.com>
+---
+--- a/drivers/net/ethernet/qualcomm/ppe/edma_rx.c
++++ b/drivers/net/ethernet/qualcomm/ppe/edma_rx.c
+@@ -487,6 +487,11 @@ static int edma_rx_reap(struct edma_rxdesc_ring *rxdesc_ring, int budget)
+ 		u32 idx = next_rxdesc_pri->word2 & EDMA_RX_RING_SIZE_MASK;
+ 		next_skb = rxdesc_ring->rxfill->skbs[idx];
+ 		rxdesc_ring->rxfill->skbs[idx] = NULL;
++		if (unlikely(!next_skb)) {
++			pr_warn_ratelimited("edma_rx_reap: NULL skb at idx %u (stale/dup desc); aborting batch\n",
++					    idx);
++			return 0;
++		}
+ 	}
+
+ 	work_leftover = work_to_do & (EDMA_RX_MAX_PROCESS - 1);
+@@ -538,6 +543,12 @@ static int edma_rx_reap(struct edma_rxdesc_ring *rxdesc_ring, int budget)
+ 					  EDMA_RX_RING_SIZE_MASK;
+ 				next_skb = rxdesc_ring->rxfill->skbs[idx];
+ 				rxdesc_ring->rxfill->skbs[idx] = NULL;
++				if (unlikely(!next_skb)) {
++					pr_warn_ratelimited("edma_rx_reap: NULL skb (linear next) at idx %u\n",
++							    idx);
++					dev_kfree_skb_any(skb);
++					break;
++				}
+
+ 				if (unlikely(!
+ 					     edma_rx_handle_linear_packets(rxdesc_ring,
+@@ -552,6 +563,11 @@ static int edma_rx_reap(struct edma_rxdesc_ring *rxdesc_ring, int budget)
+ 			u32 idx = next_rxdesc_pri->word2 & EDMA_RX_RING_SIZE_MASK;
+ 			next_skb = rxdesc_ring->rxfill->skbs[idx];
+ 			rxdesc_ring->rxfill->skbs[idx] = NULL;
++			if (unlikely(!next_skb)) {
++				pr_warn_ratelimited("edma_rx_reap: NULL skb (scatter next) at idx %u\n",
++						    idx);
++				break;
++			}
+ 		}
+
+ 		/* Handle scatter frame processing for first/middle/last segments. */

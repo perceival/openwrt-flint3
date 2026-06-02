@@ -1,0 +1,87 @@
+From: Kamil Bienkiewicz <perceivalpercy@gmail.com>
+Date: Fri, 29 May 2026 07:00:00 +0000
+Subject: [PATCH] net: ethernet: qcom: ppe: xgmac enable MTL store-and-forward
+
+The IPQ5332 XGMAC powers up with the MTL transmit FIFO in cut-through
+mode (TSF=0) and a small Transmit Threshold (TTC). On this SoC that
+combination causes the MAC to start transmitting as soon as a few
+dozen bytes are in the TX FIFO; for anything bigger than a tiny frame
+the rest of the payload does not arrive at the FIFO in time and the
+MAC reports `tx_underflow_err` and drops the frame on the wire. The
+behaviour is sharp and reproducible from userspace:
+
+    size 64    10/10 received (100%)
+    size 200   3/10 received (30%)
+    size 500   0/10 received (100% loss)
+    size 1000  0/10 received (100% loss)
+    size 1400  0/10 received (100% loss)
+
+`ip -s link show eth0` (and `/proc/net/dev`) tracks the count exactly:
+one TX error + one TX fifo error per failed frame, because the
+`tx_errors` accounting uses `xgmib_tx_underflow_err` as its source.
+Confirmed it is not an offload bug (disabling NETIF_F_HW_CSUM +
+NETIF_F_TSO did not help), not an MTU issue (smaller MTU did not
+help), and not an AXI burst-length issue (toggling EDMA_DMAR_BURST_LEN
+made things worse).
+
+The fix is to take the XGMAC out of cut-through mode by setting
+TSF=1 (Store-and-Forward) in MTL_TXQ_OPERATION_MODE, register at
+XGMAC_BASE + 0x1100. With Store-and-Forward, the MAC waits until the
+full frame is buffered in the TX FIFO before driving the MII/SGMII,
+which trivially avoids the underflow window. Also set TXQEN=2 so the
+queue is enabled in 802.1Qav-style mode (the value the QSDK vendor
+driver uses for the same register).
+
+Applied after the regular XGMAC RX-enable in `ppe_port_xgmac_link_up`
+so the queue config is in place before any frame is offered to the
+MAC.
+
+Validated on Flint 3:
+
+    --- 192.168.1.2 ping statistics ---
+    10 packets transmitted, 10 packets received, 0% packet loss
+    (s=64, 200, 500, 1000, 1400 all 100%, sub-ms RTT)
+
+    [  5]   0.00-10.09 sec   861 MBytes   716 Mbits/sec  receiver
+    (`iperf3 -c 192.168.1.2 -t 10` -- 942 Mbit/s steady-state per
+     1s sample, slightly lower averaged because of the first second
+     of TCP slow-start; this is wire-rate for the 1 Gbps host NIC.)
+
+After-fix MIB: eth0 TX errs=0 / TX fifo=0 over a full iperf3 run
+(was 126/126 for a 50-frame mixed-size burst before).
+
+Signed-off-by: Kamil Bienkiewicz <perceivalpercy@gmail.com>
+---
+--- a/drivers/net/ethernet/qualcomm/ppe/ppe_port.c
++++ b/drivers/net/ethernet/qualcomm/ppe/ppe_port.c
+@@ -793,6 +793,30 @@ static int ppe_port_xgmac_link_up(struct ppe_port *ppe_port,
+ 	/* Enable XGMAC RX*/
+ 	ret = regmap_update_bits(ppe_dev->regmap, reg + XGMAC_RX_CONFIG_ADDR,
+ 				 XGMAC_RXEN, XGMAC_RXEN);
++	if (ret)
++		return ret;
++
++	/* MTL_TXQ0_OPERATION_MODE @ XGMAC_BASE+0x1100.
++	 * Set TSF=1 (Store-and-Forward) so the XGMAC buffers the entire
++	 * frame before transmitting. Without this, on this SoC TX FIFO
++	 * underflows for frames >~200 bytes -- XGMAC reports
++	 * tx_underflow_err and the frame is dropped before reaching the
++	 * switch. With TSF=1 the FIFO threshold (TTC) becomes irrelevant;
++	 * the MAC waits for the full frame and then sends at line rate.
++	 * Bits: TXQEN=2 (bits 3:2), TSF=1 (bit 1).
++	 */
++	{
++		u32 mtl_val;
++		u32 mtl_mask;
++		u32 mtl_reg = reg + 0x1100;
++
++		mtl_mask = GENMASK(3, 1);
++		mtl_val = BIT(1) | (2u << 2);  /* TSF=1, TXQEN=2 */
++		ret = regmap_update_bits(ppe_dev->regmap, mtl_reg,
++					 mtl_mask, mtl_val);
++		if (ret)
++			return ret;
++	}
+
+ 	return ret;
+ }

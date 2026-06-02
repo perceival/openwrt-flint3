@@ -1,0 +1,37 @@
+From: Percival <perceivalpercy@gmail.com>
+Date: Thu, 14 May 2026 00:55:00 +0000
+Subject: [PATCH] wifi: ath12k: allow forcing dualmac fw via DT property
+
+QCN9274 boards that physically wire out both MAC0 and MAC1 (e.g. used as
+combined 5 GHz + 6 GHz radio on a single chip, like GL.iNet Flint 3) need
+the dualmac AMSS firmware. ath12k selects between single-mac and dualmac
+firmware based on a board-id flag read from chip OTP fuses, but on boards
+where the OTP is not provisioned (board_id == 0xff), the driver falls back
+to single-mac firmware. The chip then fails to bring up MAC1 ("HTC Service
+WMI MAC1 connect request failed").
+
+Allow boards to express the dualmac requirement via a DT property
+`qcom,ath12k-prefer-dualmac` on the PCIe wifi child node. When the property
+is present and OTP didn't already indicate dualmac, force dualmac firmware
+selection.
+
+Signed-off-by: Percival <perceivalpercy@gmail.com>
+---
+--- a/drivers/net/wireless/ath/ath12k/mhi.c
++++ b/drivers/net/wireless/ath/ath12k/mhi.c
+@@ -344,6 +344,15 @@ static int ath12k_mhi_register(struct at
+ 		}
+ 	}
+
++	if (!dualmac &&
++	    device_property_read_bool(ab->dev, "qcom,ath12k-prefer-dualmac")) {
++		dualmac = true;
++		ath12k_dbg(ab, ATH12K_DBG_BOOT,
++			   "dualmac fw forced via DT (OTP board_id %#x lacks dualmac flag)\n",
++			   ath12k_pci_read32(ab, ab->hw_params->otp_board_id_register) &
++			   OTP_BOARD_ID_MASK);
++	}
++
+ 	if (dualmac) {
+ 		if (ab->fw.amss_dualmac_data && ab->fw.amss_dualmac_len > 0) {
+ 			/* use MHI firmware file from firmware-N.bin */

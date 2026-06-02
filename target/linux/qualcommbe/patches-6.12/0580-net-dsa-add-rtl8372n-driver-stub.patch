@@ -1,0 +1,50 @@
+From: Kamil Bienkiewicz <perceivalpercy@gmail.com>
+Date: Thu, 21 May 2026 06:00:00 +0000
+Subject: [PATCH] net: dsa: add rtl8372n driver scaffolding
+
+Adds a new standalone driver for the Realtek RTL8372N / RTL8373 family
+of managed switches that hang off the host SoC's MDIO bus, used in
+IPQ5332-based routers (GL.iNet Flint 3 GL-BE9300 and likely others).
+
+This patch only adds the Kconfig + Makefile entries. The .c file itself
+lives at target/linux/qualcommbe/files-6.12/drivers/net/dsa/rtl8372n.c
+in this work tree so we can iterate on it without re-generating a
+patch every edit.
+
+First-cut driver covers probe + chip-ID detection only — enough to
+prove the DT binding and the MDIO indirect protocol. Port + VLAN
+support is follow-up work.
+
+Signed-off-by: Kamil Bienkiewicz <perceivalpercy@gmail.com>
+---
+--- a/drivers/net/dsa/Kconfig
++++ b/drivers/net/dsa/Kconfig
+@@ -161,4 +161,18 @@
+ 	  This enables support for the Vitesse VSC7385, VSC7388, VSC7395
+ 	  and VSC7398 SparX integrated ethernet switches, connected over
+ 	  a CPU-attached address bus and work in memory-mapped I/O mode.
++config NET_DSA_RTL8372N
++	tristate "Realtek RTL8372N / RTL8373 family switch support"
++	depends on NET_DSA && OF
++	select NET_DSA_TAG_RTL8_4
++	help
++	  Enable support for the Realtek RTL8372N and RTL8373 family of
++	  managed switches. Used in IPQ5332-based routers (e.g. GL.iNet
++	  Flint 3 GL-BE9300) where the LAN ports sit behind a Realtek
++	  switch chip attached on the SoC's MDIO bus.
++
++	  The first-cut driver provides probe + chip-ID detection only;
++	  port and VLAN support is still under development.
++
++
+ endmenu
+--- a/drivers/net/dsa/Makefile
++++ b/drivers/net/dsa/Makefile
+@@ -18,6 +18,7 @@
+ obj-$(CONFIG_NET_DSA_VITESSE_VSC73XX) += vitesse-vsc73xx-core.o
+ obj-$(CONFIG_NET_DSA_VITESSE_VSC73XX_PLATFORM) += vitesse-vsc73xx-platform.o
+ obj-$(CONFIG_NET_DSA_VITESSE_VSC73XX_SPI) += vitesse-vsc73xx-spi.o
++obj-$(CONFIG_NET_DSA_RTL8372N)	+= rtl8372n.o
+ obj-y				+= b53/
+ obj-y				+= hirschmann/
+ obj-y				+= microchip/

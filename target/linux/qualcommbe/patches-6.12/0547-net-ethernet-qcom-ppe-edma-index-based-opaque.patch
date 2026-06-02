@@ -1,0 +1,166 @@
+From: Kamil Bienkiewicz <perceivalpercy@gmail.com>
+From: Kamil Bienkiewicz <perceivalpercy@gmail.com>
+Date: Fri, 22 May 2026 16:30:00 +0000
+Subject: [PATCH] net: ethernet: qcom: ppe: edma: index-based opaque skb tracking
+
+On IPQ5332 the EDMA hardware doesn't preserve the descriptor opaque
+field across RXFILL->RXDESC in a way that lets the kernel reconstruct
+the original 64-bit skb pointer. Even with the LP64 fix (0546)
+storing both halves on the kernel side, the kernel reads back
+truncated/garbage skb pointers from RXDESC and oopses.
+
+Replace the pointer-in-opaque scheme with a ring-index opaque +
+parallel kernel-side skbs[] array:
+
+- struct edma_rxfill_ring gets a count-sized skbs array.
+- edma_cfg_rx_fill_ring_dma_alloc allocates it; cleanup walks it
+  and frees still-populated entries.
+- edma_rx_alloc_buffer_list stores the skb in
+  rxfill_ring->skbs[prod_idx] and writes only the ring index into
+  word2. word3 is explicitly zeroed.
+- edma_rx_napi_poll's reap path reads opaque as a u32 ring index,
+  looks up the real skb in skbs[], and NULLs the slot to defend
+  against duplicate/stale descriptors referring to the same index.
+
+Sidesteps the word3 preservation question entirely: only the
+small ring index in word2 needs to survive the HW pipeline.
+
+Signed-off-by: Kamil Bienkiewicz <perceivalpercy@gmail.com>
+---
+--- a/drivers/net/ethernet/qualcomm/ppe/edma_rx.h
++++ b/drivers/net/ethernet/qualcomm/ppe/edma_rx.h
+@@ -243,6 +243,7 @@
+ 	u32 buf_len;
+ 	bool page_mode;
+ 	struct edma_rxfill_stats rxfill_stats;
++	struct sk_buff **skbs;
+ };
+ 
+ /**
+--- a/drivers/net/ethernet/qualcomm/ppe/edma_rx.c
++++ b/drivers/net/ethernet/qualcomm/ppe/edma_rx.c
+@@ -89,10 +89,15 @@
+ 
+ 		EDMA_RXFILL_BUFFER_ADDR_SET(rxfill_desc, buff_addr);
+ 
+-		EDMA_RXFILL_OPAQUE_LO_SET(rxfill_desc, skb);
+-#ifdef CONFIG_64BIT
+-		EDMA_RXFILL_OPAQUE_HI_SET(rxfill_desc, skb);
+-#endif
++		/* Index-based opaque: park real skb in kernel-side array,
++		 * stuff only ring index into the descriptor. Sidesteps
++		 * IPQ5332's apparent failure to preserve word3 across
++		 * RXFILL->RXDESC.
++		 */
++		rxfill_ring->skbs[prod_idx] = skb;
++		rxfill_desc->word2 = prod_idx;
++		rxfill_desc->word3 = 0;
++
+ 		EDMA_RXFILL_PACKET_LEN_SET(rxfill_desc,
+ 					   (u32)(buf_len) & EDMA_RXFILL_BUF_SIZE_MASK);
+ 		prod_idx = (prod_idx + 1) & EDMA_RX_RING_SIZE_MASK;
+@@ -473,8 +478,16 @@
+ 	end_idx = (cons_idx + work_to_do) & EDMA_RX_RING_SIZE_MASK;
+ 	next_rxdesc_pri = EDMA_RXDESC_PRI_DESC(rxdesc_ring, cons_idx);
+ 
+-	/* Get opaque from RXDESC. */
+-	next_skb = (struct sk_buff *)EDMA_RXDESC_OPAQUE_GET(next_rxdesc_pri);
++	/* Index-based opaque: word2 carries RXFILL ring index; look up
++	 * the real skb from the parallel skbs[] array and take
++	 * ownership (NULL the slot) so any later descriptor with the
++	 * same index doesn't refer to the same skb again.
++	 */
++	{
++		u32 idx = next_rxdesc_pri->word2 & EDMA_RX_RING_SIZE_MASK;
++		next_skb = rxdesc_ring->rxfill->skbs[idx];
++		rxdesc_ring->rxfill->skbs[idx] = NULL;
++	}
+ 
+ 	work_leftover = work_to_do & (EDMA_RX_MAX_PROCESS - 1);
+ 	while (likely(work_to_do--)) {
+@@ -513,8 +526,10 @@
+ 
+ 			/* Handle linear packets. */
+ 			if (likely(!EDMA_RXDESC_MORE_BIT_GET(rxdesc_pri))) {
+-				next_skb =
+-					(struct sk_buff *)EDMA_RXDESC_OPAQUE_GET(next_rxdesc_pri);
++				u32 idx = next_rxdesc_pri->word2 &
++					  EDMA_RX_RING_SIZE_MASK;
++				next_skb = rxdesc_ring->rxfill->skbs[idx];
++				rxdesc_ring->rxfill->skbs[idx] = NULL;
+ 
+ 				if (unlikely(!
+ 					     edma_rx_handle_linear_packets(rxdesc_ring,
+@@ -525,7 +540,11 @@
+ 			}
+ 		}
+ 
+-		next_skb = (struct sk_buff *)EDMA_RXDESC_OPAQUE_GET(next_rxdesc_pri);
++		{
++			u32 idx = next_rxdesc_pri->word2 & EDMA_RX_RING_SIZE_MASK;
++			next_skb = rxdesc_ring->rxfill->skbs[idx];
++			rxdesc_ring->rxfill->skbs[idx] = NULL;
++		}
+ 
+ 		/* Handle scatter frame processing for first/middle/last segments. */
+ 		page_mode ? edma_rx_handle_nr_frags(rxdesc_ring, rxdesc_pri, skb) :
+--- a/drivers/net/ethernet/qualcomm/ppe/edma_cfg_rx.c
++++ b/drivers/net/ethernet/qualcomm/ppe/edma_cfg_rx.c
+@@ -427,24 +427,23 @@
+ 	regmap_read(regmap, reg, &data);
+ 	cons_idx = data & EDMA_RXFILL_CONS_IDX_MASK;
+ 
+-	while (curr_idx != cons_idx) {
+-		struct edma_rxfill_desc *rxfill_desc;
+-		struct sk_buff *skb;
+-
+-		/* Get RxFill descriptor */
+-		rxfill_desc = EDMA_RXFILL_DESC(rxfill_ring, cons_idx);
+-
+-		cons_idx = (cons_idx + 1) & EDMA_RX_RING_SIZE_MASK;
+-
+-		/* Get skb from opaque */
+-		skb = (struct sk_buff *)EDMA_RXFILL_OPAQUE_GET(rxfill_desc);
+-		if (unlikely(!skb)) {
+-			pr_err("Empty skb reference at index:%d\n",
+-			       cons_idx);
+-			continue;
+-		}
++	(void)curr_idx;
++	(void)cons_idx;
+ 
+-		dev_kfree_skb_any(skb);
++	/* Free skbs still held in the parallel skbs[] array. */
++	if (rxfill_ring->skbs) {
++		u32 i;
++
++		for (i = 0; i < rxfill_ring->count; i++) {
++			struct sk_buff *skb = rxfill_ring->skbs[i];
++
++			if (skb) {
++				dev_kfree_skb_any(skb);
++				rxfill_ring->skbs[i] = NULL;
++			}
++		}
++		kfree(rxfill_ring->skbs);
++		rxfill_ring->skbs = NULL;
+ 	}
+ 
+ 	/* Free RxFill ring descriptors */
+@@ -468,6 +467,16 @@
+ 	if (unlikely(!rxfill_ring->desc))
+ 		return -ENOMEM;
+ 
++	rxfill_ring->skbs = kcalloc(rxfill_ring->count,
++				    sizeof(struct sk_buff *), GFP_KERNEL);
++	if (unlikely(!rxfill_ring->skbs)) {
++		dma_free_coherent(dev, (sizeof(struct edma_rxfill_desc)
++				   * rxfill_ring->count),
++				   rxfill_ring->desc, rxfill_ring->dma);
++		rxfill_ring->desc = NULL;
++		return -ENOMEM;
++	}
++
+ 	return 0;
+ }
+ 

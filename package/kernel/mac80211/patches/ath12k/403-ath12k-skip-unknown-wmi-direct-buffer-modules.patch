@@ -1,0 +1,64 @@
+From: Percival <perceivalpercy@gmail.com>
+Date: Thu, 14 May 2026 06:10:00 +0000
+Subject: [PATCH] wifi: ath12k: skip unknown WMI direct-buffer modules
+
+Newer QCN9274 firmware (e.g. WLAN.WBE.1.6-01243) advertises direct-buffer
+modules with ids beyond the SPECTRAL/CFR pair that this driver knows
+about. The current ath12k_wmi_dma_ring_caps treats anything >=
+WMI_DIRECT_BUF_MAX as a hard error and returns -EINVAL, which aborts the
+entire SERVICE_READY_EXT2 parse. The device then never finishes
+initialization and no wiphy/wlan interfaces are registered.
+
+Skip unknown module ids instead of failing the parse. An unused
+direct-buffer capability is harmless; bailing out of probe is not.
+
+Tested-on: QCN9274 hw2.0 (GL.iNet Flint 3, IPQ5332) with
+WLAN.WBE.1.6-01243-QCAHKSWPL_SILICONZ-1.
+
+Signed-off-by: Percival <perceivalpercy@gmail.com>
+---
+--- a/drivers/net/wireless/ath/ath12k/wmi.c
++++ b/drivers/net/wireless/ath/ath12k/wmi.c
+@@ -4717,14 +4717,25 @@
+ 
+ 	dir_buff_caps = ab->db_caps;
+ 	for (i = 0; i < dma_caps_parse->n_dma_ring_caps; i++) {
+-		if (le32_to_cpu(dma_caps[i].module_id) >= WMI_DIRECT_BUF_MAX) {
+-			ath12k_warn(ab, "Invalid module id %d\n",
+-				    le32_to_cpu(dma_caps[i].module_id));
+-			ret = -EINVAL;
+-			goto free_dir_buff;
++		u32 mod_id = le32_to_cpu(dma_caps[i].module_id);
++
++		if (mod_id >= WMI_DIRECT_BUF_MAX) {
++			/*
++			 * Newer QCN9274 firmware (WLAN.WBE.1.6+) advertises
++			 * direct-buffer modules beyond the SPECTRAL/CFR pair
++			 * this driver knows about. Skip them rather than fail
++			 * the whole service-ready-ext2 parse; bailing leaves
++			 * the device half-initialized and no wlan interfaces
++			 * are registered.
++			 */
++			ath12k_dbg(ab, ATH12K_DBG_WMI,
++				   "skipping unknown direct-buffer module id %u\n",
++				   mod_id);
++			dir_buff_caps[i].id = WMI_DIRECT_BUF_MAX;
++			continue;
+ 		}
+ 
+-		dir_buff_caps[i].id = le32_to_cpu(dma_caps[i].module_id);
++		dir_buff_caps[i].id = mod_id;
+ 		dir_buff_caps[i].pdev_id =
+ 			DP_HW2SW_MACID(le32_to_cpu(dma_caps[i].pdev_id));
+ 		dir_buff_caps[i].min_elem = le32_to_cpu(dma_caps[i].min_elem);
+@@ -4733,10 +4744,6 @@
+ 	}
+ 
+ 	return 0;
+-
+-free_dir_buff:
+-	ath12k_wmi_free_dbring_caps(ab);
+-	return ret;
+ }
+ 
+ static void

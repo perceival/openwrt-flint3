@@ -1,0 +1,38 @@
+From: Kamil Bienkiewicz <perceivalpercy@gmail.com>
+Date: Sat, 23 May 2026 08:30:00 +0000
+Subject: [PATCH] net: ethernet: qcom: ppe: edma: ratelimit AXI error prints
+
+`edma_misc_handle_irq()` already wraps every other error-class print
+in `net_ratelimit()` — except AXI read and write errors. On IPQ5332
+the misc IRQ fires continuously when EDMA HW is in a degraded state
+(e.g. once we start dropping RX descriptors via the NULL-skb guard).
+Without rate-limiting, the kernel log is flooded fast enough that no
+other output gets through, and the rdinit shell is unusable.
+
+Match the existing pattern: gate the AXI error prints on
+`net_ratelimit()` too. The percpu stats counters keep updating as
+before — only the console spam is suppressed.
+
+Signed-off-by: Kamil Bienkiewicz <perceivalpercy@gmail.com>
+---
+--- a/drivers/net/ethernet/qualcomm/ppe/edma.c
++++ b/drivers/net/ethernet/qualcomm/ppe/edma.c
+@@ -295,14 +295,16 @@ static irqreturn_t edma_misc_handle_irq(int irq, void *ctx)
+ 	pr_debug("Received misc irq %d, status: %d\n", irq, misc_intr_status);
+
+ 	if (FIELD_GET(EDMA_MISC_AXI_RD_ERR_MASK, misc_intr_status)) {
+-		pr_err("MISC AXI read error received\n");
++		if (net_ratelimit())
++			pr_err("MISC AXI read error received\n");
+ 		u64_stats_update_begin(&stats->syncp);
+ 		++stats->edma_axi_read_err;
+ 		u64_stats_update_end(&stats->syncp);
+ 	}
+
+ 	if (FIELD_GET(EDMA_MISC_AXI_WR_ERR_MASK, misc_intr_status)) {
+-		pr_err("MISC AXI write error received\n");
++		if (net_ratelimit())
++			pr_err("MISC AXI write error received\n");
+ 		u64_stats_update_begin(&stats->syncp);
+ 		++stats->edma_axi_write_err;
+ 		u64_stats_update_end(&stats->syncp);

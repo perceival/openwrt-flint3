@@ -1,0 +1,57 @@
+From: Kamil Bienkiewicz <perceivalpercy@gmail.com>
+Date: Fri, 22 May 2026 12:00:00 +0000
+Subject: [PATCH] net: ethernet: qcom: ppe: edma: skip stale RXDESC entries at
+ init
+
+After enabling the EDMA RX/TXCMPL/misc IRQs in DT (commit on
+0540-arm64-dts-...-PPE-PCS-MDIO-nodes), the first RX NAPI poll on
+IPQ5332 took a fatal exception inside edma_rx_napi_poll at the
+"skb->dev = ndev" store. The crash was:
+
+  Unable to handle kernel write to read-only memory at virtual address
+                                                          0x000000002e
+  pc : edma_rx_napi_poll+0x134/0x69c
+
+Disassembly shows x26 (the skb pointer, loaded from rxdesc opaque
+field at descriptor offset 8) is a small bogus value. So the RX
+descriptor ring's first entries had garbage opaque pointers — left
+over from U-Boot's networking activity (TFTP, eth0 PHY1 probes)
+before the kernel took over.
+
+The reap loop in edma_rx_reap reads the HW PROD_IDX, compares to the
+SW-tracked cons_idx (initialised to 0 in BSS), and processes
+prod_idx - 0 descriptors. The kernel's RX FILL allocation hasn't
+populated those entries yet, so opaque is whatever U-Boot left at
+the start of the DMA region.
+
+Fix by syncing both the SW cons_idx and the HW CONS_IDX register to
+the current HW PROD_IDX at ring config time. Anything the EDMA
+considers "pending" at this point is from a prior boot context and
+must be skipped.
+
+Signed-off-by: Kamil Bienkiewicz <perceivalpercy@gmail.com>
+---
+--- a/drivers/net/ethernet/qualcomm/ppe/edma_cfg_rx.c
++++ b/drivers/net/ethernet/qualcomm/ppe/edma_cfg_rx.c
+@@ -206,6 +206,21 @@ static void edma_cfg_rx_desc_ring_configure(struct edma_rxdesc_ring *rxdesc_ring
+ 	/* Enable ring. Set ret mode to 'opaque'. */
+ 	reg = EDMA_BASE_OFFSET + EDMA_REG_RX_INT_CTRL(rxdesc_ring->ring_id);
+ 	regmap_write(regmap, reg, EDMA_RX_NE_INT_EN);
++
++	/* Skip any stale descriptors left by U-Boot / prior context.
++	 * On IPQ5332 the first NAPI poll after IRQ-enabled probe would
++	 * otherwise see prod_idx != 0 with garbage opaque-skb pointers
++	 * and oops on the "skb->dev = ndev" store. Sync the SW cons_idx
++	 * and the HW RXDESC_CONS_IDX register to whatever PROD_IDX the
++	 * EDMA currently reports — anything between is stale and must
++	 * be ignored.
++	 */
++	reg = EDMA_BASE_OFFSET + EDMA_REG_RXDESC_PROD_IDX(rxdesc_ring->ring_id);
++	regmap_read(regmap, reg, &data);
++	data &= EDMA_RXDESC_PROD_IDX_MASK;
++	rxdesc_ring->cons_idx = data;
++	reg = EDMA_BASE_OFFSET + EDMA_REG_RXDESC_CONS_IDX(rxdesc_ring->ring_id);
++	regmap_write(regmap, reg, data);
+ }
+
+ static void edma_cfg_rx_qid_to_rx_desc_ring_mapping(void)

@@ -1,0 +1,45 @@
+From: Kamil Bienkiewicz <perceivalpercy@gmail.com>
+Date: Sun, 17 May 2026 14:10:00 +0000
+Subject: [PATCH] net: pcs: qcom-ipq9574: IPQ5332 MPPE init deltas
+ 
+Vendor SSDK adpt_hppe_uniphy_sgmiiplus_mode_set() for MPPE: clear
+MISC2 REG_RATE (bits 1:0), clear MODE_CTRL autoneg (bit 0) for
+2500BASEX, toggle UNIPHY_VCO_CALIBRATION_CONTROL bit 14.
+ 
+Signed-off-by: Kamil Bienkiewicz <perceivalpercy@gmail.com>
+---
+--- a/drivers/net/pcs/pcs-qcom-ipq9574.c	2026-05-17 19:01:57.730293816 +0200
++++ b/drivers/net/pcs/pcs-qcom-ipq9574.c	2026-05-17 19:02:29.153708416 +0200
+@@ -65,6 +65,9 @@
+ #define PCS_PLL_RESET			0x780
+ #define PCS_ANA_SW_RESET		BIT(6)
+ 
++#define UNIPHY_VCO_CALIBRATION_CONTROL	0xb4
++#define UNIPHY_VCO_CALIB_RESTART	BIT(14)
++
+ #define XPCS_INDIRECT_ADDR		0x8000
+ #define XPCS_INDIRECT_AHB_ADDR		0x83fc
+ #define XPCS_INDIRECT_ADDR_H		GENMASK(20, 8)
+@@ -372,6 +375,22 @@
+ 		return ret;
+ 	}
+ 
++	/* IPQ5332 (MPPE) deltas vs IPQ9574 — match vendor SSDK init: */
++	if (interface == PHY_INTERFACE_MODE_2500BASEX) {
++		regmap_update_bits(qpcs->regmap, PCS_MISC2, GENMASK(1, 0), 0);
++		regmap_clear_bits(qpcs->regmap, PCS_MODE_CTRL, BIT(0));
++	}
++	ret = regmap_set_bits(qpcs->regmap, UNIPHY_VCO_CALIBRATION_CONTROL,
++			      UNIPHY_VCO_CALIB_RESTART);
++	if (ret)
++		return ret;
++	msleep(10);
++	ret = regmap_clear_bits(qpcs->regmap, UNIPHY_VCO_CALIBRATION_CONTROL,
++				UNIPHY_VCO_CALIB_RESTART);
++	if (ret)
++		return ret;
++	msleep(10);
++
+ 	qpcs->interface = interface;
+ 
+ 	/* Configure the RX and TX clock to NSSCC as 125M or 312.5M based

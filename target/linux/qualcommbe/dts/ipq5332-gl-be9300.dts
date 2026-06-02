@@ -1,0 +1,408 @@
+// SPDX-License-Identifier: GPL-2.0-or-later OR MIT
+/dts-v1/;
+
+#include "ipq5332.dtsi"
+
+#include <dt-bindings/gpio/gpio.h>
+#include <dt-bindings/input/input.h>
+#include <dt-bindings/leds/common.h>
+
+/ {
+	model = "GL.iNet GL-BE9300 (Flint 3)";
+	compatible = "glinet,gl-be9300", "qcom,ipq5332";
+
+	aliases {
+		serial0 = &blsp1_uart0;
+	};
+
+	chosen {
+		stdout-path = "serial0:115200n8";
+	};
+
+	/*
+	 * Reserved memory regions for QSDK/QCN9224 radio firmware + TrustZone app
+	 * memory. Vendor's DT reserves these so kernel doesn't allocate over
+	 * them; QSEE and firmware loaders use them at fixed addresses.
+	 * Layout matches vendor's `from-ap2/ap2-live.dts`:
+	 *   m3_dump@4cc00000  1M  Q6 M3-core crash dump
+	 *   q6_etr_dump@4cd00000 1M  Q6 ETR (Embedded Trace Replicator) dump
+	 *   q6_caldb@4ce00000 5M  Q6 calibration DB
+	 *   wcnss@4a900000   35M  internal-radio WCNSS firmware loading area
+	 *   tzapp@49b00000    6M  TrustZone app memory
+	 *   qcn9224_pcie0@4ed00000 50M  QCN9224 radio 0 (disabled — slot empty?)
+	 *   qcn9224_pcie1@51f00000 50M  QCN9224 radio 1 (active)
+	 */
+	reserved-memory {
+		#address-cells = <2>;
+		#size-cells = <2>;
+		ranges;
+
+		tzapp@49b00000 {
+			reg = <0x0 0x49b00000 0x0 0x600000>;
+			no-map;
+		};
+
+		wcnss@4a900000 {
+			reg = <0x0 0x4a900000 0x0 0x2300000>;
+			no-map;
+		};
+
+		m3_dump@4cc00000 {
+			reg = <0x0 0x4cc00000 0x0 0x100000>;
+			no-map;
+		};
+
+		q6_etr_dump@4cd00000 {
+			reg = <0x0 0x4cd00000 0x0 0x100000>;
+			no-map;
+		};
+
+		q6_caldb@4ce00000 {
+			reg = <0x0 0x4ce00000 0x0 0x500000>;
+			no-map;
+		};
+
+		qcn9224_pcie0@4ed00000 {
+			reg = <0x0 0x4ed00000 0x0 0x3200000>;
+			no-map;
+			status = "disabled";
+		};
+
+		qcn9224_pcie1@51f00000 {
+			reg = <0x0 0x51f00000 0x0 0x3200000>;
+			no-map;
+		};
+	};
+
+	keys {
+		compatible = "gpio-keys";
+
+		button-reset {
+			label = "reset";
+			gpios = <&tlmm 17 GPIO_ACTIVE_LOW>;
+			linux,code = <KEY_RESTART>;
+		};
+	};
+
+	leds {
+		compatible = "gpio-leds";
+
+		led_run: led-0 {
+			color = <LED_COLOR_ID_BLUE>;
+			function = LED_FUNCTION_POWER;
+			label = "blue:run";
+			gpios = <&tlmm 32 GPIO_ACTIVE_HIGH>;
+			default-state = "on";
+		};
+
+		led-1 {
+			color = <LED_COLOR_ID_WHITE>;
+			function = LED_FUNCTION_STATUS;
+			label = "white:system";
+			gpios = <&tlmm 33 GPIO_ACTIVE_HIGH>;
+			default-state = "off";
+		};
+	};
+};
+
+&blsp1_uart0 {
+	pinctrl-0 = <&serial_0_pins>;
+	pinctrl-names = "default";
+	status = "okay";
+};
+
+&sleep_clk {
+	clock-frequency = <32000>;
+};
+
+&xo_board {
+	clock-frequency = <24000000>;
+};
+
+&sdhc {
+	bus-width = <4>;
+	max-frequency = <192000000>;
+	mmc-ddr-1_8v;
+	mmc-hs200-1_8v;
+	non-removable;
+	pinctrl-0 = <&sdc_default_state>;
+	pinctrl-names = "default";
+	status = "okay";
+};
+
+&usbphy0 {
+	status = "okay";
+};
+
+&usb {
+	status = "okay";
+};
+
+&usb_dwc {
+	dr_mode = "host";
+};
+
+&pcie1_phy {
+	status = "okay";
+};
+
+&pcie1 {
+	perst-gpios = <&tlmm 47 GPIO_ACTIVE_LOW>;
+	wake-gpios = <&tlmm 30 GPIO_ACTIVE_LOW>;
+
+	status = "okay";
+
+	pcie@0 {
+		wifi@0,0 {
+			/*
+			 * QCN9274 (PCI 17cb:1109) wired as a dualmac radio:
+			 * MAC0 = 5 GHz, MAC1 = 6 GHz. OTP on this board is
+			 * not provisioned (board_id == 0xff), so ath12k can't
+			 * auto-detect dualmac from fuse bits — force it here.
+			 */
+			compatible = "pci17cb,1109";
+			reg = <0x00010000 0 0 0 0>;
+			qcom,ath12k-prefer-dualmac;
+		};
+	};
+};
+
+&tlmm {
+	sdc_default_state: sdc-default-state {
+		clk-pins {
+			pins = "gpio13";
+			function = "sdc_clk";
+			drive-strength = <8>;
+			bias-disable;
+		};
+
+		cmd-pins {
+			pins = "gpio12";
+			function = "sdc_cmd";
+			drive-strength = <8>;
+			bias-pull-up;
+		};
+
+		data-pins {
+			pins = "gpio8", "gpio9", "gpio10", "gpio11";
+			function = "sdc_data";
+			drive-strength = <8>;
+			bias-pull-up;
+		};
+	};
+};
+
+/*
+ * Ethernet via mainline qcom-ppe (replaces QSDK qca-nss-* stack).
+ *
+ * Flint 3 has two GMAC ports active off IPQ5332's PPE:
+ *   port@1 — LAN-side, behind the RTL8372N managed switch (no Linux driver
+ *           yet for RTL8372N, so we use fixed-link for now and accept
+ *           whatever the switch's U-Boot defaults give us).
+ *   port@2 — WAN-side 2.5GbE, via on-board RTL8221B-VB-CG PHY (PHY ID
+ *           001c.c849) on MDIO addr 1. Driven by mainline drivers/net/phy/
+ *           realtek/realtek_main.c with CONFIG_REALTEK_PHY=y.
+ */
+&mdio {
+	/*
+	 * GPIO 27 = MDC, GPIO 28 = MDIO (vendor pinmux).
+	 * PHY reset GPIOs: 51 (internal RTL8221B) and 24 (RTL8372N).
+	 */
+	pinctrl-0 = <&mdio_pinmux>;
+	pinctrl-names = "default";
+	status = "okay";
+
+	wan_phy: ethernet-phy@1 {
+		compatible = "ethernet-phy-ieee802.3-c45";
+		reg = <1>;
+	};
+
+	/*
+	 * LAN switch chip — Realtek RTL8372N at MDIO address 0x1d.
+	 * Captured from vendor DT (decimal node name `switch@29`,
+	 * `reg = <0x1d>` = 29).  Per vendor swconfig:
+	 *   port 3 = 10G SerDes (CPU port from IPQ5332 UNIPHY0)
+	 *   port 4 = 1G secondary CPU connection
+	 *   ports 5..8 = LAN1..LAN4 jacks
+	 *   ports 0..2, 9 = unused
+	 * CPU port from this board's perspective is port 3.
+	 */
+	switch: switch@1d {
+		compatible = "realtek,rtl8372n";
+		reg = <0x1d>;
+
+		ports {
+			#address-cells = <1>;
+			#size-cells = <0>;
+
+			/* port 3 — CPU port via SerDes to IPQ5332 UNIPHY0.
+			 * Vendor U-Boot leaves SDS0 in SERDES_10GR (10GBASE-R)
+			 * and our PCS skip-reconfig preserves that. The chip's
+			 * port-3 MAC must match — otherwise the chip sends
+			 * frames clocked for 2.5G while the SerDes ships them
+			 * at 10G and the receive end can't decode. Symptom
+			 * observed via MIB counters 2026-05-29: chip's port-3
+			 * ifOutUcastPkts advances correctly (forwarding from
+			 * port 7 → port 3 works), but SoC eth0 RX never sees
+			 * those frames.
+			 *
+			 * See memory/project_flint3_socswitch_link_is_10g.md.
+			 */
+			port@3 {
+				reg = <3>;
+				label = "cpu";
+				ethernet = <&qcom_ppe>;
+				phy-mode = "10gbase-r";
+
+				fixed-link {
+					speed = <10000>;
+					full-duplex;
+				};
+			};
+
+			/* Front-panel jack → switch port mapping (verified
+			 * with the actual ap2 unit + vendor swconfig dump):
+			 *   LAN1 (laptop)        → switch port 7
+			 *   LAN2 (printer/etc)   → switch port 5
+			 *   LAN3 (n/c)           → switch port 6 (vendor's guest VLAN)
+			 *   LAN4 (trunk)         → switch port 4 (vendor's trunk, tagged for
+			 *                                          both VLAN 10 + 192)
+			 * Switch port 8 is internal / unused — not exposed.
+			 *
+			 * LAN ports use the chip's internal 2.5G PHYs.
+			 * Mainline rtl8372n.c doesn't expose phy_read/write
+			 * yet, so phylink can't find the internal PHYs via
+			 * MDIO. Declare fixed-link 2500/full as a workaround
+			 * — link state is whatever the chip auto-negotiates,
+			 * but DSA slave netdevs come up. Replace with
+			 * phy-handle + phy_read once the driver grows
+			 * internal-MDIO access.
+			 */
+			port@4 {
+				reg = <4>;
+				label = "lan4";
+				phy-mode = "internal";
+				fixed-link { speed = <2500>; full-duplex; };
+			};
+			port@5 {
+				reg = <5>;
+				label = "lan2";
+				phy-mode = "internal";
+				fixed-link { speed = <2500>; full-duplex; };
+			};
+			port@6 {
+				reg = <6>;
+				label = "lan3";
+				phy-mode = "internal";
+				fixed-link { speed = <2500>; full-duplex; };
+			};
+			port@7 {
+				reg = <7>;
+				label = "lan1";
+				phy-mode = "internal";
+				fixed-link { speed = <2500>; full-duplex; };
+			};
+		};
+	};
+};
+
+&pcs0 {
+	status = "okay";
+};
+
+&pcs1 {
+	status = "okay";
+};
+
+&qcom_ppe {
+	status = "okay";
+
+	ethernet-ports {
+		#address-cells = <1>;
+		#size-cells = <0>;
+
+		port@1 {
+			reg = <1>;
+			/* Vendor swconfig shows the SoC↔switch SerDes link
+			 * runs at 10G (port 3 on the switch reports
+			 * speed:10000baseT). Vendor U-Boot also leaves the
+			 * RTL8372N SDS0 mode at SERDES_10GR (0x1A in the
+			 * SDS_MODE_SEL register). So the right phy-mode here
+			 * is a 10G class — 10gbase-r matches the switch end
+			 * line code directly. 2500base-x was wrong.
+			 */
+			phy-mode = "10gbase-r";
+			pcs-handle = <&pcs0_ch0>;
+			clocks = <&nsscc NSS_CC_PORT1_MAC_CLK>,
+				 <&nsscc NSS_CC_PORT1_RX_CLK>,
+				 <&nsscc NSS_CC_PORT1_TX_CLK>;
+			clock-names = "port_mac",
+				      "port_rx",
+				      "port_tx";
+			resets = <&nsscc NSS_CC_PORT1_MAC_CLK_ARES>,
+				 <&nsscc NSS_CC_PORT1_RX_CLK_ARES>,
+				 <&nsscc NSS_CC_PORT1_TX_CLK_ARES>;
+			reset-names = "port_mac",
+				      "port_rx",
+				      "port_tx";
+
+			fixed-link {
+				speed = <10000>;
+				full-duplex;
+			};
+		};
+
+		port@2 {
+			reg = <2>;
+			/* RTL8221B is a USXGMII-capable 2.5G PHY. Vendor
+			 * configures this port via XPCS (PCS_MODE_CTRL bit 12 +
+			 * MISC2=0x70 = REG_PHY_MODE 7) which matches mainline's
+			 * "usxgmii" path in pcs-qcom-ipq9574, NOT the
+			 * "2500base-x" path (which sets bit 11 + MISC2=0x40 and
+			 * doesn't bring the XPCS block out of reset). Verified
+			 * 2026-05-17 by comparing vendor /sys/firmware regdump
+			 * with our mainline boot trace.
+			 */
+			phy-mode = "usxgmii";
+			pcs-handle = <&pcs1_ch0>;
+			phy-handle = <&wan_phy>;
+			clocks = <&nsscc NSS_CC_PORT2_MAC_CLK>,
+				 <&nsscc NSS_CC_PORT2_RX_CLK>,
+				 <&nsscc NSS_CC_PORT2_TX_CLK>;
+			clock-names = "port_mac",
+				      "port_rx",
+				      "port_tx";
+			resets = <&nsscc NSS_CC_PORT2_MAC_CLK_ARES>,
+				 <&nsscc NSS_CC_PORT2_RX_CLK_ARES>,
+				 <&nsscc NSS_CC_PORT2_TX_CLK_ARES>;
+			reset-names = "port_mac",
+				      "port_rx",
+				      "port_tx";
+		};
+	};
+};
+
+/* MDIO pinmux state — used by &mdio. Defined here because ipq5332.dtsi
+ * doesn't include it (vendor uses different pins on different boards). */
+&tlmm {
+	mdio_pinmux: mdio-pinmux-state {
+		mdc-pins {
+			pins = "gpio27";
+			function = "mdc1";
+			drive-strength = <8>;
+			bias-pull-up;
+		};
+		mdio-pins {
+			pins = "gpio28";
+			function = "mdio1";
+			drive-strength = <8>;
+			bias-pull-up;
+		};
+	};
+};
+
+/* TODO: partitions on /dev/mmcblk0 (use kernel's GPT auto-detect via PARTUUID) */
+
+&watchdog {
+	status = "disabled";
+};

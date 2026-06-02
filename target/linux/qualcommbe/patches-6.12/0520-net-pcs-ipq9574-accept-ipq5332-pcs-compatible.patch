@@ -1,0 +1,21 @@
+From: Kamil Bienkiewicz <perceivalpercy@gmail.com>
+Date: Sat, 16 May 2026 12:00:00 +0000
+Subject: [PATCH] net: pcs: qcom-ipq9574: Accept qcom,ipq5332-pcs compatible
+
+IPQ5332 uses the same UNIPHY PCS hardware block as IPQ9574 (PCS +
+SerDes at the same register layout); the only difference is IPQ5332
+exposes two instances (vs three on IPQ9574). Add the IPQ5332 compat
+string to the match table so an IPQ5332 board DTS can use the same
+driver without code changes.
+
+Signed-off-by: Kamil Bienkiewicz <perceivalpercy@gmail.com>
+---
+--- a/drivers/net/pcs/pcs-qcom-ipq9574.c
++++ b/drivers/net/pcs/pcs-qcom-ipq9574.c
+@@ -1050,6 +1050,7 @@
+ static const struct of_device_id ipq9574_pcs_of_mtable[] = {
+ 	{ .compatible = "qcom,ipq9574-pcs" },
++	{ .compatible = "qcom,ipq5332-pcs" },
+ 	{ /* sentinel */ },
+ };
+ MODULE_DEVICE_TABLE(of, ipq9574_pcs_of_mtable);

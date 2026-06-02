@@ -1,0 +1,79 @@
+From: Kamil Bienkiewicz <perceivalpercy@gmail.com>
+Date: Sun, 17 May 2026 12:00:00 +0000
+Subject: [PATCH] net: ethernet: qcom: ppe: reset cycle + clk_set_rate on link-up
+ 
+Mirror the vendor QSDK qca-ssdk-mppe pattern. On IPQ5332 the GMAC
+needs both a port_mac/rx/tx reset cycle AND a framework-level
+clk_set_rate on the per-port branches before phylink's link-up step
+finishes. Without it, USXGMII inband signaling between the RTL8221B
+2.5G PHY and the GMAC doesn't latch carrier (PHY reports 1G to the
+partner but SoC sees carrier=0, operstate=down). The clk_set_rate
+doesn't move hardware (NSSCC RCG2 silently ignores SRC_SEL writes —
+vendor's running firmware sits at SRC_SEL=0=XO too) but the framework
+propagation appears to trigger downstream events the GMAC needs.
+ 
+Signed-off-by: Kamil Bienkiewicz <perceivalpercy@gmail.com>
+---
+--- a/drivers/net/ethernet/qualcomm/ppe/ppe_port.c	2026-05-17 13:31:29.643435213 +0200
++++ b/drivers/net/ethernet/qualcomm/ppe/ppe_port.c	2026-05-17 13:46:35.039775849 +0200
+@@ -798,6 +798,51 @@
+ 	return ret;
+ }
+ 
++/* Vendor QSDK ssdk_port_mac_clock_reset() pattern: assert port_mac +
++ * port_rx + port_tx resets, sleep 150ms, deassert all three, sleep 150ms,
++ * then propagate the target rate through the NSSCC port_rx/tx clk tree.
++ * Without this, USXGMII inband signaling between PCS-driven PHY and the
++ * GMAC doesn't latch carrier even after PHY-side autoneg completes. The
++ * clk_set_rate calls don't actually change hardware state (the RCG2
++ * hardware ignores SRC_SEL writes — vendor's running firmware shows the
++ * same XO-parented state) but the framework-level propagation appears to
++ * trigger something downstream (branch re-enable, etc.) that the GMAC
++ * needs to start servicing TX frames.
++ */
++static int ppe_port_mac_reset_and_set_rate(struct ppe_port *ppe_port, int speed)
++{
++	unsigned long rate;
++	int i;
++
++	switch (speed) {
++	case SPEED_10000:
++	case SPEED_5000:
++	case SPEED_2500:
++		rate = 312500000;
++		break;
++	case SPEED_1000:
++		rate = 125000000;
++		break;
++	case SPEED_100:
++		rate = 25000000;
++		break;
++	default:
++		rate = 2500000;
++		break;
++	}
++
++	for (i = 0; i < PPE_PORT_CLK_RST_MAX; i++)
++		reset_control_assert(ppe_port->rstcs[i]);
++	msleep(150);
++	for (i = 0; i < PPE_PORT_CLK_RST_MAX; i++)
++		reset_control_deassert(ppe_port->rstcs[i]);
++	msleep(150);
++
++	clk_set_rate(ppe_port->clks[PPE_PORT_CLK_RST_RX], rate);
++	clk_set_rate(ppe_port->clks[PPE_PORT_CLK_RST_TX], rate);
++	return 0;
++}
++
+ /* PPE port MAC link up configuration for phylink */
+ static void ppe_port_mac_link_up(struct phylink_config *config,
+ 				 struct phy_device *phy,
+@@ -825,6 +870,8 @@
+ 	if (ret)
+ 		goto err_port_mac_link_up;
+ 
++	ppe_port_mac_reset_and_set_rate(ppe_port, speed);
++
+ 	/* Set PPE port BM flow control */
+ 	reg = PPE_BM_PORT_FC_MODE_ADDR +
+ 		PPE_BM_PORT_FC_MODE_INC * (port + PPE_BM_PORT_MAC_START);

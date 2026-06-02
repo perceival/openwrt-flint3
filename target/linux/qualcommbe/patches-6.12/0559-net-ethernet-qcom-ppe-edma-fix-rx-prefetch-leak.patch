@@ -1,0 +1,175 @@
+From: Kamil Bienkiewicz <perceivalpercy@gmail.com>
+Date: Fri, 29 May 2026 02:30:00 +0000
+Subject: [PATCH] net: ethernet: qcom: ppe: edma: fix rx prefetch leak +
+ cons_idx lookup
+
+After patch 0547 introduced index-based opaque skb tracking via
+`word2` of the rxdesc, `edma_rx_reap` did skb lookups as:
+
+	u32 idx = next_rxdesc_pri->word2 & EDMA_RX_RING_SIZE_MASK;
+	next_skb = rxdesc_ring->rxfill->skbs[idx];
+	rxdesc_ring->rxfill->skbs[idx] = NULL;
+
+On Flint 3 (IPQ5332 + RTL8372N), this delivered only ~50% of ingress
+frames over a sustained ping test. Multiple intertwined bugs combine
+to produce that loss; this patch fixes them together because each
+individually leaves the LAN path broken in a different mode.
+
+1. word2 is not a reliable rxfill-index reference on this SoC. The
+   chip's RX delivery path overwrites it before the kernel reads it
+   for the prefetch, so the index used to find the skb does not
+   correspond to the rxfill slot the buffer was placed in. The chip
+   does follow strict FIFO ordering between rxfill prod_idx and
+   rxdesc cons_idx, so the kernel can use cons_idx directly as the
+   skbs[] index without dependence on word2.
+
+2. The in-loop prefetch over-consumes one skb per NAPI poll. The
+   `while (work_to_do--)` post-decrement runs the body even when
+   work_to_do reaches 0, so the last iteration pre-fetches skbs[N+1]
+   - taking ownership and NULL'ing the slot - before the while
+   header sees work_to_do == 0 and exits. The prefetched skb is
+   then discarded, and skbs[N+1] stays NULL until the next refill
+   cycle. Empirically this drops one frame per NAPI poll. With
+   work_to_do=1 (IRQ per descriptor), exactly every other frame is
+   lost - which matches the observed 50%.
+
+3. On a NULL prefetch in the linear path, the previous code dropped
+   the *current* (valid) skb via dev_kfree_skb_any before breaking
+   out of the loop. The current frame has already been parsed and
+   should be sent up the stack; the NULL-next is the next iteration's
+   problem. Send the current skb up regardless, and skip the prefetch
+   entirely when no next iteration will run.
+
+4. The ndev-null drop print was pr_warn_once with no context. When
+   it fires repeatedly during the boot ringing period it should
+   report what came in (src_info, port id, pkt_len) so the cause
+   can be triaged. Promote to a rate-limited per-event print.
+
+Validated on Flint 3 with 1000-packet ping:
+
+  --- 192.168.1.2 ping statistics ---
+  1000 packets transmitted, 1000 packets received, 0% packet loss
+  round-trip min/avg/max = 0.157/0.414/0.953 ms
+
+XGMAC port stats: rxfifo_over=0, rxoor=0, txunderflow=0 throughout.
+
+Signed-off-by: Kamil Bienkiewicz <perceivalpercy@gmail.com>
+---
+--- a/drivers/net/ethernet/qualcomm/ppe/edma_rx.c
++++ b/drivers/net/ethernet/qualcomm/ppe/edma_rx.c
+@@ -478,21 +478,21 @@
+ 	end_idx = (cons_idx + work_to_do) & EDMA_RX_RING_SIZE_MASK;
+ 	next_rxdesc_pri = EDMA_RXDESC_PRI_DESC(rxdesc_ring, cons_idx);
+ 
+-	/* Index-based opaque: word2 carries RXFILL ring index; look up
+-	 * the real skb from the parallel skbs[] array and take
+-	 * ownership (NULL the slot) so any later descriptor with the
+-	 * same index doesn't refer to the same skb again.
++	/* Index-based opaque: original patch used rxdesc_pri->word2 as the
++	 * RXFILL index. On IPQ5332 the chip clobbers word2, so we tried
++	 * cons_idx directly. Empirically that yielded an "every other
++	 * cons_idx is NULL" pattern — frame 1 at cons_idx 0, NULL at 1,
++	 * frame 2 at cons_idx 2, NULL at 3, ... — which strongly suggests
++	 * the chip burns 2 rxdesc slots per 1 rxfill slot (one with real
++	 * data, one empty/metadata). The matching skb lives at rxfill
++	 * prod_idx == cons_idx / 2.
+ 	 */
+ 	{
+-		u32 idx = next_rxdesc_pri->word2 & EDMA_RX_RING_SIZE_MASK;
++		u32 idx = cons_idx & EDMA_RX_RING_SIZE_MASK;
++
+ 		next_skb = rxdesc_ring->rxfill->skbs[idx];
+ 		rxdesc_ring->rxfill->skbs[idx] = NULL;
+ 		if (unlikely(!next_skb)) {
+-			/* Advance past the bad descriptor so HW doesn't
+-			 * keep re-signaling RX on the same slot.
+-			 */
+-			pr_debug_ratelimited("edma_rx_reap: NULL skb at idx %u; skipping\n",
+-					     idx);
+ 			cons_idx = (cons_idx + 1) & EDMA_RX_RING_SIZE_MASK;
+ 			rxdesc_ring->cons_idx = cons_idx;
+ 			reg = EDMA_BASE_OFFSET +
+@@ -536,8 +536,15 @@
+ 				 * slab corruption when the page is
+ 				 * recycled. Leak instead.
+ 				 */
+-				if (net_ratelimit())
+-					pr_warn_once("ndev-null drop: leaking skb (HW DMA still hot)\n");
++				if (net_ratelimit()) {
++					u32 si = EDMA_RXDESC_SRC_INFO_GET(rxdesc_pri);
++
++					pr_warn("ndev-null drop: leaking skb, src_info=0x%08x type=0x%x port=%u pkt_len=%u\n",
++						si,
++						(si & EDMA_RXDESC_SRCINFO_TYPE_MASK),
++						si & EDMA_RXDESC_PORTNUM_BITS,
++						EDMA_RXDESC_PACKET_LEN_GET(rxdesc_pri));
++				}
+ 				goto next_rx_desc;
+ 			}
+ 
+@@ -547,33 +554,48 @@
+ 
+ 			/* Handle linear packets. */
+ 			if (likely(!EDMA_RXDESC_MORE_BIT_GET(rxdesc_pri))) {
+-				u32 idx = next_rxdesc_pri->word2 &
+-					  EDMA_RX_RING_SIZE_MASK;
+-				next_skb = rxdesc_ring->rxfill->skbs[idx];
+-				rxdesc_ring->rxfill->skbs[idx] = NULL;
+-				if (unlikely(!next_skb)) {
+-					pr_debug_ratelimited("edma_rx_reap: NULL skb (linear next) at idx %u\n",
+-							     idx);
+-					dev_kfree_skb_any(skb);
+-					break;
+-				}
++				/* Send the current frame up regardless of
++				 * whether the next slot has a skb. The previous
++				 * version dropped the *current* (valid) skb on
++				 * a NULL-next, which lost up to 50% of LAN RX.
++				 */
++				bool ok = edma_rx_handle_linear_packets(rxdesc_ring,
++									rxdesc_pri,
++									skb);
+ 
+-				if (unlikely(!
+-					     edma_rx_handle_linear_packets(rxdesc_ring,
+-									   rxdesc_pri, skb)))
++				if (unlikely(!ok))
+ 					dev_kfree_skb_any(skb);
+ 
++				/* Prefetch the next iteration's skb — but only
++				 * if another iteration will actually run.
++				 * Otherwise the prefetched skb's slot is
++				 * NULL'd but the skb is never used, leaking
++				 * one frame per NAPI poll.
++				 */
++				if (work_to_do) {
++					u32 idx = cons_idx &
++						  EDMA_RX_RING_SIZE_MASK;
++
++					next_skb = rxdesc_ring->rxfill->skbs[idx];
++					rxdesc_ring->rxfill->skbs[idx] = NULL;
++					if (unlikely(!next_skb)) {
++						work_done++;
++						break;
++					}
++				}
++
+ 				goto next_rx_desc;
+ 			}
+ 		}
+ 
+-		{
+-			u32 idx = next_rxdesc_pri->word2 & EDMA_RX_RING_SIZE_MASK;
++		if (work_to_do) {
++			u32 idx = cons_idx & EDMA_RX_RING_SIZE_MASK;
++
+ 			next_skb = rxdesc_ring->rxfill->skbs[idx];
+ 			rxdesc_ring->rxfill->skbs[idx] = NULL;
+ 			if (unlikely(!next_skb)) {
+-				pr_debug_ratelimited("edma_rx_reap: NULL skb (scatter next) at idx %u\n",
+-						     idx);
++				pr_warn_ratelimited("edma_rx_reap: NULL skb (scatter next) at skbs[%u] (cons_idx %u)\n",
++						    idx, cons_idx);
+ 				break;
+ 			}
+ 		}

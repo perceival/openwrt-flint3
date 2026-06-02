@@ -1,0 +1,73 @@
+From: Kamil Bienkiewicz <perceivalpercy@gmail.com>
+Date: Mon, 18 May 2026 04:30:00 +0000
+Subject: [PATCH] clk: qcom: nsscc-ipq5332: skip HALT poll on nssnoc_* branches
+
+The NSS-NOC interconnect clocks (nssnoc_ce_apb, nssnoc_ce_axi,
+nssnoc_eip, nssnoc_nss_csr, nssnoc_ppe_cfg, nssnoc_ppe) are kept
+running by hardware on this SoC. Polling their HALT bit on disable
+times out and produces a WARN per attempt; on qcommbe boots the
+qcom-ppe icc_sync_state() cleanup triggers many of these in
+sequence, flooding the UART and starving procd's watchdog feed.
+
+Switch their halt_check to BRANCH_HALT_SKIP so clk_branch_toggle()
+returns immediately instead of polling the HALT bit, eliminating
+the WARN flood and the secondary watchdog reset it caused.
+
+Signed-off-by: Kamil Bienkiewicz <perceivalpercy@gmail.com>
+---
+--- a/drivers/clk/qcom/nsscc-ipq5332.c	2026-05-18 04:32:18.550959990 +0200
++++ b/drivers/clk/qcom/nsscc-ipq5332.c	2026-05-18 04:32:30.569551440 +0200
+@@ -625,7 +625,7 @@
+ 
+ static struct clk_branch nss_cc_nssnoc_ce_apb_clk = {
+ 	.halt_reg = 0x5f4,
+-	.halt_check = BRANCH_HALT,
++	.halt_check = BRANCH_HALT_SKIP,
+ 	.clkr = {
+ 		.enable_reg = 0x5f4,
+ 		.enable_mask = BIT(0),
+@@ -643,7 +643,7 @@
+ 
+ static struct clk_branch nss_cc_nssnoc_ce_axi_clk = {
+ 	.halt_reg = 0x5f8,
+-	.halt_check = BRANCH_HALT,
++	.halt_check = BRANCH_HALT_SKIP,
+ 	.clkr = {
+ 		.enable_reg = 0x5f8,
+ 		.enable_mask = BIT(0),
+@@ -661,7 +661,7 @@
+ 
+ static struct clk_branch nss_cc_nssnoc_eip_clk = {
+ 	.halt_reg = 0x660,
+-	.halt_check = BRANCH_HALT,
++	.halt_check = BRANCH_HALT_SKIP,
+ 	.clkr = {
+ 		.enable_reg = 0x660,
+ 		.enable_mask = BIT(0),
+@@ -679,7 +679,7 @@
+ 
+ static struct clk_branch nss_cc_nssnoc_nss_csr_clk = {
+ 	.halt_reg = 0x6b4,
+-	.halt_check = BRANCH_HALT,
++	.halt_check = BRANCH_HALT_SKIP,
+ 	.clkr = {
+ 		.enable_reg = 0x6b4,
+ 		.enable_mask = BIT(0),
+@@ -697,7 +697,7 @@
+ 
+ static struct clk_branch nss_cc_nssnoc_ppe_cfg_clk = {
+ 	.halt_reg = 0x444,
+-	.halt_check = BRANCH_HALT,
++	.halt_check = BRANCH_HALT_SKIP,
+ 	.clkr = {
+ 		.enable_reg = 0x444,
+ 		.enable_mask = BIT(0),
+@@ -715,7 +715,7 @@
+ 
+ static struct clk_branch nss_cc_nssnoc_ppe_clk = {
+ 	.halt_reg = 0x440,
+-	.halt_check = BRANCH_HALT,
++	.halt_check = BRANCH_HALT_SKIP,
+ 	.clkr = {
+ 		.enable_reg = 0x440,
+ 		.enable_mask = BIT(0),

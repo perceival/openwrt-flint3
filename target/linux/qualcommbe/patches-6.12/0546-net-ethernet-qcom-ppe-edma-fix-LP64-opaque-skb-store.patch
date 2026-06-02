@@ -1,0 +1,67 @@
+From: Kamil Bienkiewicz <perceivalpercy@gmail.com>
+Date: Fri, 22 May 2026 13:00:00 +0000
+Subject: [PATCH] net: ethernet: qcom: ppe: edma: store full 64-bit opaque skb
+ pointer in descriptors
+
+EDMA_RXFILL_OPAQUE_HI_SET / EDMA_TXDESC_OPAQUE_HI_SET (and their
+respective call sites) are gated on `#ifdef __LP64__`. That's a
+userspace toolchain macro defined by glibc/musl — it is **NOT**
+defined when the kernel is compiled. The kernel uses CONFIG_64BIT
+instead.
+
+On a 64-bit aarch64 kernel, the result is that only the low 32 bits
+of the opaque skb pointer are written to the descriptor's word2.
+word3 (the high half) stays zero. When edma_rx_napi_poll later
+reconstructs `skb = (uintptr_t)(word2 | (word3 << 32))` it gets
+something like 0x0000000000847000 — a userspace-looking value —
+instead of the true ffffffc0... kernel pointer.
+
+The reap loop then dereferences this NULL-high-half "skb" pointer
+in `skb->dev = ndev` and oopses with "Unable to handle kernel
+write to read-only memory at virtual address 0x..." where the
+address is a small offset into a value that should have been an
+sk_buff base.
+
+This was the actual root cause behind the two earlier oopses at
+edma_rx_napi_poll+0x134 (skb=0x1e) and +0x168 (skb=0x10) — both
+the same "low-32-bits-of-an-skb pointer" pattern.
+
+Fix all three occurrences (rx caller, rx header macro definition,
+tx header macro definition) to use CONFIG_64BIT instead of
+__LP64__.
+
+Signed-off-by: Kamil Bienkiewicz <perceivalpercy@gmail.com>
+---
+--- a/drivers/net/ethernet/qualcomm/ppe/edma_rx.c
++++ b/drivers/net/ethernet/qualcomm/ppe/edma_rx.c
+@@ -90,7 +90,7 @@
+ 		EDMA_RXFILL_BUFFER_ADDR_SET(rxfill_desc, buff_addr);
+
+ 		EDMA_RXFILL_OPAQUE_LO_SET(rxfill_desc, skb);
+-#ifdef __LP64__
++#ifdef CONFIG_64BIT
+ 		EDMA_RXFILL_OPAQUE_HI_SET(rxfill_desc, skb);
+ #endif
+ 		EDMA_RXFILL_PACKET_LEN_SET(rxfill_desc,
+--- a/drivers/net/ethernet/qualcomm/ppe/edma_rx.h
++++ b/drivers/net/ethernet/qualcomm/ppe/edma_rx.h
+@@ -108,7 +108,7 @@
+
+ #define EDMA_RXFILL_OPAQUE_LO_SET(desc, ptr)	(((desc)->word2) = \
+ 						(u32)(uintptr_t)(ptr))
+-#ifdef __LP64__
++#ifdef CONFIG_64BIT
+ #define EDMA_RXFILL_OPAQUE_HI_SET(desc, ptr)	(((desc)->word3) = \
+ 						(u32)((u64)(ptr) >> 0x20))
+ #endif
+--- a/drivers/net/ethernet/qualcomm/ppe/edma_tx.h
++++ b/drivers/net/ethernet/qualcomm/ppe/edma_tx.h
+@@ -76,7 +76,7 @@
+ 				(FIELD_PREP(EDMA_TXDESC_SERVICE_CODE_MASK, x)))
+ #define EDMA_TXDESC_BUFFER_ADDR_SET(desc, addr)	(((desc)->word0) = (addr))
+
+-#ifdef __LP64__
++#ifdef CONFIG_64BIT
+ #define EDMA_TXDESC_OPAQUE_GET(_desc) ({ \
+ 			typeof(_desc) (desc) = (_desc); \
+ 			(((u64)(desc)->word3 << 32) | (desc)->word2); })

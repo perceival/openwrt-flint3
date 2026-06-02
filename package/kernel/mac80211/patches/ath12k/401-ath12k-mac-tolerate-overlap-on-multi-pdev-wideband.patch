@@ -1,0 +1,57 @@
+From: Percival <perceivalpercy@gmail.com>
+Date: Thu, 14 May 2026 01:05:00 +0000
+Subject: [PATCH] wifi: ath12k: tolerate overlapping channels when merging
+ wideband multi-pdev bands
+
+ath12k_mac_update_band() exists to support the "split mac" topology - two
+MACs in the same band advertising disjoint channel ranges that get merged
+into one supported_band. The function WARNs and refuses if the second MAC
+re-enables a channel that the first already enabled.
+
+On QCN9274 dualmac boards (single chip, two wideband PHYs each capable of
+5 GHz + 6 GHz), firmware reports overlapping channel lists for both PHYs.
+The split-mac assumption doesn't hold: both pdevs claim the full 5 GHz set
+and (when applicable) the full 6 GHz set. mac_register then fails with:
+
+  WARN at ath12k/mac.c:13149  ath12k_mac_update_band
+  ath12k_mac_register failed
+  ath12k_core_qmi_firmware_ready failed
+  ath12k_pci ...: unable to start hw group
+
+Without proper merging support for this topology yet, at least let
+mac_register complete by treating already-enabled channels in the merge
+target as a no-op. The first pdev "owns" the band; the second one's
+redundant channels are silently dropped. The device probes and wlan
+interfaces appear, which is strictly better than bailing out entirely.
+
+Tested-on: QCN9274 hw2.0 PCI (GL.iNet Flint 3) with WLAN.WBE.1.6 fw.
+
+Signed-off-by: Percival <perceivalpercy@gmail.com>
+---
+--- a/drivers/net/wireless/ath/ath12k/mac.c
++++ b/drivers/net/wireless/ath/ath12k/mac.c
+@@ -13143,12 +13143,19 @@
+ 	for (i = 0; i < new_band->n_channels; i++) {
+ 		if (new_band->channels[i].flags & IEEE80211_CHAN_DISABLED)
+ 			continue;
+-		/* An enabled channel in new_band should not be already enabled
+-		 * in the orig_band
++		/*
++		 * In the split-mac topology a channel enabled by the new pdev
++		 * is expected to still be disabled in the orig band. On wideband
++		 * QCN9274 dualmac, however, firmware reports the *same* channel
++		 * range from both PHYs; the second pdev's claim on an already
++		 * enabled channel is a no-op rather than an error.
+ 		 */
+-		if (WARN_ON(!(orig_band->channels[i].flags &
+-			      IEEE80211_CHAN_DISABLED)))
+-			return -EINVAL;
++		if (!(orig_band->channels[i].flags & IEEE80211_CHAN_DISABLED)) {
++			ath12k_dbg(ar->ab, ATH12K_DBG_MAC,
++				   "mac band %d ch %d already owned by earlier pdev, skipping\n",
++				   orig_band->band, new_band->channels[i].hw_value);
++			continue;
++		}
+ 		orig_band->channels[i].flags &= ~IEEE80211_CHAN_DISABLED;
+ 	}
+ 	return 0;

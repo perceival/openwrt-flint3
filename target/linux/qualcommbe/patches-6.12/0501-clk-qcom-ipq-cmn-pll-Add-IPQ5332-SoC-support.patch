@@ -1,0 +1,76 @@
+From: Kamil Bienkiewicz <perceivalpercy@gmail.com>
+Date: Sat, 17 May 2026 21:00:00 +0000
+Subject: [PATCH] clk: qcom: ipq-cmn-pll: Add IPQ5332 SoC support
+
+The CMN PLL in IPQ5332 supplies fixed clocks: XO (24 MHz), sleep
+(32 kHz), two NSS reference clocks at 200 MHz and 300 MHz that the
+NSSCC clock controller consumes, and an Ethernet 50 MHz tap.
+
+Refactor probe to select the per-SoC output clock array via
+device_get_match_data() and a sentinel-terminated table, matching
+the upstream-ready pattern.
+
+Signed-off-by: Kamil Bienkiewicz <perceivalpercy@gmail.com>
+---
+--- a/drivers/clk/qcom/ipq-cmn-pll.c	2026-05-17 23:10:57.177581372 +0200
++++ b/drivers/clk/qcom/ipq-cmn-pll.c	2026-05-17 23:11:43.659373938 +0200
+@@ -46,6 +46,7 @@
+ #include <linux/regmap.h>
+ 
+ #include <dt-bindings/clock/qcom,ipq-cmn-pll.h>
++#include <dt-bindings/clock/qcom,ipq5332-cmn-pll.h>
+ 
+ #define CMN_PLL_REFCLK_SRC_SELECTION		0x28
+ #define CMN_PLL_REFCLK_SRC_DIV			GENMASK(9, 8)
+@@ -115,6 +116,16 @@
+ 	CLK_PLL_OUTPUT(ETH1_50MHZ_CLK, "eth1-50mhz", 50000000UL),
+ 	CLK_PLL_OUTPUT(ETH2_50MHZ_CLK, "eth2-50mhz", 50000000UL),
+ 	CLK_PLL_OUTPUT(ETH_25MHZ_CLK, "eth-25mhz", 25000000UL),
++	{ /* Sentinel */ }
++};
++
++static const struct cmn_pll_fixed_output_clk ipq5332_output_clks[] = {
++	CLK_PLL_OUTPUT(IPQ5332_XO_24MHZ_CLK, "xo-24mhz", 24000000UL),
++	CLK_PLL_OUTPUT(IPQ5332_SLEEP_32KHZ_CLK, "sleep-32khz", 32000UL),
++	CLK_PLL_OUTPUT(IPQ5332_NSS_200MHZ_CLK, "nss-200mhz", 200000000UL),
++	CLK_PLL_OUTPUT(IPQ5332_NSS_300MHZ_CLK, "nss-300mhz", 300000000UL),
++	CLK_PLL_OUTPUT(IPQ5332_ETH_50MHZ_CLK, "eth-50mhz", 50000000UL),
++	{ /* Sentinel */ }
+ };
+ 
+ /*
+@@ -297,7 +308,7 @@
+ 
+ static int ipq_cmn_pll_register_clks(struct platform_device *pdev)
+ {
+-	const struct cmn_pll_fixed_output_clk *fixed_clk;
++	const struct cmn_pll_fixed_output_clk *p, *fixed_clk;
+ 	struct clk_hw_onecell_data *hw_data;
+ 	struct device *dev = &pdev->dev;
+ 	struct clk_hw *cmn_pll_hw;
+@@ -305,8 +316,13 @@
+ 	struct clk_hw *hw;
+ 	int ret, i;
+ 
+-	fixed_clk = ipq9574_output_clks;
+-	num_clks = ARRAY_SIZE(ipq9574_output_clks);
++	fixed_clk = device_get_match_data(dev);
++	if (!fixed_clk)
++		return -EINVAL;
++
++	num_clks = 0;
++	for (p = fixed_clk; p->name; p++)
++		num_clks++;
+ 
+ 	hw_data = devm_kzalloc(dev, struct_size(hw_data, hws, num_clks + 1),
+ 			       GFP_KERNEL);
+@@ -415,7 +431,8 @@
+ };
+ 
+ static const struct of_device_id ipq_cmn_pll_clk_ids[] = {
+-	{ .compatible = "qcom,ipq9574-cmn-pll", },
++	{ .compatible = "qcom,ipq5332-cmn-pll", .data = &ipq5332_output_clks },
++	{ .compatible = "qcom,ipq9574-cmn-pll", .data = &ipq9574_output_clks },
+ 	{ }
+ };
+ MODULE_DEVICE_TABLE(of, ipq_cmn_pll_clk_ids);

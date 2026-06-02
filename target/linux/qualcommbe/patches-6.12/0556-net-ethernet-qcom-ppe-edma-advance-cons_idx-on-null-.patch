@@ -1,0 +1,69 @@
+From: Kamil Bienkiewicz <perceivalpercy@gmail.com>
+Date: Sat, 23 May 2026 10:50:00 +0000
+Subject: [PATCH] net: ethernet: qcom: ppe: edma: advance cons_idx on null-skb
+ abort
+
+Patch 0554 added NULL-skb guards to `edma_rx_reap` so the kernel
+doesn't deref NULL when the IPQ5332 EDMA hands us a phantom or
+duplicate descriptor. But the pre-loop guard `return 0` doesn't
+advance cons_idx, so the next NAPI tick sees the same descriptor,
+hits the same NULL, and aborts again. With HW continuously signaling
+RX available, this becomes a NAPI livelock — millions of callbacks
+per second, ratelimit-suppressed prints still saturate the console,
+and the rdinit shell becomes unresponsive.
+
+Fix: when the pre-loop guard fires, also write `cons_idx = (cons_idx
++ 1) & MASK` and commit it to HW, so the descriptor is consumed and
+NAPI moves on. Same for the inner-loop scatter path. The linear
+inner-loop path already `break`s out of the loop which falls through
+to the existing tail that commits cons_idx, so it's already correct.
+
+Also demote the pr_warn_ratelimited to pr_debug_ratelimited — once
+the cons_idx advances, the print isn't load-bearing, and even
+ratelimited it dominated the console under heavy bad-descriptor flow.
+
+Signed-off-by: Kamil Bienkiewicz <perceivalpercy@gmail.com>
+---
+--- a/drivers/net/ethernet/qualcomm/ppe/edma_rx.c
++++ b/drivers/net/ethernet/qualcomm/ppe/edma_rx.c
+@@ -488,8 +488,16 @@ static int edma_rx_reap(struct edma_rxdesc_ring *rxdesc_ring, int budget)
+ 		next_skb = rxdesc_ring->rxfill->skbs[idx];
+ 		rxdesc_ring->rxfill->skbs[idx] = NULL;
+ 		if (unlikely(!next_skb)) {
+-			pr_warn_ratelimited("edma_rx_reap: NULL skb at idx %u (stale/dup desc); aborting batch\n",
+-					    idx);
++			/* Advance past the bad descriptor so HW doesn't
++			 * keep re-signaling RX on the same slot.
++			 */
++			pr_debug_ratelimited("edma_rx_reap: NULL skb at idx %u; skipping\n",
++					     idx);
++			cons_idx = (cons_idx + 1) & EDMA_RX_RING_SIZE_MASK;
++			rxdesc_ring->cons_idx = cons_idx;
++			reg = EDMA_BASE_OFFSET +
++			      EDMA_REG_RXDESC_CONS_IDX(rxdesc_ring->ring_id);
++			regmap_write(regmap, reg, cons_idx);
+ 			return 0;
+ 		}
+ 	}
+@@ -544,8 +552,8 @@ static int edma_rx_reap(struct edma_rxdesc_ring *rxdesc_ring, int budget)
+ 				next_skb = rxdesc_ring->rxfill->skbs[idx];
+ 				rxdesc_ring->rxfill->skbs[idx] = NULL;
+ 				if (unlikely(!next_skb)) {
+-					pr_warn_ratelimited("edma_rx_reap: NULL skb (linear next) at idx %u\n",
+-							    idx);
++					pr_debug_ratelimited("edma_rx_reap: NULL skb (linear next) at idx %u\n",
++							     idx);
+ 					dev_kfree_skb_any(skb);
+ 					break;
+ 				}
+@@ -564,8 +572,8 @@ static int edma_rx_reap(struct edma_rxdesc_ring *rxdesc_ring, int budget)
+ 			next_skb = rxdesc_ring->rxfill->skbs[idx];
+ 			rxdesc_ring->rxfill->skbs[idx] = NULL;
+ 			if (unlikely(!next_skb)) {
+-				pr_warn_ratelimited("edma_rx_reap: NULL skb (scatter next) at idx %u\n",
+-						    idx);
++				pr_debug_ratelimited("edma_rx_reap: NULL skb (scatter next) at idx %u\n",
++						     idx);
+ 				break;
+ 			}
+ 		}

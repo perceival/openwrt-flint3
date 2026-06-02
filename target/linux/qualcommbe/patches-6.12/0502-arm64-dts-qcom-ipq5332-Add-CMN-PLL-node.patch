@@ -1,0 +1,54 @@
+From: Kamil Bienkiewicz <perceivalpercy@gmail.com>
+Date: Thu, 14 May 2026 10:35:00 +0000
+Subject: [PATCH] arm64: dts: qcom: ipq5332: Add CMN PLL node
+
+Add the CMN PLL clock-controller node at offset 0x9b000 (same address
+as IPQ5018) plus a ref_48mhz_clk fixed-clock providing the 48 MHz
+reference that the on-board WiFi block feeds to the CMN PLL input
+(matches IPQ9574's setup).
+
+assigned-clock-rates-u64 is deliberately omitted: U-Boot already locks
+the PLL at the right rate before Linux starts. The driver only needs
+to register the fixed-rate output clocks; we don't want it to run a
+reset+re-lock cycle while NSS / ethernet are mid-initialization later.
+
+Signed-off-by: Kamil Bienkiewicz <perceivalpercy@gmail.com>
+---
+--- a/arch/arm64/boot/dts/qcom/ipq5332.dtsi
++++ b/arch/arm64/boot/dts/qcom/ipq5332.dtsi
+@@ -16,6 +16,12 @@
+ 	#size-cells = <2>;
+ 
+ 	clocks {
++		ref_48mhz_clk: ref-48mhz-clk {
++			compatible = "fixed-clock";
++			#clock-cells = <0>;
++			clock-frequency = <48000000>;
++		};
++
+ 		sleep_clk: sleep-clk {
+ 			compatible = "fixed-clock";
+ 			#clock-cells = <0>;
+@@ -179,6 +185,22 @@
+ 			};
+ 		};
+ 
++		cmn_pll: clock-controller@9b000 {
++			compatible = "qcom,ipq5332-cmn-pll";
++			reg = <0x0009b000 0x800>;
++			clocks = <&ref_48mhz_clk>,
++				 <&gcc GCC_CMN_12GPLL_AHB_CLK>,
++				 <&gcc GCC_CMN_12GPLL_SYS_CLK>;
++			clock-names = "ref", "ahb", "sys";
++			#clock-cells = <1>;
++			/*
++			 * The CMN PLL is configured by U-Boot before Linux
++			 * starts; we deliberately omit assigned-clock-rates-u64
++			 * here so the driver only registers fixed-rate output
++			 * clocks and does not re-issue a PLL reset sequence.
++			 */
++		};
++
+ 		rng: rng@e3000 {
+ 			compatible = "qcom,prng-ee";
+ 			reg = <0x000e3000 0x1000>;

@@ -1,0 +1,85 @@
+From: Kamil Bienkiewicz <perceivalpercy@gmail.com>
+Date: Sun, 24 May 2026 12:00:00 +0000
+Subject: [PATCH] clk: qcom: nsscc-ipq5332: dedicated PPE freq_tbl + drop
+ CLK_SET_RATE_PARENT
+
+PPE_CLK_SRC currently shares ftbl_nss_cc_ce_clk_src which was copied
+from the IPQ5424 driver and lies about the rates produced on this SoC:
+
+    F(375000000, P_CMN_PLL_NSS_200M_CLK, 1, 0, 0)
+
+On IPQ5424 the matching CMN PLL tap really outputs 375 MHz. On IPQ5332
+the CMN PLL only emits 200 MHz from this tap (verified live: nss-200mhz
+is registered at 200000000 Hz in clk_summary), so the entry describes
+an unreachable rate.
+
+Combined with CLK_SET_RATE_PARENT on the RCG, this broke every
+clk_set_rate() call from the PPE driver:
+
+  1. ppe.c calls clk_set_rate(ppe, 353000000)
+  2. _freq_tbl_determine_rate() picks the F(375M, ...) entry via CEIL
+  3. With CLK_SET_RATE_PARENT, the framework asks the parent
+     (nss-200mhz, a fixed-rate clock) to produce 375 MHz
+  4. clk_calc_new_rates() on a fixed-rate clock with no further parent
+     returns NULL
+  5. clk_core_set_rate_nolock() reports -EINVAL to the caller
+
+Observed live on Flint 3 (boot dmesg):
+  qcom_ppe 3a000000.ethernet: clk_set_rate(ppe, 353000000) failed: -22,
+                              using current rate 24000000
+
+The whole PPE clock subtree is then stuck at 24 MHz (XO), causing
+~95% packet loss under sustained LAN traffic (PPE engine starved).
+
+Fix:
+
+  * Give PPE_CLK_SRC its own freq_tbl with rates the IPQ5332 CMN PLL
+    can actually deliver: 24 MHz (XO), 200 MHz (NSS_200M), 300 MHz
+    (NSS_300M).
+  * Drop CLK_SET_RATE_PARENT from PPE_CLK_SRC so the framework no
+    longer tries to retune the fixed parent.
+
+With CEIL semantics, the PPE driver's clk_set_rate(353M) now lands
+on the 300 MHz entry (the last one matched when no exact ceiling
+exists) — the highest the IPQ5332 CMN PLL can deliver to the PPE.
+
+CE_CLK_SRC and EIP_BFDCD_CLK_SRC still share the original (wrong) table
+but no consumer calls clk_set_rate() on them today, so the bug is
+inert there. U-Boot leaves CE at GPLL0/1 = 800 MHz which Linux reads
+back via recalc_rate without consulting the table.
+
+Signed-off-by: Kamil Bienkiewicz <perceivalpercy@gmail.com>
+---
+--- a/drivers/clk/qcom/nsscc-ipq5332.c
++++ b/drivers/clk/qcom/nsscc-ipq5332.c
+@@ -558,17 +558,28 @@ static struct clk_rcg2 nss_cc_port3_tx_clk_src = {
+ 	},
+ };
+
++/*
++ * IPQ5332 CMN PLL only provides 200 and 300 MHz NSS reference taps —
++ * a dedicated table avoids inheriting ftbl_nss_cc_ce_clk_src's bogus
++ * 375 MHz / NSS_200M entry copied from the IPQ5424 driver.
++ */
++static const struct freq_tbl ftbl_nss_cc_ppe_clk_src[] = {
++	F(24000000,  P_CMN_PLL_XO_CLK,       1, 0, 0),
++	F(200000000, P_CMN_PLL_NSS_200M_CLK, 1, 0, 0),
++	F(300000000, P_CMN_PLL_NSS_300M_CLK, 1, 0, 0),
++	{ }
++};
++
+ static struct clk_rcg2 nss_cc_ppe_clk_src = {
+ 	.cmd_rcgr = 0x3ec,
+ 	.mnd_width = 0,
+ 	.hid_width = 5,
+ 	.parent_map = nss_cc_parent_map_0,
+-	.freq_tbl = ftbl_nss_cc_ce_clk_src,
++	.freq_tbl = ftbl_nss_cc_ppe_clk_src,
+ 	.clkr.hw.init = &(const struct clk_init_data){
+ 		.name = "nss_cc_ppe_clk_src",
+ 		.parent_data = nss_cc_parent_data_0,
+ 		.num_parents = ARRAY_SIZE(nss_cc_parent_data_0),
+-		.flags = CLK_SET_RATE_PARENT,
+ 		.ops = &clk_rcg2_ops,
+ 	},
+ };

@@ -1,0 +1,40 @@
+From: Kamil Bienkiewicz <perceivalpercy@gmail.com>
+Date: Thu, 28 May 2026 04:30:00 +0000
+Subject: [PATCH] net: ethernet: qualcomm: ppe: edma: demote AXI error prints to
+ debug
+
+Even with `net_ratelimit()` (0555), the AXI read/write error prints
+appear ~2/sec on IPQ5332 while EDMA is in a degraded state. That's
+enough volume — together with the "callbacks suppressed" lines — to
+clog the 115200 baud UART console and make the rdinit shell unusable
+when AXI errors are spurious (which they often are during bring-up).
+
+The percpu stats counters in `edma_axi_read_err` /
+`edma_axi_write_err` still get incremented, so the condition remains
+observable via ethtool. Drop the pr_err to pr_debug_ratelimited so
+the console stays clean. Re-enable with dynamic_debug if needed for
+diagnosis.
+
+Signed-off-by: Kamil Bienkiewicz <perceivalpercy@gmail.com>
+---
+--- a/drivers/net/ethernet/qualcomm/ppe/edma.c
++++ b/drivers/net/ethernet/qualcomm/ppe/edma.c
+@@ -295,16 +295,14 @@ static irqreturn_t edma_misc_handle_irq(int irq, void *ctx)
+ 	pr_debug("Received misc irq %d, status: %d\n", irq, misc_intr_status);
+ 
+ 	if (FIELD_GET(EDMA_MISC_AXI_RD_ERR_MASK, misc_intr_status)) {
+-		if (net_ratelimit())
+-			pr_err("MISC AXI read error received\n");
++		pr_debug_ratelimited("MISC AXI read error received\n");
+ 		u64_stats_update_begin(&stats->syncp);
+ 		++stats->edma_axi_read_err;
+ 		u64_stats_update_end(&stats->syncp);
+ 	}
+ 
+ 	if (FIELD_GET(EDMA_MISC_AXI_WR_ERR_MASK, misc_intr_status)) {
+-		if (net_ratelimit())
+-			pr_err("MISC AXI write error received\n");
++		pr_debug_ratelimited("MISC AXI write error received\n");
+ 		u64_stats_update_begin(&stats->syncp);
+ 		++stats->edma_axi_write_err;
+ 		u64_stats_update_end(&stats->syncp);

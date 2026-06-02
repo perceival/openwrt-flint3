@@ -1,0 +1,33 @@
+From: Kamil Bienkiewicz <perceivalpercy@gmail.com>
+Date: Sat, 16 May 2026 15:00:00 +0000
+Subject: [PATCH] net: ethernet: qualcomm: ppe: Tolerate clk_set_rate failure
+
+The IPQ9574 reference set PPE_CLK_RATE = 353 MHz, which corresponds
+to one of nsscc-ipq9574's PPE_CLK_SRC mux paths. On IPQ5332 the
+nsscc PPE_CLK_SRC mux table is a subset and may not have a parent
+that can reach 353 MHz, causing clk_set_rate() → -EINVAL.
+
+Log the failure and continue with whatever rate U-Boot left the
+clock at (typically 200/300 MHz from cmn_pll). The PPE driver doesn't
+need an exact 353 MHz to initialize — it just propagates the rate
+to the icc bandwidth and PPE child clocks. Sub-optimal performance is
+acceptable for first-bring-up; the rate can be tuned via DT later.
+
+Signed-off-by: Kamil Bienkiewicz <perceivalpercy@gmail.com>
+---
+--- a/drivers/net/ethernet/qualcomm/ppe/ppe.c
++++ b/drivers/net/ethernet/qualcomm/ppe/ppe.c
+@@ -163,8 +163,11 @@
+ 		return PTR_ERR(clk);
+
+ 	ret = clk_set_rate(clk, ppe_rate);
+-	if (ret)
+-		return ret;
++	if (ret) {
++		dev_warn(dev, "clk_set_rate(ppe, %lu) failed: %d, using current rate %lu\n",
++			 ppe_rate, ret, clk_get_rate(clk));
++		ppe_dev->clk_rate = clk_get_rate(clk);
++	}
+
+ 	ret = devm_clk_bulk_get_all_enable(dev, &clks);
+ 	if (ret < 0)

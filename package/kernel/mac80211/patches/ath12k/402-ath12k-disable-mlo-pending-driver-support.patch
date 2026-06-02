@@ -1,0 +1,40 @@
+From: Percival <perceivalpercy@gmail.com>
+Date: Thu, 14 May 2026 05:35:00 +0000
+Subject: [PATCH] wifi: ath12k: defer MLO capability advertisement
+
+When the QCN9274 firmware advertises the MLO feature in firmware-2.bin
+(features = "multi-qrtr-id,mlo"), ath12k sets ag->mlo_capable=true which
+then makes mac80211 enforce the full MLO API contract on registration
+(link_info_changed, AMPDU_AGGREGATION, MFP_CAPABLE, AP_LINK_PS, etc).
+ath12k as shipped doesn't satisfy all of those, so ieee80211_register_hw
+fails with -EINVAL and the device never comes up.
+
+Until the driver's MLO surface is complete, mask the firmware-advertised
+MLO bit so we register as a non-MLO multi-pdev driver. The dualmac AMSS
+firmware still loads (its selection is independent of the MLO feature
+bit) and both PHYs come up as separate wiphys / radios.
+
+Signed-off-by: Percival <perceivalpercy@gmail.com>
+---
+--- a/drivers/net/wireless/ath/ath12k/core.c
++++ b/drivers/net/wireless/ath/ath12k/core.c
+@@ -2152,10 +2152,16 @@
+ 
+ 	if (ag->num_devices == 1) {
+ 		ab = ag->ab[0];
+-		/* QCN9274 firmware uses firmware IE for MLO advertisement */
++		/*
++		 * Even when firmware advertises MLO via firmware-N.bin, the
++		 * upstream ath12k driver doesn't yet satisfy all of mac80211's
++		 * MLO registration requirements (link_info_changed, AP_LINK_PS,
++		 * etc), so ieee80211_register_hw fails with -EINVAL. Keep MLO
++		 * disabled until that gap is closed; the dualmac AMSS still
++		 * loads (its selection is independent of this bit).
++		 */
+ 		if (ab->fw.fw_features_valid) {
+-			ag->mlo_capable =
+-				ath12k_fw_feature_supported(ab, ATH12K_FW_FEATURE_MLO);
++			ag->mlo_capable = false;
+ 			return;
+ 		}
+ 

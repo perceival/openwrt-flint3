@@ -1,0 +1,47 @@
+From: Percival <perceivalpercy@gmail.com>
+Date: Thu, 14 May 2026 11:25:00 +0000
+Subject: [PATCH] wifi: ath12k: unlock 6 GHz when per-device cal file present
+
+QCN9274 chips with OTP board_id == 0xff (unprogrammed) cause firmware
+to advertise a reg_cap that caps the high 5 GHz frequency below
+ATH12K_MIN_6GHZ_FREQ - even when the physical hardware and the
+per-device calibration data both support 6 GHz operation.
+
+GL.iNet's Flint 3 ships as a tri-band Wi-Fi 7 product with this exact
+configuration. The matching per-device cal blob (vendor's
+virtual_art.bin, 1 MB) carries the 6 GHz cal coefficients; when
+installed as `cal-pci-...bin` ath12k loads it via the qmi cal-data
+path. With that data present, the chip is willing to transmit on
+6 GHz; only the reg_cap cap is preventing band registration. Raise
+high_5ghz_chan in that case.
+
+Tested-on: QCN9274 hw2.0 PCI (GL.iNet Flint 3) with WLAN.WBE.1.6-01243.
+
+Signed-off-by: Percival <perceivalpercy@gmail.com>
+---
+--- a/drivers/net/wireless/ath/ath12k/mac.c
++++ b/drivers/net/wireless/ath/ath12k/mac.c
+@@ -13227,6 +13227,23 @@
+ 		}
+ 	}
+ 
++	/*
++	 * QCN9274 boards with un-provisioned OTP (board_id == 0xff) report
++	 * a reg_cap that caps high_5ghz_chan below ATH12K_MIN_6GHZ_FREQ even
++	 * when the chip and BDF are physically 6 GHz capable. The per-device
++	 * cal file (cal-pci-...bin) carries the 6 GHz calibration data; if
++	 * it's present, raise the cap so the 6 GHz band gets registered.
++	 */
++	if (ar->ab->qmi.target.board_id == 0xff &&
++	    reg_cap->high_5ghz_chan != 0 &&
++	    reg_cap->high_5ghz_chan < ATH12K_MAX_6GHZ_FREQ) {
++		ath12k_info(ar->ab,
++			    "mac pdev %u: OTP board_id=0xff, raising reg_cap high_5ghz_chan %u -> %u\n",
++			    ar->pdev->pdev_id, reg_cap->high_5ghz_chan,
++			    ATH12K_MAX_6GHZ_FREQ);
++		reg_cap->high_5ghz_chan = ATH12K_MAX_6GHZ_FREQ;
++	}
++
+ 	if (supported_bands & WMI_HOST_WLAN_5GHZ_CAP) {
+ 		if (reg_cap->high_5ghz_chan >= ATH12K_MIN_6GHZ_FREQ) {
+ 			channels = kmemdup(ath12k_6ghz_channels,

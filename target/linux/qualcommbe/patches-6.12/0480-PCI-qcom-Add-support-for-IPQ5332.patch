@@ -1,0 +1,20 @@
+From: Kamil Bienkiewicz <perceivalpercy@gmail.com>
+Date: Sat, 17 May 2026 22:00:00 +0000
+Subject: [PATCH] PCI: qcom: Add support for IPQ5332
+
+Add qcom,pcie-ipq5332 compatible string for the PCIe controller on
+IPQ5332, which is the same configuration family (cfg_2_9_0) as IPQ9574
+already supported in this driver.
+
+Signed-off-by: Kamil Bienkiewicz <perceivalpercy@gmail.com>
+---
+--- a/drivers/pci/controller/dwc/pcie-qcom.c
++++ b/drivers/pci/controller/dwc/pcie-qcom.c
+@@ -1829,6 +1829,7 @@ static const struct of_device_id qcom_pc
+ 	{ .compatible = "qcom,pcie-ipq4019", .data = &cfg_2_4_0 },
+ 	{ .compatible = "qcom,pcie-ipq6018", .data = &cfg_2_9_0 },
+ 	{ .compatible = "qcom,pcie-ipq8064", .data = &cfg_2_1_0 },
++	{ .compatible = "qcom,pcie-ipq5332", .data = &cfg_2_9_0 },
+ 	{ .compatible = "qcom,pcie-ipq8064-v2", .data = &cfg_2_1_0 },
+ 	{ .compatible = "qcom,pcie-ipq8074", .data = &cfg_2_3_3 },
+ 	{ .compatible = "qcom,pcie-ipq8074-gen3", .data = &cfg_2_9_0 },

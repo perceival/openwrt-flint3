@@ -1,0 +1,60 @@
+From: Kamil Bienkiewicz <perceivalpercy@gmail.com>
+Date: Sat, 23 May 2026 02:55:00 +0000
+Subject: [PATCH] net: ethernet: qcom: ppe: edma: alloc err_stats in setup, not
+ only in debugfs
+
+The EDMA misc IRQ handler (edma_misc_handle_irq in edma.c) does
+
+    struct edma_err_stats *stats = this_cpu_ptr(edma_ctx->err_stats);
+
+at its very first instruction. But `edma_err_stats_alloc()` is only
+called from `edma_debugfs_setup()` (drivers/.../edma_debugfs.c:352).
+On IPQ5332 the first misc IRQ fires shortly after link-up, before
+debugfs registration has run — `edma_ctx->err_stats` is still NULL,
+and `this_cpu_ptr(NULL)` is a small per-CPU offset which then dies
+in the handler with a paging fault at `edma_misc_handle_irq+0x1a8`.
+
+Move the alloc into `edma_setup()` so it always runs at probe.
+Remove the duplicate alloc from debugfs setup (keep the file
+exposure only).
+
+Signed-off-by: Kamil Bienkiewicz <perceivalpercy@gmail.com>
+---
+--- a/drivers/net/ethernet/qualcomm/ppe/edma.c
++++ b/drivers/net/ethernet/qualcomm/ppe/edma.c
+@@ -918,6 +918,17 @@ int edma_setup(struct ppe_device *ppe_dev)
+ 		return ret;
+ 	}
+
++	/* Allocate err_stats here (not only from debugfs setup) so the
++	 * misc IRQ handler's `this_cpu_ptr(edma_ctx->err_stats)` always
++	 * resolves to a valid percpu allocation. Without this, the first
++	 * misc IRQ after link-up crashes in edma_misc_handle_irq+0x1a8.
++	 */
++	ret = edma_err_stats_alloc();
++	if (ret) {
++		dev_err(dev, "Failed to alloc edma err_stats: %d\n", ret);
++		return ret;
++	}
++
+ 	ret = edma_irq_init();
+ 	if (ret) {
+ 		dev_err(dev, "Error in irq initialization\n");
+--- a/drivers/net/ethernet/qualcomm/ppe/edma_debugfs.c
++++ b/drivers/net/ethernet/qualcomm/ppe/edma_debugfs.c
+@@ -348,11 +348,10 @@ int edma_debugfs_setup(void)
+ 		goto debugfs_dir_failed;
+ 	}
+
+-	/* Allocate memory for EDMA miscellaneous stats */
+-	if (edma_err_stats_alloc() < 0) {
+-		pr_err("Unable to allocate miscellaneous percpu stats\n");
+-		goto debugfs_dir_failed;
+-	}
++	/* err_stats is now allocated in edma_setup (in edma.c) so the
++	 * misc IRQ handler can rely on it before debugfs is up. Just
++	 * expose the file here.
++	 */
+
+ 	if (!debugfs_create_file("err_stats", 0444, stats_dentry,
+ 				 NULL, &edma_debugfs_misc_file_ops)) {

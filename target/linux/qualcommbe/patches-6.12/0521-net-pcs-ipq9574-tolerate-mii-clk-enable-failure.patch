@@ -1,0 +1,46 @@
+From: Kamil Bienkiewicz <perceivalpercy@gmail.com>
+Date: Sun, 17 May 2026 11:00:00 +0000
+Subject: [PATCH] net: pcs: qcom-ipq9574: Tolerate MII clock enable failure
+
+Phylink calls pcs_enable BEFORE pcs_config. clk_prepare_enable on the
+NSSCC uniphy_port_rx/tx_clk branches polls hardware ack of the clock
+branch. On IPQ5332, the underlying SerDes hasn't been configured yet
+when pcs_enable runs, so the upstream RX clock isn't producing pulses
+and the NSSCC branch poll times out → -ETIMEDOUT.
+
+This blocks pcs_enable but phylink ignores the return value, so link
+"comes up" via fixed-link state — but the downstream MII clock gate
+never actually opens. For traffic to flow we need the gate open after
+SerDes is up.
+
+Workaround: in pcs_enable, log clk_prepare_enable failures and return
+0 anyway. clk_prepare reference counting on the failed enable is
+slightly off but the deferred enable in pcs_link_up (if added) would
+recover. For now this just gets us past the pcs_enable wall.
+
+Signed-off-by: Kamil Bienkiewicz <perceivalpercy@gmail.com>
+---
+--- a/drivers/net/pcs/pcs-qcom-ipq9574.c
++++ b/drivers/net/pcs/pcs-qcom-ipq9574.c
+@@ -643,8 +643,8 @@ static int ipq_pcs_enable(struct phylink
+
+ 	ret = clk_prepare_enable(qpcs_mii->rx_clk);
+ 	if (ret) {
+-		dev_err(qpcs->dev, "Failed to enable MII %d RX clock\n", index);
+-		return ret;
++		dev_warn(qpcs->dev, "Failed to enable MII %d RX clock (%d) — continuing\n", index, ret);
++		ret = 0;
+ 	}
+
+ 	ret = clk_prepare_enable(qpcs_mii->tx_clk);
+@@ -653,8 +653,8 @@ static int ipq_pcs_enable(struct phylink
+ 		 * the state back for this error. So, we only report the error
+ 		 * and do not disable the clocks.
+ 		 */
+-		dev_err(qpcs->dev, "Failed to enable MII %d TX clock\n", index);
+-		return ret;
++		dev_warn(qpcs->dev, "Failed to enable MII %d TX clock (%d) — continuing\n", index, ret);
++		ret = 0;
+ 	}
+
+ 	return 0;

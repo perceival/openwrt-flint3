@@ -1,0 +1,45 @@
+From: Kamil Bienkiewicz <perceivalpercy@gmail.com>
+Date: Fri, 15 May 2026 18:00:00 +0000
+Subject: [PATCH] clk: qcom: gcc-ipq5332: mark snoc<->nssnoc bridge clocks critical
+
+The two SNOC->NSSNOC bridge clocks (gcc_snoc_nssnoc_clk at 0x17084 and
+gcc_snoc_nssnoc_1_clk at 0x17090) gate access from the system NoC to
+the NSS sub-system NoC. They are enabled by the bootloader; nothing in
+mainline currently requests them via clk_get(), so clk_disable_unused
+turns them off during late init. Once disabled, any in-flight access
+to the NSS register window from the wrong side of the fabric raises a
+NoC error and the SoC resets ~20ms later.
+
+Observed during boot on GL.iNet GL-BE9300 (Flint 3, IPQ5332) once the
+NSSCC driver started registering, even before any PPE/EDMA/uniphy
+consumer was wired up: kernel reached "clk: Disabling unused clocks",
+brought PCIe Gen3 up, and a NoC-Error reset followed shortly after AER
+init. Booting with clk_ignore_unused on the kernel command line lets
+userspace come up.
+
+Both these bridge clocks need to stay on permanently to keep the NSS
+register apertures reachable from the system fabric, so mark them with
+CLK_IS_CRITICAL.
+
+Signed-off-by: Kamil Bienkiewicz <perceivalpercy@gmail.com>
+---
+--- a/drivers/clk/qcom/gcc-ipq5332.c
++++ b/drivers/clk/qcom/gcc-ipq5332.c
+@@ -2587,7 +2587,7 @@ static struct clk_branch gcc_snoc_nssnoc_1_clk = {
+ 				&gcc_system_noc_bfdcd_clk_src.clkr.hw,
+ 			},
+ 			.num_parents = 1,
+-			.flags = CLK_SET_RATE_PARENT,
++			.flags = CLK_SET_RATE_PARENT | CLK_IS_CRITICAL,
+ 			.ops = &clk_branch2_ops,
+ 		},
+ 	},
+@@ -2605,7 +2605,7 @@ static struct clk_branch gcc_snoc_nssnoc_clk = {
+ 				&gcc_system_noc_bfdcd_clk_src.clkr.hw,
+ 			},
+ 			.num_parents = 1,
+-			.flags = CLK_SET_RATE_PARENT,
++			.flags = CLK_SET_RATE_PARENT | CLK_IS_CRITICAL,
+ 			.ops = &clk_branch2_ops,
+ 		},
+ 	},

@@ -1,0 +1,146 @@
+From: Kamil Bienkiewicz <perceivalpercy@gmail.com>
+Date: Wed, 13 May 2026 14:00:00 +0000
+Subject: [PATCH] arm64: dts: qcom: ipq5332: Add PCIe related nodes
+
+Add phy and controller nodes for the 2-lane Gen3 PCIe3X2 controller.
+IPQ5332 reuses the Qualcomm IP rev 2.9.0 / Synopsys IP rev 5.00a PCIe
+controller block (cfg_2_9_0 in pcie-qcom, shared with IPQ5018 / IPQ6018
+/ IPQ9574) and the PCIe UNIPHY 28LP PHY driver originally written for
+this SoC. The other two PCIe blocks (PCIe3X1_0 / PCIe3X1_1) are left
+out for now since no upstreamed board needs them.
+
+Hook pcie1_phy into the GCC clocks property at the
+DT_PCIE_2LANE_PHY_PIPE_CLK slot so gcc_pcie3x2_pipe_clk_src has a real
+parent.
+
+Signed-off-by: Kamil Bienkiewicz <perceivalpercy@gmail.com>
+---
+ arch/arm64/boot/dts/qcom/ipq5332.dtsi | 121 ++++++++++++++++++++++++++
+ 1 file changed, 121 insertions(+)
+
+--- a/arch/arm64/boot/dts/qcom/ipq5332.dtsi
++++ b/arch/arm64/boot/dts/qcom/ipq5332.dtsi
+@@ -186,6 +186,23 @@
+ 			clock-names = "core";
+ 		};
+ 
++		pcie1_phy: phy@4b1000 {
++			compatible = "qcom,ipq5332-uniphy-pcie-phy";
++			reg = <0x004b1000 0x1000>;
++
++			clocks = <&gcc GCC_PCIE3X2_PIPE_CLK>;
++
++			resets = <&gcc GCC_PCIE3X2_PHY_BCR>,
++				 <&gcc GCC_PCIE3X2PHY_PHY_BCR>;
++
++			#clock-cells = <0>;
++			#phy-cells = <0>;
++
++			num-lanes = <2>;
++
++			status = "disabled";
++		};
++
+ 		tlmm: pinctrl@1000000 {
+ 			compatible = "qcom,ipq5332-tlmm";
+ 			reg = <0x01000000 0x300000>;
+@@ -212,7 +229,7 @@
+ 			#interconnect-cells = <1>;
+ 			clocks = <&xo_board>,
+ 				 <&sleep_clk>,
+-				 <0>,
++				 <&pcie1_phy>,
+ 				 <0>,
+ 				 <0>;
+ 		};
+@@ -479,6 +496,90 @@
+ 				status = "disabled";
+ 			};
+ 		};
++
++		pcie1: pcie@18000000 {
++			compatible = "qcom,pcie-ipq5332";
++			reg = <0x18000000 0xf1d>,
++			      <0x18000f20 0xa8>,
++			      <0x18001000 0x1000>,
++			      <0x00088000 0x3000>,
++			      <0x18100000 0x1000>;
++			reg-names = "dbi",
++				    "elbi",
++				    "atu",
++				    "parf",
++				    "config";
++			device_type = "pci";
++			linux,pci-domain = <1>;
++			bus-range = <0x00 0xff>;
++			num-lanes = <2>;
++			#address-cells = <3>;
++			#size-cells = <2>;
++
++			max-link-speed = <3>;
++
++			phys = <&pcie1_phy>;
++			phy-names = "pciephy";
++
++			ranges = <0x01000000 0 0x00000000 0x18200000 0 0x00100000>,
++				 <0x02000000 0 0x18300000 0x18300000 0 0x07d00000>;
++
++			msi-map = <0x0 &v2m0 0x0 0xff8>;
++
++			interrupts = <GIC_SPI 411 IRQ_TYPE_LEVEL_HIGH>;
++			interrupt-names = "global";
++
++			#interrupt-cells = <1>;
++			interrupt-map-mask = <0 0 0 0x7>;
++			interrupt-map = <0 0 0 1 &intc 0 0 412 IRQ_TYPE_LEVEL_HIGH>,
++					<0 0 0 2 &intc 0 0 413 IRQ_TYPE_LEVEL_HIGH>,
++					<0 0 0 3 &intc 0 0 414 IRQ_TYPE_LEVEL_HIGH>,
++					<0 0 0 4 &intc 0 0 415 IRQ_TYPE_LEVEL_HIGH>;
++
++			clocks = <&gcc GCC_SNOC_PCIE3_2LANE_M_CLK>,
++				 <&gcc GCC_PCIE3X2_AXI_M_CLK>,
++				 <&gcc GCC_PCIE3X2_AXI_S_CLK>,
++				 <&gcc GCC_PCIE3X2_AHB_CLK>,
++				 <&gcc GCC_PCIE3X2_AUX_CLK>,
++				 <&gcc GCC_PCIE3X2_AXI_S_BRIDGE_CLK>,
++				 <&gcc GCC_PCIE3X2_RCHG_CLK>;
++			clock-names = "iface",
++				      "axi_m",
++				      "axi_s",
++				      "ahb",
++				      "aux",
++				      "axi_bridge",
++				      "rchng";
++
++			resets = <&gcc GCC_PCIE3X2_PIPE_ARES>,
++				 <&gcc GCC_PCIE3X2_CORE_STICKY_ARES>,
++				 <&gcc GCC_PCIE3X2_AXI_M_CLK_ARES>,
++				 <&gcc GCC_PCIE3X2_AXI_S_CLK_ARES>,
++				 <&gcc GCC_PCIE3X2_AXI_M_STICKY_ARES>,
++				 <&gcc GCC_PCIE3X2_AXI_S_STICKY_ARES>,
++				 <&gcc GCC_PCIE3X2_AHB_CLK_ARES>,
++				 <&gcc GCC_PCIE3X2_AUX_CLK_ARES>;
++			reset-names = "pipe",
++				      "sticky",
++				      "axi_m",
++				      "axi_s",
++				      "axi_m_sticky",
++				      "axi_s_sticky",
++				      "ahb",
++				      "aux";
++
++			status = "disabled";
++
++			pcie@0 {
++				device_type = "pci";
++				reg = <0x0 0x0 0x0 0x0 0x0>;
++				bus-range = <0x01 0xff>;
++
++				#address-cells = <3>;
++				#size-cells = <2>;
++				ranges;
++			};
++		};
+ 	};
+ 
+ 	timer {

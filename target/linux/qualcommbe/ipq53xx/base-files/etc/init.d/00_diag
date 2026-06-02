@@ -1,0 +1,8 @@
+#!/bin/sh /etc/rc.common
+START=01
+STOP=99
+boot() {
+    echo "DEBUG: init.d/00_diag boot() running ($(date 2>/dev/null || echo no-date))" > /dev/kmsg
+    sleep 1
+    echo "DEBUG: init.d/00_diag boot() returning" > /dev/kmsg
+}

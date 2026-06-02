@@ -1,0 +1,48 @@
+From: Kamil Bienkiewicz <perceivalpercy@gmail.com>
+Date: Tue, 2 Jun 2026 08:55:00 +0000
+Subject: [PATCH] debug: pci: trace inside pci_assign_irq for the QCN
+
+Diagnostic-only. The hang is inside pci_assign_irq() for the QCN9274
+(17cb:1109). Split it to tell whether the config-space read (PCI_INTERRUPT_PIN),
+the map_irq() call, or the config-space write (PCI_INTERRUPT_LINE) wedges.
+Guarded to the QCN endpoint. Remove before merge.
+
+Signed-off-by: Kamil Bienkiewicz <perceivalpercy@gmail.com>
+---
+--- a/drivers/pci/irq.c
++++ b/drivers/pci/irq.c
+@@ -144,6 +144,7 @@ void pci_assign_irq(struct pci_dev *dev)
+ 	u8 slot = -1;
+ 	int irq = 0;
+ 	struct pci_host_bridge *hbrg = pci_find_host_bridge(dev->bus);
++	bool qcn = (dev->vendor == 0x17cb && dev->device == 0x1109);
+
+ 	if (!(hbrg->map_irq)) {
+ 		pci_dbg(dev, "runtime IRQ mapping not provided by arch\n");
+@@ -158,6 +159,8 @@ void pci_assign_irq(struct pci_dev *dev)
+ 	 * apply the swizzle function.
+ 	 */
++	if (qcn) pr_emerg("ASSIGN[1] reading PCI_INTERRUPT_PIN\n");
+ 	pci_read_config_byte(dev, PCI_INTERRUPT_PIN, &pin);
++	if (qcn) pr_emerg("ASSIGN[2] pin=%u\n", pin);
+ 	/* Cope with illegal. */
+ 	if (pin > 4)
+ 		pin = 1;
+@@ -170,7 +173,9 @@ void pci_assign_irq(struct pci_dev *dev)
+ 		 * If a swizzling function is not used, map_irq() must
+ 		 * ignore slot.
+ 		 */
++		if (qcn) pr_emerg("ASSIGN[3] calling map_irq slot=%d pin=%u\n", slot, pin);
+ 		irq = (*(hbrg->map_irq))(dev, slot, pin);
++		if (qcn) pr_emerg("ASSIGN[4] map_irq returned %d\n", irq);
+ 		if (irq == -1)
+ 			irq = 0;
+ 	}
+@@ -183,5 +188,7 @@ void pci_assign_irq(struct pci_dev *dev)
+ 	 * Always tell the device, so the driver knows what is the real IRQ
+ 	 * to use; the device does not use it.
+ 	 */
++	if (qcn) pr_emerg("ASSIGN[5] writing PCI_INTERRUPT_LINE=%d\n", irq);
+ 	pci_write_config_byte(dev, PCI_INTERRUPT_LINE, irq);
++	if (qcn) pr_emerg("ASSIGN[6] done\n");
+ }

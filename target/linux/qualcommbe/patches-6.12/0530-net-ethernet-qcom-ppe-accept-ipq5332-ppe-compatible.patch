@@ -1,0 +1,24 @@
+From: Kamil Bienkiewicz <perceivalpercy@gmail.com>
+Date: Sat, 16 May 2026 12:00:00 +0000
+Subject: [PATCH] net: ethernet: qualcomm: ppe: Accept qcom,ipq5332-ppe
+ compatible
+
+IPQ5332 uses the same NSS-PPE hardware block as IPQ9574 (PPE
+register window at 0x3a000000+0xbef800 layout matches). The
+clock/reset tree differs (fewer ports — 2 vs 6, no UBI32, etc.)
+but those come from DT, not from the driver.
+
+Add the IPQ5332 compat string to the qcom-ppe match table.
+
+Signed-off-by: Kamil Bienkiewicz <perceivalpercy@gmail.com>
+---
+--- a/drivers/net/ethernet/qualcomm/ppe/ppe.c
++++ b/drivers/net/ethernet/qualcomm/ppe/ppe.c
+@@ -233,6 +233,7 @@ static int qcom_ppe_remove(struct platfo
+
+ static const struct of_device_id qcom_ppe_of_match[] = {
+ 	{ .compatible = "qcom,ipq9574-ppe" },
++	{ .compatible = "qcom,ipq5332-ppe" },
+ 	{}
+ };
+ MODULE_DEVICE_TABLE(of, qcom_ppe_of_match);

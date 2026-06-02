@@ -1,0 +1,122 @@
+From: Kamil Bienkiewicz <perceivalpercy@gmail.com>
+Date: Sun, 17 May 2026 14:00:00 +0000
+Subject: [PATCH] clk: qcom: nsscc-ipq5332: export force_port_pcs helper
+
+Adds qcom_nsscc_ipq5332_force_port_pcs(port, tx) — writes CFG_RCGR
+selecting the matching uniphy_{rx,tx} clock parent (src=3 for RX,
+src=4 for TX, per nss_cc_parent_map_1/_2 in nsscc-ipq5332.c) and
+sets CMD UPDATE for the port_rx/tx_clk_src RCG2. Vendor's SSDK
+ssdk_raw_clock_rate_set pattern: no halt poll, just sleep 1ms,
+then read back CMD to warn if UPDATE never cleared.
+
+Called from qcom_ppe's mac_link_up (patch 0552) to make link-up
+deterministic on IPQ5332 USXGMII path. Without this, the SoC's
+PHY-side USXGMII inband signaling sometimes doesn't latch carrier.
+ 
+Signed-off-by: Kamil Bienkiewicz <perceivalpercy@gmail.com>
+---
+--- a/drivers/clk/qcom/nsscc-ipq5332.c	2026-05-17 19:01:57.731782377 +0200
++++ b/drivers/clk/qcom/nsscc-ipq5332.c	2026-05-17 19:03:02.297809084 +0200
+@@ -1288,6 +1288,91 @@
+ 	.icc_first_node_id = IPQ_NSSCC_ID,
+ };
+ 
++/* Forward declarations for exported helpers below. */
++int qcom_nsscc_ipq5332_force_port_pcs(unsigned int port, bool tx);
++
++#define NSSCC_PORT1_RX_CMD	0x4b4
++#define NSSCC_PORT1_TX_CMD	0x4c0
++#define NSSCC_PORT2_RX_CMD	0x4cc
++#define NSSCC_PORT2_TX_CMD	0x4d8
++/* uniphy_port_*_clk branch CBCR registers (offset from NSSCC base). */
++#define NSSCC_PORT1_RX_BR	0x57c
++#define NSSCC_PORT1_TX_BR	0x580
++#define NSSCC_PORT2_RX_BR	0x584
++#define NSSCC_PORT2_TX_BR	0x588
++#define NSSCC_RCG_CMD_UPDATE	BIT(0)
++#define NSSCC_RCG_CFG_SRC_UNIPHY_RX	(3 << 8)
++#define NSSCC_RCG_CFG_SRC_UNIPHY_TX	(4 << 8)
++#define NSSCC_RCG_CFG_DIV_1	1
++
++static struct regmap *nss_cc_ipq5332_regmap;
++static struct device *nss_cc_ipq5332_dev;
++
++int qcom_nsscc_ipq5332_force_port_pcs(unsigned int port, bool tx)
++{
++	struct regmap *r = nss_cc_ipq5332_regmap;
++	u32 cmd_off, br_off, cfg, cmd_val, cfg_val, br_val;
++	int ret;
++
++	if (!r)
++		return -ENODEV;
++
++	switch (port) {
++	case 1:
++		cmd_off = tx ? NSSCC_PORT1_TX_CMD : NSSCC_PORT1_RX_CMD;
++		br_off  = tx ? NSSCC_PORT1_TX_BR  : NSSCC_PORT1_RX_BR;
++		break;
++	case 2:
++		cmd_off = tx ? NSSCC_PORT2_TX_CMD : NSSCC_PORT2_RX_CMD;
++		br_off  = tx ? NSSCC_PORT2_TX_BR  : NSSCC_PORT2_RX_BR;
++		break;
++	default:
++		return -EINVAL;
++	}
++
++	cfg = (tx ? NSSCC_RCG_CFG_SRC_UNIPHY_TX : NSSCC_RCG_CFG_SRC_UNIPHY_RX)
++	      | NSSCC_RCG_CFG_DIV_1;
++
++	if (nss_cc_ipq5332_dev)
++		pm_runtime_get_sync(nss_cc_ipq5332_dev);
++
++	/* Snapshot pre-write state for the kernel log so we can compare to
++	 * vendor's running-state register dump. */
++	regmap_read(r, cmd_off,     &cmd_val);
++	regmap_read(r, cmd_off + 4, &cfg_val);
++	regmap_read(r, br_off,      &br_val);
++	pr_warn("nsscc-ipq5332: port%u %s PRE  CMD@0x%x=0x%x CFG@0x%x=0x%x BR@0x%x=0x%x\n",
++		port, tx ? "TX" : "RX",
++		cmd_off,     cmd_val,
++		cmd_off + 4, cfg_val,
++		br_off,      br_val);
++
++	ret = regmap_write(r, cmd_off + 4, cfg);
++	if (ret)
++		goto out;
++	ret = regmap_update_bits(r, cmd_off, NSSCC_RCG_CMD_UPDATE,
++				 NSSCC_RCG_CMD_UPDATE);
++	if (ret)
++		goto out;
++	usleep_range(1000, 1100);
++
++	regmap_read(r, cmd_off,     &cmd_val);
++	regmap_read(r, cmd_off + 4, &cfg_val);
++	regmap_read(r, br_off,      &br_val);
++	pr_warn("nsscc-ipq5332: port%u %s POST CMD@0x%x=0x%x CFG@0x%x=0x%x BR@0x%x=0x%x %s\n",
++		port, tx ? "TX" : "RX",
++		cmd_off,     cmd_val,
++		cmd_off + 4, cfg_val,
++		br_off,      br_val,
++		(cmd_val & NSSCC_RCG_CMD_UPDATE) ? "UPDATE-STUCK" : "");
++
++out:
++	if (nss_cc_ipq5332_dev)
++		pm_runtime_put(nss_cc_ipq5332_dev);
++	return ret;
++}
++EXPORT_SYMBOL_GPL(qcom_nsscc_ipq5332_force_port_pcs);
++
+ static const struct dev_pm_ops nss_cc_ipq5332_pm_ops = {
+ 	SET_RUNTIME_PM_OPS(pm_clk_suspend, pm_clk_resume, NULL)
+ };
+@@ -1331,6 +1394,10 @@
+ 		return dev_err_probe(&pdev->dev, ret, "Fail to resume\n");
+ 
+ 	ret = qcom_cc_probe(pdev, &nss_cc_ipq5332_desc);
++	if (!ret) {
++		nss_cc_ipq5332_regmap = dev_get_regmap(&pdev->dev, NULL);
++		nss_cc_ipq5332_dev = &pdev->dev;
++	}
+ 	pm_runtime_put(&pdev->dev);
+ 
+ 	return ret;
