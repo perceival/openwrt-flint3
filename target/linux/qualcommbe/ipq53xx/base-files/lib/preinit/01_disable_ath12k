@@ -1,5 +1,0 @@
-# Temporary: skip loading ath12k while we debug the QCN9274 probe hang
-[ -f /etc/modules.d/ath12k ] && {
-    echo "disabling ath12k autoload (debug)" > /dev/kmsg
-    rm -f /etc/modules.d/ath12k
-}
