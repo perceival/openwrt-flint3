@@ -1,0 +1,9 @@
+#!/bin/sh
+# DSA conduit MTU fix (GL-BE9300 / RTL8372N).
+# DSA sizes the CPU conduit eth0 for the 8-byte RTL8_4 CPU tag but NOT the
+# extra 4-byte VLAN tag used by the vlan-aware bridge, so full-1500 frames are
+# silently dropped on the CPU/Wi-Fi path (pings/DNS work, TCP/SSH stall).
+# Bump the conduit to 1600 so tagged 1500-byte frames fit. Idempotent.
+[ "$ACTION" = ifup ] || [ "$ACTION" = ifupdate ] || exit 0
+ip link set dev eth0 mtu 1600 2>/dev/null
+exit 0

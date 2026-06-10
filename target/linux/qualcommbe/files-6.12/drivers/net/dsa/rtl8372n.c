@@ -17,7 +17,10 @@
 
 #include <linux/bitfield.h>
 #include <linux/bitops.h>
+#include <linux/debugfs.h>
 #include <linux/delay.h>
+#include <linux/ktime.h>
+#include <linux/uaccess.h>
 #include <linux/etherdevice.h>
 #include <linux/iopoll.h>
 #include <linux/kernel.h>
@@ -229,6 +232,8 @@ struct rtl8372n_priv {
 	int phy_addr;
 	struct mutex lock;  /* serialises multi-MDIO indirect transactions */
 	struct dsa_switch *ds;
+	struct device *dev;
+	struct dentry *dbgfs;
 	/* Periodic LUT diagnostic — re-read our static CPU-MAC entry every
 	 * few seconds for the first minute to see whether the chip
 	 * preserves it under traffic (testing the nosalearn=1 / age=6
@@ -339,6 +344,141 @@ static int rtl8372n_reg_write(struct rtl8372n_priv *p,
 out:
 	mutex_unlock(&p->lock);
 	return ret;
+}
+
+/* ---- LAN-jack copper-PHY access (indirect via the switch's PHY registers) ----
+ * Method from RuijieNetworksCommunity/openwrt-rtl8372n-driver
+ * (rtl8372n_asicdrv_phy.c, decompiled). 'page' is the Realtek PHY page / MMD
+ * (7 = auto-negotiation). Each rtl8372n_reg_* op takes p->lock on its own, so a
+ * PHY transaction is not globally atomic — fine for the probe-time diagnostic
+ * below; hold the lock across the whole sequence before any runtime use.
+ * See docs/rtl8372n-port-phy-2p5g-plan.md.
+ */
+#define RTL8372N_PHY_PORT_SEL	0x6438
+#define RTL8372N_PHY_CTRL	0x643C
+#define RTL8372N_PHY_DATA_LO	0x6440
+#define RTL8372N_PHY_DATA	0x6444
+#define RTL8372N_PHY_CMD_READ	0x3
+#define RTL8372N_PHY_CMD_WRITE	0x7
+#define RTL8372N_PHY_BUSY	BIT(0)
+#define RTL8372N_PHY_OPSTAT	GENMASK(26, 24)
+
+static bool rtl8372n_adv_2p5g;	/* default off: AN-restart-at-probe loops the boot */
+module_param_named(adv_2p5g, rtl8372n_adv_2p5g, bool, 0444);
+MODULE_PARM_DESC(adv_2p5g,
+	"Experimental: advertise 2.5GBASE-T on the LAN-jack PHYs at probe");
+
+static int rtl8372n_phy_wait(struct rtl8372n_priv *p)
+{
+	u32 ctrl;
+	int i, ret;
+
+	for (i = 0; i < 1000; i++) {
+		ret = rtl8372n_reg_read(p, RTL8372N_PHY_CTRL, &ctrl);
+		if (ret)
+			return ret;
+		if (!(ctrl & (RTL8372N_PHY_BUSY | RTL8372N_PHY_OPSTAT)))
+			return 0;
+	}
+	return -ETIMEDOUT;
+}
+
+static int rtl8372n_phy_read(struct rtl8372n_priv *p, u8 port, u8 page,
+			     u8 reg, u16 *val)
+{
+	u32 v;
+	int ret;
+
+	/* The decompiled reference selects the port via PHY_DATA (0x6444) on
+	 * reads but PHY_PORT_SEL (0x6438) on writes — set both so the port is
+	 * selected whichever the HW consumes; prune once verified on bench.
+	 */
+	ret = rtl8372n_reg_write(p, RTL8372N_PHY_PORT_SEL, BIT(port));
+	if (!ret)
+		ret = rtl8372n_reg_write(p, RTL8372N_PHY_DATA, port);
+	if (!ret)
+		ret = rtl8372n_reg_write(p, RTL8372N_PHY_CTRL,
+					 ((u32)page << 19) | ((u32)reg << 3) |
+					 RTL8372N_PHY_CMD_READ);
+	if (!ret)
+		ret = rtl8372n_phy_wait(p);
+	if (ret)
+		return ret;
+	ret = rtl8372n_reg_read(p, RTL8372N_PHY_DATA_LO, &v);
+	if (!ret)
+		*val = v & 0xffff;
+	return ret;
+}
+
+static int rtl8372n_phy_write(struct rtl8372n_priv *p, u8 port, u8 page,
+			      u8 reg, u16 val)
+{
+	int ret;
+
+	ret = rtl8372n_reg_write(p, RTL8372N_PHY_PORT_SEL, BIT(port));
+	if (!ret)
+		ret = rtl8372n_reg_write(p, RTL8372N_PHY_DATA, val);
+	if (!ret)
+		ret = rtl8372n_reg_write(p, RTL8372N_PHY_CTRL,
+					 ((u32)page << 19) | ((u32)reg << 3) |
+					 RTL8372N_PHY_CMD_WRITE);
+	if (!ret)
+		ret = rtl8372n_phy_wait(p);
+	return ret;
+}
+
+/* Advertise 2.5GBASE-T + restart AN on one LAN-jack PHY. Gated behind adv_2p5g
+ * because the register map above is still unverified on HW. Reference:
+ * rtl8372n_phy_autoNegoAbility_set (MGBASE_AN_CTRL page7/0x20 bit7).
+ */
+static int rtl8372n_phy_enable_2p5g(struct rtl8372n_priv *p, u8 port)
+{
+	u16 v;
+	int ret;
+
+	ret = rtl8372n_phy_read(p, port, 7, 0x20, &v);
+	if (!ret)
+		ret = rtl8372n_phy_write(p, port, 7, 0x20, v | 0x80);
+	if (!ret)
+		ret = rtl8372n_phy_read(p, port, 7, 0x00, &v);
+	if (!ret)
+		ret = rtl8372n_phy_write(p, port, 7, 0x00, v | 0x1200);
+	return ret;
+}
+
+/* Probe-time diagnostic: dump each LAN-jack PHY's AN registers to validate the
+ * indirect-PHY access method and show whether 2.5GBASE-T is advertised
+ * (MGBASE_AN_CTRL bit7 — the suspected reason the 2.5G uplink won't link).
+ * Read-only unless adv_2p5g=1. LAN jacks are switch ports 4..7 (port@4..7).
+ */
+static void rtl8372n_phy_diag(struct rtl8372n_priv *p, struct device *dev)
+{
+	u8 port;
+
+	for (port = 4; port <= 7; port++) {
+		u16 anctrl = 0xffff, anadv = 0xffff, mgbase = 0xffff;
+		int r0, r1, r2;
+
+		r0 = rtl8372n_phy_read(p, port, 7, 0x00, &anctrl);
+		r1 = rtl8372n_phy_read(p, port, 7, 0x10, &anadv);
+		r2 = rtl8372n_phy_read(p, port, 7, 0x20, &mgbase);
+		if (r0 || r1 || r2) {
+			dev_info(dev,
+				 "phy-diag port %u: read err (%d/%d/%d) — access/port-index likely wrong\n",
+				 port, r0, r1, r2);
+			continue;
+		}
+		dev_info(dev,
+			 "phy-diag port %u: AN_CTRL=0x%04x AN_ADV=0x%04x MGBASE_AN_CTRL=0x%04x (2.5G-adv=%u)\n",
+			 port, anctrl, anadv, mgbase, !!(mgbase & 0x80));
+
+		if (rtl8372n_adv_2p5g) {
+			int ret = rtl8372n_phy_enable_2p5g(p, port);
+
+			dev_info(dev, "phy-diag port %u: enable 2.5G adv -> %d\n",
+				 port, ret);
+		}
+	}
 }
 
 /* Read-only baseline dump — proves reg access across the address space, and
@@ -919,7 +1059,7 @@ static void rtl8372n_dump_diag(struct rtl8372n_priv *p, struct device *dev)
 		dev_info(dev, "diag: VLAN_PORT_IGR_FLTR = 0x%08x (per-port ingress filter)\n", v);
 
 	for (port = 3; port <= 8; port++) {
-		if (!(port == 3 || port == 5 || port == 6 || port == 7 || port == 8))
+		if (!(port == 3 || port == 4 || port == 5 || port == 6 || port == 7 || port == 8))
 			continue;
 		if (!rtl8372n_reg_read(p, RTL8372N_REG_PORT_ISO_PMSK(port), &v))
 			dev_info(dev, "diag: PORT_ISO[%u] = 0x%08x (allowed-egress mask)\n",
@@ -927,7 +1067,7 @@ static void rtl8372n_dump_diag(struct rtl8372n_priv *p, struct device *dev)
 	}
 
 	for (port = 3; port <= 8; port++) {
-		if (!(port == 3 || port == 5 || port == 6 || port == 7 || port == 8))
+		if (!(port == 3 || port == 4 || port == 5 || port == 6 || port == 7 || port == 8))
 			continue;
 		if (!rtl8372n_reg_read(p, RTL8372N_REG_MAC_FORCE_CTRL0(port), &v))
 			dev_info(dev,
@@ -1078,14 +1218,37 @@ static int rtl8372n_program_default_vlan(struct rtl8372n_priv *p,
 	(void)rtl8372n_reg_read(p, RTL8372N_REG_VLAN_PORT_EGR_TAG, &ctrl);
 	dev_info(dev, "vlan-init: EGR_TAG = 0x%08x (want 0 = ORIGINAL)\n", ctrl);
 
-	/* Ingress + egress VLAN filtering deliberately NOT enabled. With
-	 * filtering ON the chip drops 100% of test ARP/ICMP traffic —
-	 * presumably because our minimum VLAN setup doesn't program every
-	 * port-membership detail the filter checks against. Leave them
-	 * disabled until we know the full table is correct.
+	/* Enable ingress + egress VLAN filtering. The vendor DAL
+	 * (dal_rtl8373_vlan_init) turns both ON unconditionally; without them
+	 * the chip assigns PVIDs but never ENFORCES membership, so untagged
+	 * frames on an access port bleed across VLANs (a vlan192 access port
+	 * leaks onto vlan10). The earlier "drops 100%" was with the old
+	 * VLAN-1-only setup before a vlan-aware bridge programmed real
+	 * per-port + CPU-port membership; DSA now fills that in.
+	 *
+	 *   Ingress: per-port enable bits 0..9 of IGR_FLTR (0x4E18)
+	 *   Egress:  CVLAN_FILTER = bit 2 of VLAN_CTRL (0x4E14)
 	 */
+	ret = rtl8372n_reg_read(p, RTL8372N_REG_VLAN_PORT_IGR_FLTR, &ctrl);
+	if (!ret) {
+		ctrl |= 0x3FF;	/* all 10 ports */
+		ret = rtl8372n_reg_write(p, RTL8372N_REG_VLAN_PORT_IGR_FLTR, ctrl);
+	}
+	if (ret)
+		dev_warn(dev, "vlan-init: ingress-filter enable failed: %d\n", ret);
+
+	ret = rtl8372n_reg_read(p, RTL8372N_REG_VLAN_CTRL, &ctrl);
+	if (!ret) {
+		ctrl |= BIT(2);	/* CVLAN_FILTER = egress filter */
+		ret = rtl8372n_reg_write(p, RTL8372N_REG_VLAN_CTRL, ctrl);
+	}
+	if (ret)
+		dev_warn(dev, "vlan-init: egress-filter enable failed: %d\n", ret);
+
+	(void)rtl8372n_reg_read(p, RTL8372N_REG_VLAN_PORT_IGR_FLTR, &ctrl);
+	dev_info(dev, "vlan-init: IGR_FLTR = 0x%08x (want bits 0-9 set)\n", ctrl);
 	(void)rtl8372n_reg_read(p, RTL8372N_REG_VLAN_CTRL, &ctrl);
-	dev_info(dev, "vlan-init: VLAN_CTRL = 0x%08x\n", ctrl);
+	dev_info(dev, "vlan-init: VLAN_CTRL = 0x%08x (want bit 2 set)\n", ctrl);
 
 	return 0;
 }
@@ -1570,7 +1733,7 @@ static void rtl8372n_fdb_diag_work(struct work_struct *work)
 			dev_warn(dev, "MIB read rxMacDiscards port %u failed: %d\n",
 				 port, ret);
 
-		dev_info(dev,
+		dev_dbg(dev,
 			 "MIB t+%us port=%u: inUcast=(H=%u L=%u) outUcast=(H=%u L=%u) outDisc=%u inDisc=%u rxMacDisc=%u\n",
 			 (p->fdb_diag_iter * 30 + 30),
 			 port,
@@ -1684,11 +1847,21 @@ static int rtl8372n_port_vlan_add(struct dsa_switch *ds, int port,
 	 * grabbing it would deadlock (the reg helpers re-acquire it).
 	 */
 
-	mbr = p->vid_mbr[vid] | BIT(port);
+	mbr = p->vid_mbr[vid] | BIT(port) | BIT(RTL8372N_EXT_CPU_PORT);
 	if (vlan->flags & BRIDGE_VLAN_INFO_UNTAGGED)
 		untag = p->vid_untag[vid] | BIT(port);
 	else
 		untag = p->vid_untag[vid] & ~BIT(port);
+	/* The CPU/conduit port (3) is a member of every VLAN (forced into mbr
+	 * above; DSA doesn't reliably program CPU-port membership here). On the
+	 * default VLAN 1 it must stay UNTAGGED so the standalone mgmt port
+	 * (lan3, untagged vid 1) can still reach it; on data VLANs it must be
+	 * TAGGED so the vlan-aware bridge sees the 802.1Q tag. Forcing it tagged
+	 * on vid 1 is what broke mgmt — the standalone port expects untagged. */
+	if (vid == 1)
+		untag |= BIT(RTL8372N_EXT_CPU_PORT);
+	else
+		untag &= ~BIT(RTL8372N_EXT_CPU_PORT);
 
 	ret = rtl8372n_write_vlan4k(p, vid, mbr, untag);
 	if (ret) {
@@ -1718,7 +1891,7 @@ static int rtl8372n_port_vlan_add(struct dsa_switch *ds, int port,
 				 port, vid, ret);
 	}
 
-	dev_dbg(ds->dev,
+	dev_info(ds->dev,
 		"vlan_add: vid=%u port=%d flags=0x%x -> mbr=0x%03x untag=0x%03x\n",
 		vid, port, vlan->flags, mbr, untag);
 	return ret;
@@ -1770,6 +1943,32 @@ static int rtl8372n_dsa_setup(struct dsa_switch *ds)
 	 * configuration when bridge support is added.
 	 */
 	dev_info(ds->dev, "DSA setup complete (cpu-tag insertion already enabled)\n");
+
+	/* Program per-port isolation (allowed-egress) masks. U-Boot's vendor
+	 * init only configures the ports it actually uses (3,5,6,7,8), leaving
+	 * lan4 = chip port 4 at the isolated reset default — so its ingress
+	 * never egresses to the CPU and lan4 RX is stuck at 0. The working
+	 * ports sit at 0x3ff; match that for every port we own so all four LAN
+	 * ports forward to the CPU. (cf. JiaY-shi/rtl837x-dsa-driver
+	 * rtl837x_apply_port_matrix.)
+	 */
+	{
+		unsigned int iso_port;
+		u32 iso_v;
+
+		for (iso_port = RTL8372N_EXT_CPU_PORT; iso_port <= 8; iso_port++) {
+			ret = rtl8372n_reg_write(p,
+				RTL8372N_REG_PORT_ISO_PMSK(iso_port), 0x3ff);
+			if (ret)
+				dev_warn(ds->dev,
+					 "port-iso: PORT_ISO[%u] write failed: %d\n",
+					 iso_port, ret);
+		}
+		if (!rtl8372n_reg_read(p, RTL8372N_REG_PORT_ISO_PMSK(4), &iso_v))
+			dev_info(ds->dev,
+				 "port-iso: PORT_ISO[4] (lan4) now 0x%08x\n",
+				 iso_v);
+	}
 
 	/* Pin the conduit (master eth0) MAC to the CPU port in the L2
 	 * LUT as a static entry. Without this, unicast frames addressed
@@ -1987,7 +2186,31 @@ static void rtl8372n_phylink_mac_link_down(struct dsa_switch *ds, int port,
 		dev_warn(dev, "port %d MAC link-down failed: %d\n", port, ret);
 }
 
+/* DSA's dsa_switch_bridge_join() returns -EOPNOTSUPP if this op is absent,
+ * which aborts bridge offload entirely: the port is never registered for
+ * switchdev, so port_vlan_add/port_fdb_add are NEVER called and the chip's
+ * per-VLAN membership is never programmed (VLANs silently never reach the
+ * switch -> CPU islanding). The chip bridges in hardware by default, so for
+ * our single-bridge setup it's enough to accept the offload here; per-VLAN
+ * membership is then driven by port_vlan_add. */
+static int rtl8372n_port_bridge_join(struct dsa_switch *ds, int port,
+				     struct dsa_bridge bridge,
+				     bool *tx_fwd_offload,
+				     struct netlink_ext_ack *extack)
+{
+	dev_info(ds->dev, "port %d bridge_join (offload accepted)\n", port);
+	return 0;
+}
+
+static void rtl8372n_port_bridge_leave(struct dsa_switch *ds, int port,
+				       struct dsa_bridge bridge)
+{
+	dev_info(ds->dev, "port %d bridge_leave\n", port);
+}
+
 static const struct dsa_switch_ops rtl8372n_switch_ops = {
+	.port_bridge_join	= rtl8372n_port_bridge_join,
+	.port_bridge_leave	= rtl8372n_port_bridge_leave,
 	.get_tag_protocol	= rtl8372n_get_tag_protocol,
 	.setup			= rtl8372n_dsa_setup,
 	.phylink_get_caps	= rtl8372n_phylink_get_caps,
@@ -1996,6 +2219,127 @@ static const struct dsa_switch_ops rtl8372n_switch_ops = {
 	.port_vlan_filtering	= rtl8372n_port_vlan_filtering,
 	.port_vlan_add		= rtl8372n_port_vlan_add,
 	.port_vlan_del		= rtl8372n_port_vlan_del,
+};
+
+/* Quiesce/resume the on-die DW8051 microcontroller. It is marked READY in
+ * chip_init and then owns the port-PHY management interface (auto-poll), so a
+ * host-issued PHY op never completes (busy stuck) at runtime. Clear READY before
+ * a manual PHY access and restore it after.
+ */
+static int rtl8372n_dw8051_set_ready(struct rtl8372n_priv *p, bool ready)
+{
+	u32 v;
+	int ret = rtl8372n_reg_read(p, RTL8372N_REG_DW8051_CFG, &v);
+
+	if (ret)
+		return ret;
+	if (ready)
+		v |= RTL8372N_DW8051_READY;
+	else
+		v &= ~RTL8372N_DW8051_READY;
+	return rtl8372n_reg_write(p, RTL8372N_REG_DW8051_CFG, v);
+}
+
+/* The micro's REAL run-control lives in RST_GLB_CTRL_0 (0x24), not the 0x6040
+ * READY handshake: CFG_EN_8051 (b11) = run-enable, DW8051_RST (b4) = reset.
+ * Toggling these actually halts the micro so it stops owning the port-PHY
+ * indirect-access interface — the suspected runtime wedge. (refs/rtl83xx SDK.)
+ */
+#define RTL8372N_REG_RST_GLB_CTRL0	0x24
+#define RTL8372N_RST_CFG_EN_8051	BIT(11)
+#define RTL8372N_RST_DW8051_RST		BIT(4)
+
+static int rtl8372n_dw8051_reset(struct rtl8372n_priv *p, bool assert)
+{
+	u32 v;
+	int ret = rtl8372n_reg_read(p, RTL8372N_REG_RST_GLB_CTRL0, &v);
+
+	if (ret)
+		return ret;
+	if (assert)
+		v |= RTL8372N_RST_DW8051_RST;
+	else
+		v &= ~RTL8372N_RST_DW8051_RST;
+	return rtl8372n_reg_write(p, RTL8372N_REG_RST_GLB_CTRL0, v);
+}
+
+static int rtl8372n_dw8051_cfg_en(struct rtl8372n_priv *p, bool en)
+{
+	u32 v;
+	int ret = rtl8372n_reg_read(p, RTL8372N_REG_RST_GLB_CTRL0, &v);
+
+	if (ret)
+		return ret;
+	if (en)
+		v |= RTL8372N_RST_CFG_EN_8051;
+	else
+		v &= ~RTL8372N_RST_CFG_EN_8051;
+	return rtl8372n_reg_write(p, RTL8372N_REG_RST_GLB_CTRL0, v);
+}
+
+/* debugfs port-PHY poke. Write to /sys/kernel/debug/rtl8372n_phy:
+ *   "<op> <method> <port> <page> <reg> [val]"
+ *     op:     r = phy_read           w = phy_write (needs val)
+ *     method: n = none (plain access — baseline)
+ *             d = clear DW8051_READY (0x6040 b0) around op  [old lever, known no-op]
+ *             x = assert DW8051_RST  (0x24  b4) around op   [real micro reset]
+ *             e = clear CFG_EN_8051  (0x24 b11) around op   [micro run-disable]
+ *   page/reg/val accept 0x.. hex. Logs result + rc + elapsed-us to dmesg, so a
+ *   bounded phy_wait timeout (~ms) is distinguishable from a true MDIO hang.
+ */
+static ssize_t rtl8372n_phy_dbg_write(struct file *file, const char __user *ubuf,
+				      size_t len, loff_t *ppos)
+{
+	struct rtl8372n_priv *p = file->private_data;
+	int page, reg, val = 0, n, ret = -EINVAL;
+	unsigned int port;
+	char buf[64], op, meth;
+	u16 rval = 0;
+	ktime_t t0;
+	s64 us = 0;
+
+	if (len >= sizeof(buf))
+		return -EINVAL;
+	if (copy_from_user(buf, ubuf, len))
+		return -EFAULT;
+	buf[len] = '\0';
+
+	n = sscanf(buf, "%c %c %u %i %i %i", &op, &meth, &port, &page, &reg, &val);
+	if (n < 5)
+		return -EINVAL;
+
+	switch (meth) {			/* enter quiesce via the requested lever */
+	case 'd': rtl8372n_dw8051_set_ready(p, false); break;
+	case 'x': rtl8372n_dw8051_reset(p, true);      break;
+	case 'e': rtl8372n_dw8051_cfg_en(p, false);    break;
+	default:  break;		/* 'n' = none */
+	}
+
+	t0 = ktime_get();
+	if (op == 'r')
+		ret = rtl8372n_phy_read(p, port, page, reg, &rval);
+	else if (op == 'w' && n == 6)
+		ret = rtl8372n_phy_write(p, port, page, reg, val);
+	us = ktime_us_delta(ktime_get(), t0);
+
+	switch (meth) {			/* exit quiesce */
+	case 'd': rtl8372n_dw8051_set_ready(p, true); break;
+	case 'x': rtl8372n_dw8051_reset(p, false);    break;
+	case 'e': rtl8372n_dw8051_cfg_en(p, true);    break;
+	default:  break;
+	}
+
+	dev_info(p->dev,
+		 "phydbg %c meth=%c port%u pg0x%x r0x%x val=0x%04x rc=%d %lldus\n",
+		 op, meth, port, page, reg, (op == 'r' ? rval : (u16)val), ret, us);
+	return (ret == -EINVAL) ? ret : (ssize_t)len;
+}
+
+static const struct file_operations rtl8372n_phy_dbg_fops = {
+	.owner = THIS_MODULE,
+	.open = simple_open,
+	.write = rtl8372n_phy_dbg_write,
+	.llseek = default_llseek,
 };
 
 static int rtl8372n_mdio_probe(struct mdio_device *mdiodev)
@@ -2011,6 +2355,7 @@ static int rtl8372n_mdio_probe(struct mdio_device *mdiodev)
 
 	p->bus = mdiodev->bus;
 	p->phy_addr = mdiodev->addr;
+	p->dev = dev;
 	mutex_init(&p->lock);
 	INIT_DELAYED_WORK(&p->fdb_diag_work, rtl8372n_fdb_diag_work);
 
@@ -2026,6 +2371,9 @@ static int rtl8372n_mdio_probe(struct mdio_device *mdiodev)
 	dev_info(dev, "RTL8372N family chip detected, model=0x%04x\n", model);
 
 	rtl8372n_dump_baseline(p, dev);
+	rtl8372n_phy_diag(p, dev);
+	p->dbgfs = debugfs_create_file("rtl8372n_phy", 0200, NULL, p,
+				       &rtl8372n_phy_dbg_fops);
 	rtl8372n_write_selftest(p, dev);
 	rtl8372n_chip_init(p, dev);
 	rtl8372n_stage_cpu_tag(p, dev);
@@ -2110,6 +2458,7 @@ static void rtl8372n_mdio_remove(struct mdio_device *mdiodev)
 	if (!p)
 		return;
 
+	debugfs_remove(p->dbgfs);
 	cancel_delayed_work_sync(&p->fdb_diag_work);
 
 	if (p->ds)

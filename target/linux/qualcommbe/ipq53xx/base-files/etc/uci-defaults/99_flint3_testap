@@ -1,0 +1,34 @@
+#!/bin/sh
+# Wired-only deploy: keep BOTH radios DISABLED on first boot.
+# Standing rule — never auto-raise wireless (esp. the moodsy SSID) on this
+# unit without explicit OK. WLAN bring-up is a separate, deliberate step.
+# (2.4G PAS auth is still -22; 5/6G beaconing unverified.)
+
+board=$(strings /proc/device-tree/compatible 2>/dev/null | head -n1)
+case "$board" in
+glinet,gl-be9300|gl.inet,gl-be9300|glinet-gl-be9300)
+	;;
+*)
+	# Not our board; skip silently
+	exit 0
+	;;
+esac
+
+# Generate wireless config if wifi-detect hasn't yet, then force radios off.
+if ! [ -f /etc/config/wireless ]; then
+	/sbin/wifi detect > /etc/config/wireless 2>/dev/null || true
+fi
+if ! uci -q get wireless.@wifi-device[0] >/dev/null; then
+	echo "no wifi radios present; nothing to disable" > /dev/kmsg
+	exit 0
+fi
+
+# Disable every radio that exists (index 0..N).
+i=0
+while uci -q get wireless.@wifi-device[$i] >/dev/null; do
+	uci -q set wireless.@wifi-device[$i].disabled='1'
+	i=$((i+1))
+done
+uci -q commit wireless
+
+exit 0

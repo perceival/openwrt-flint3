@@ -12,6 +12,9 @@ define Device/glinet_gl-be9300
 	DEVICE_PACKAGES := \
 		ipq-wifi-glinet_gl-be9300 \
 		ath12k-firmware-qcn9274 \
-		e2fsprogs kmod-fs-ext4 losetup
+		ipq5332-wifi-firmware \
+		e2fsprogs kmod-fs-ext4 losetup \
+		kmod-fs-f2fs mkf2fs f2fsck \
+		-wpad-basic-mbedtls wpad-mbedtls dawn umdns
 endef
 TARGET_DEVICES += glinet_gl-be9300

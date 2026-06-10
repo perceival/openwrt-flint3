@@ -1,0 +1,47 @@
+From: Kamil Bienkiewicz <perceivalpercy@gmail.com>
+Subject: [PATCH] net: ethernet: qualcomm: ppe: ack EDMA misc IRQ status (W1C)
+
+The EDMA misc interrupt handler only counts errors and never acks the
+MISC_INT_STAT register, and edma_enable_misc_interrupt() unmasks without
+clearing any pending status. On IPQ5332 a latched misc condition (observed
+when the WAN/eth1 RTL8221B PHY is linked at boot) then fires the instant the
+misc IRQ is unmasked and re-fires forever -> IRQ storm -> RCU stall, which
+manifests as a hang inside the final regmap_write of edma_setup().
+
+Clear (W1C) any pending status before unmasking, and ack the handled status
+in the handler so a latched condition cannot storm the CPU.
+
+Signed-off-by: Kamil Bienkiewicz <perceivalpercy@gmail.com>
+---
+--- a/drivers/net/ethernet/qualcomm/ppe/edma.c
++++ b/drivers/net/ethernet/qualcomm/ppe/edma.c
+@@ -273,7 +273,16 @@
+ {
+ 	struct ppe_device *ppe_dev = edma_ctx->ppe_dev;
+ 	struct regmap *regmap = ppe_dev->regmap;
+-	u32 reg;
++	u32 reg, stat;
++
++	/* clear any latched misc status (W1C) before unmasking.
++	 * The handler doesn't ack the status, so a pending condition (correlates
++	 * with the WAN PHY connected at boot) would fire on unmask and re-fire
++	 * forever -> IRQ storm -> RCU stall in this very write. */
++	reg = EDMA_BASE_OFFSET + EDMA_REG_MISC_INT_STAT_ADDR;
++	regmap_read(regmap, reg, &stat);
++	if (stat)
++		regmap_write(regmap, reg, stat);
+ 
+ 	reg = EDMA_BASE_OFFSET + EDMA_REG_MISC_INT_MASK_ADDR;
+ 	regmap_write(regmap, reg, edma_ctx->intr_info.intr_mask_misc);
+@@ -356,6 +365,11 @@
+ 		u64_stats_update_end(&stats->syncp);
+ 	}
+ 
++	/* ack the handled misc status (W1C) so a latched
++	 * condition does not re-fire immediately and storm the CPU. */
++	reg = EDMA_BASE_OFFSET + EDMA_REG_MISC_INT_STAT_ADDR;
++	regmap_write(regmap, reg, misc_intr_status);
++
+ 	return IRQ_HANDLED;
+ }
+ 

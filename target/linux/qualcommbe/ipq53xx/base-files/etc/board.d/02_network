@@ -7,7 +7,11 @@ ipq53xx_setup_interfaces()
 
 	case "$board" in
 	glinet,gl-be9300)
-		ucidef_set_interfaces_lan_wan "lan1 lan2 lan3 lan4" "eth1"
+		# LAN-only: the AP runs off the LAN-uplink (trunk on lan3).
+		# eth1/WAN is deliberately NOT assigned — bringing up the WAN
+		# USXGMII PCS wedges the nss_cc port1 RCG (UPDATE-STUCK) and
+		# triggers a watchdog reset (WDog 0x4 / reason 0x69) at ~26s.
+		ucidef_set_interface_lan "lan1 lan2 lan3 lan4"
 		;;
 	*)
 		echo "Unsupported hardware. Network interfaces not initialized"

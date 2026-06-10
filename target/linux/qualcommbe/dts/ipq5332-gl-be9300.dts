@@ -42,7 +42,7 @@
 			no-map;
 		};
 
-		wcnss@4a900000 {
+		q6_region: wcnss@4a900000 {
 			reg = <0x0 0x4a900000 0x0 0x2300000>;
 			no-map;
 		};
@@ -57,8 +57,13 @@
 			no-map;
 		};
 
-		q6_caldb@4ce00000 {
+		q6_caldb: q6_caldb@4ce00000 {
 			reg = <0x0 0x4ce00000 0x0 0x500000>;
+			no-map;
+		};
+
+		mlo_global_mem: mlo_global_mem@4db00000 {
+			reg = <0x0 0x4db00000 0x0 0x1200000>;
 			no-map;
 		};
 
@@ -127,6 +132,17 @@
 	non-removable;
 	pinctrl-0 = <&sdc_default_state>;
 	pinctrl-names = "default";
+	/*
+	 * Hard block-reset (GCC SDCC BCR). When U-Boot boots the kernel off
+	 * eMMC (bootipq), it leaves the SDHCI controller mid-transfer; Linux's
+	 * soft RESET_ALL then times out ("mmc0: Reset 0x1 never completed") and
+	 * mmcblk0 never enumerates -> rootwait hangs -> RCU stall at ~61s.
+	 * sdhci-msm asserts/deasserts this reset at probe to fully clear the
+	 * controller. Missing from the upstream ipq5332 dtsi; ipq8074/ipq6018
+	 * wire the same SDCC BCR. Verified: TFTP-boot (no U-Boot mmc touch) was
+	 * always clean; only the eMMC-boot path wedged.
+	 */
+	resets = <&gcc GCC_SDCC_BCR>;
 	status = "okay";
 };
 
@@ -150,7 +166,18 @@
 	perst-gpios = <&tlmm 47 GPIO_ACTIVE_LOW>;
 	wake-gpios = <&tlmm 30 GPIO_ACTIVE_LOW>;
 
+	/* QCN6274/QCN9274 5 GHz + 6 GHz radios — working (ath12k, real clients, SAE + DHCP). */
 	status = "okay";
+
+	/*
+	 * WORKAROUND: ath12k uses MSI (msi-map -> v2m), not legacy INTx.
+	 * The inherited INTx interrupt-map (INTA-D -> GIC SPI 412-415) hangs
+	 * inside pci_assign_irq() during device bind (HW-verified 2026-06-02).
+	 * Drop it so pci_assign_irq sets dev->irq=0 and skips the GIC INTx
+	 * alloc; the QCN9274 is serviced entirely via MSI.
+	 */
+	/delete-property/ interrupt-map;
+	/delete-property/ interrupt-map-mask;
 
 	pcie@0 {
 		wifi@0,0 {
@@ -278,8 +305,12 @@
 			 * phy-handle + phy_read once the driver grows
 			 * internal-MDIO access.
 			 */
-			port@4 {
-				reg = <4>;
+			/* LAN4 jack is RTL8372N switch port 8 (NOT port 4 — port 4
+			 * is a secondary 1G CPU/trunk port). Confirmed via vendor
+			 * swconfig + chip register port-probe + GL.iNet forum.
+			 */
+			port@8 {
+				reg = <8>;
 				label = "lan4";
 				phy-mode = "internal";
 				fixed-link { speed = <2500>; full-duplex; };
@@ -405,4 +436,238 @@
 
 &watchdog {
 	status = "disabled";
+};
+
+/*
+ * IPQ5332 on-SoC 2.4 GHz radio: multipd Q6 remoteproc + ath12k AHB wifi.
+ * Values decoded from the vendor DT (from-ap2/ap2-dtb.tar.gz) and the qualcommax
+ * multipd reference (ipq5018-qcn6122.dtsi, binding qcom,multipd-pil.yaml + 0189).
+ * Driver side: patches 0595-0605 (multipd) + ath12k AHB (patch 201). Firmware in
+ * from-ap2/firmware/IPQ5332-stock/ (q6_fw0/q6_fw1/iu_fw/m3/regdb).
+ *
+ * !!! UNTESTED ON HW. Fields marked VERIFY are the likely iteration points:
+ *     firmware-name paths (must match staged /lib/firmware location), the
+ *     qcom,rproc target PD, and the memory-region phandles. !!!
+ */
+/ {
+	wcss: smp2p-wcss {
+		compatible = "qcom,smp2p";
+		qcom,smem = <435>, <428>;
+		interrupt-parent = <&intc>;
+		interrupts = <GIC_SPI 418 IRQ_TYPE_EDGE_RISING>;
+		mboxes = <&apcs_glb 9>;
+		qcom,local-pid = <0>;
+		qcom,remote-pid = <1>;
+
+		wcss_smp2p_out: master-kernel {
+			qcom,entry-name = "master-kernel";
+			#qcom,smem-state-cells = <1>;
+		};
+
+		wcss_smp2p_in: slave-kernel {
+			qcom,entry-name = "slave-kernel";
+			interrupt-controller;
+			#interrupt-cells = <2>;
+		};
+	};
+};
+
+&{/soc@0} {
+	q6v5_wcss: remoteproc@d100000 {
+		/*
+		 * 2.4 GHz on-SoC Q6/WCSS radio — WORK IN PROGRESS, disabled by default.
+		 * Driver (multipd + ath12k AHB), DT and firmware staging are done, but
+		 * Q6 bring-up is blocked at the TrustZone PAS step:
+		 * qcom_scm_pas_auth_and_reset(0xD) returns -22 (res[0]=-32), even with
+		 * the correct TIP ath12k firmware (the vendor WIFIFW blob is for the
+		 * proprietary cnss driver). GL.iNet/QCA are looking into the TZ side.
+		 * To test: set this and wifi@c000000 to "okay", and stage the TIP
+		 * ath12k IPQ5332 firmware to /lib/firmware/IPQ5332/ (see README).
+		 */
+		status = "disabled";
+		compatible = "qcom,ipq5332-q6-mpd";
+		reg = <0x0d100000 0x4040>;
+		reg-names = "qdsp6";
+		/* VERIFY: vendor multipd used a single entry "IPQ5332/q6_fw0.mdt".
+		 * mpd.c request_firmware()s EVERY entry, and there is no internal-radio
+		 * m3 in the stock fw (m3.bin is qcn9224/ only), so keep one entry. If the
+		 * Q6 needs an M3 as firmware[1], add it here once identified on HW. */
+		firmware-name = "IPQ5332/q6_fw0.mdt";
+		interrupts-extended = <&intc GIC_SPI 421 IRQ_TYPE_EDGE_RISING>,
+				      <&wcss_smp2p_in 0 IRQ_TYPE_NONE>,
+				      <&wcss_smp2p_in 1 IRQ_TYPE_NONE>,
+				      <&wcss_smp2p_in 2 IRQ_TYPE_NONE>,
+				      <&wcss_smp2p_in 3 IRQ_TYPE_NONE>;
+		interrupt-names = "wdog", "fatal", "ready", "handover", "stop-ack";
+		qcom,smem-states = <&wcss_smp2p_out 0>, <&wcss_smp2p_out 1>;
+		qcom,smem-state-names = "shutdown", "stop";
+		memory-region = <&q6_region>; /* VERIFY: vendor lists 5; driver uses index 0 */
+		qcom,bootargs_version = <2>;
+
+		glink-edge {
+			interrupts = <GIC_SPI 417 IRQ_TYPE_EDGE_RISING>;
+			label = "rtr";
+			qcom,remote-pid = <1>;
+			mboxes = <&apcs_glb 8>;
+		};
+
+		q6_wcss_pd1: pd-1 {
+			firmware-name = "IPQ5332/q6_fw0.mdt"; /* VERIFY: userpd fw is loaded by ath12k ahb.c */
+			interrupts-extended = <&wcss_smp2p_in 8 IRQ_TYPE_NONE>,
+					      <&wcss_smp2p_in 9 IRQ_TYPE_NONE>,
+					      <&wcss_smp2p_in 12 IRQ_TYPE_NONE>,
+					      <&wcss_smp2p_in 11 IRQ_TYPE_NONE>;
+			interrupt-names = "fatal", "ready", "spawn-ack", "stop-ack";
+			qcom,smem-states = <&wcss_smp2p_out 8>, <&wcss_smp2p_out 9>, <&wcss_smp2p_out 10>;
+			qcom,smem-state-names = "shutdown", "stop", "spawn";
+		};
+
+		q6_wcss_pd2: pd-2 {
+			firmware-name = "IPQ5332/q6_fw0.mdt"; /* VERIFY: userpd fw is loaded by ath12k ahb.c */
+			interrupts-extended = <&wcss_smp2p_in 16 IRQ_TYPE_NONE>,
+					      <&wcss_smp2p_in 17 IRQ_TYPE_NONE>,
+					      <&wcss_smp2p_in 20 IRQ_TYPE_NONE>,
+					      <&wcss_smp2p_in 19 IRQ_TYPE_NONE>;
+			interrupt-names = "fatal", "ready", "spawn-ack", "stop-ack";
+			qcom,smem-states = <&wcss_smp2p_out 16>, <&wcss_smp2p_out 17>, <&wcss_smp2p_out 18>;
+			qcom,smem-state-names = "shutdown", "stop", "spawn";
+		};
+
+		q6_wcss_pd3: pd-3 {
+			firmware-name = "IPQ5332/q6_fw0.mdt"; /* VERIFY: userpd fw is loaded by ath12k ahb.c */
+			interrupts-extended = <&wcss_smp2p_in 24 IRQ_TYPE_NONE>,
+					      <&wcss_smp2p_in 25 IRQ_TYPE_NONE>,
+					      <&wcss_smp2p_in 28 IRQ_TYPE_NONE>,
+					      <&wcss_smp2p_in 27 IRQ_TYPE_NONE>;
+			interrupt-names = "fatal", "ready", "spawn-ack", "stop-ack";
+			qcom,smem-states = <&wcss_smp2p_out 24>, <&wcss_smp2p_out 25>, <&wcss_smp2p_out 26>;
+			qcom,smem-state-names = "shutdown", "stop", "spawn";
+		};
+	};
+
+	wifi: wifi@c000000 {
+		/* 2.4 GHz ath12k AHB — WIP, disabled (depends on q6v5_wcss above; PAS -22). */
+		status = "disabled";
+		compatible = "qcom,ipq5332-wifi";
+		reg = <0x0c000000 0x1000000>;
+		clocks = <&xo_board>;
+		clock-names = "xo";
+		interrupts =
+			     <GIC_SPI 559 IRQ_TYPE_EDGE_RISING>,
+			     <GIC_SPI 560 IRQ_TYPE_EDGE_RISING>,
+			     <GIC_SPI 561 IRQ_TYPE_EDGE_RISING>,
+			     <GIC_SPI 422 IRQ_TYPE_EDGE_RISING>,
+			     <GIC_SPI 423 IRQ_TYPE_EDGE_RISING>,
+			     <GIC_SPI 424 IRQ_TYPE_EDGE_RISING>,
+			     <GIC_SPI 425 IRQ_TYPE_EDGE_RISING>,
+			     <GIC_SPI 426 IRQ_TYPE_EDGE_RISING>,
+			     <GIC_SPI 427 IRQ_TYPE_EDGE_RISING>,
+			     <GIC_SPI 428 IRQ_TYPE_EDGE_RISING>,
+			     <GIC_SPI 429 IRQ_TYPE_EDGE_RISING>,
+			     <GIC_SPI 430 IRQ_TYPE_EDGE_RISING>,
+			     <GIC_SPI 431 IRQ_TYPE_EDGE_RISING>,
+			     <GIC_SPI 432 IRQ_TYPE_EDGE_RISING>,
+			     <GIC_SPI 433 IRQ_TYPE_EDGE_RISING>,
+			     <GIC_SPI 491 IRQ_TYPE_EDGE_RISING>,
+			     <GIC_SPI 495 IRQ_TYPE_EDGE_RISING>,
+			     <GIC_SPI 493 IRQ_TYPE_EDGE_RISING>,
+			     <GIC_SPI 544 IRQ_TYPE_EDGE_RISING>,
+			     <GIC_SPI 457 IRQ_TYPE_EDGE_RISING>,
+			     <GIC_SPI 466 IRQ_TYPE_EDGE_RISING>,
+			     <GIC_SPI 497 IRQ_TYPE_EDGE_RISING>,
+			     <GIC_SPI 454 IRQ_TYPE_EDGE_RISING>,
+			     <GIC_SPI 453 IRQ_TYPE_EDGE_RISING>,
+			     <GIC_SPI 452 IRQ_TYPE_EDGE_RISING>,
+			     <GIC_SPI 451 IRQ_TYPE_EDGE_RISING>,
+			     <GIC_SPI 488 IRQ_TYPE_EDGE_RISING>,
+			     <GIC_SPI 488 IRQ_TYPE_EDGE_RISING>,
+			     <GIC_SPI 484 IRQ_TYPE_EDGE_RISING>,
+			     <GIC_SPI 554 IRQ_TYPE_EDGE_RISING>,
+			     <GIC_SPI 554 IRQ_TYPE_EDGE_RISING>,
+			     <GIC_SPI 549 IRQ_TYPE_EDGE_RISING>,
+			     <GIC_SPI 507 IRQ_TYPE_EDGE_RISING>,
+			     <GIC_SPI 500 IRQ_TYPE_EDGE_RISING>,
+			     <GIC_SPI 499 IRQ_TYPE_EDGE_RISING>,
+			     <GIC_SPI 498 IRQ_TYPE_EDGE_RISING>,
+			     <GIC_SPI 450 IRQ_TYPE_EDGE_RISING>,
+			     <GIC_SPI 449 IRQ_TYPE_EDGE_RISING>,
+			     <GIC_SPI 448 IRQ_TYPE_EDGE_RISING>,
+			     <GIC_SPI 447 IRQ_TYPE_EDGE_RISING>,
+			     <GIC_SPI 543 IRQ_TYPE_EDGE_RISING>,
+			     <GIC_SPI 486 IRQ_TYPE_EDGE_RISING>,
+			     <GIC_SPI 486 IRQ_TYPE_EDGE_RISING>,
+			     <GIC_SPI 482 IRQ_TYPE_EDGE_RISING>,
+			     <GIC_SPI 419 IRQ_TYPE_EDGE_RISING>,
+			     <GIC_SPI 558 IRQ_TYPE_EDGE_RISING>,
+			     <GIC_SPI 558 IRQ_TYPE_EDGE_RISING>,
+			     <GIC_SPI 558 IRQ_TYPE_EDGE_RISING>,
+			     <GIC_SPI 558 IRQ_TYPE_EDGE_RISING>,
+			     <GIC_SPI 558 IRQ_TYPE_EDGE_RISING>,
+			     <GIC_SPI 558 IRQ_TYPE_EDGE_RISING>,
+			     <GIC_SPI 558 IRQ_TYPE_EDGE_RISING>,
+			     <GIC_SPI 558 IRQ_TYPE_EDGE_RISING>,
+			     <GIC_SPI 558 IRQ_TYPE_EDGE_RISING>,
+			     <GIC_SPI 558 IRQ_TYPE_EDGE_RISING>,
+			     <GIC_SPI 558 IRQ_TYPE_EDGE_RISING>;
+		interrupt-names =
+				  "misc-pulse1",
+				  "misc-latch",
+				  "sw-exception",
+				  "ce0",
+				  "ce1",
+				  "ce2",
+				  "ce3",
+				  "ce4",
+				  "ce5",
+				  "ce6",
+				  "ce7",
+				  "ce8",
+				  "ce9",
+				  "ce10",
+				  "ce11",
+				  "host2wbm-desc-feed",
+				  "host2reo-re-injection",
+				  "host2reo-command",
+				  "host2rxdma-monitor-ring1",
+				  "reo2ost-exception",
+				  "wbm2host-rx-release",
+				  "reo2host-status",
+				  "reo2host-destination-ring4",
+				  "reo2host-destination-ring3",
+				  "reo2host-destination-ring2",
+				  "reo2host-destination-ring1",
+				  "rxdma2host-monitor-destination-mac3",
+				  "rxdma2host-monitor-destination-mac2",
+				  "rxdma2host-monitor-destination-mac1",
+				  "host2rxdma-host-buf-ring-mac3",
+				  "host2rxdma-host-buf-ring-mac2",
+				  "host2rxdma-host-buf-ring-mac1",
+				  "host2tcl-input-ring4",
+				  "host2tcl-input-ring3",
+				  "host2tcl-input-ring2",
+				  "host2tcl-input-ring1",
+				  "wbm2host-tx-completions-ring4",
+				  "wbm2host-tx-completions-ring3",
+				  "wbm2host-tx-completions-ring2",
+				  "wbm2host-tx-completions-ring1",
+				  "host2tx-monitor-ring1",
+				  "txmon2host-monitor-destination-mac3",
+				  "txmon2host-monitor-destination-mac2",
+				  "txmon2host-monitor-destination-mac1",
+				  "umac_reset",
+				  "host2rxdma-monitor-ring3",
+				  "host2rxdma-monitor-ring2",
+				  "ppdu-end-interrupts-mac3",
+				  "ppdu-end-interrupts-mac2",
+				  "ppdu-end-interrupts-mac1",
+				  "rxdma2host-monitor-status-ring-mac3",
+				  "rxdma2host-monitor-status-ring-mac2",
+				  "rxdma2host-monitor-status-ring-mac1",
+				  "rxdma2host-destination-ring-mac3",
+				  "rxdma2host-destination-ring-mac2",
+				  "rxdma2host-destination-ring-mac1";
+		qcom,rproc = <&q6_wcss_pd1>; /* the AHB user-PD (q6v5_wcss_userpd1) */
+		memory-region = <&q6_region>; /* VERIFY: ath12k AHB get_reserved_mem(0) */
+		/* status set to "disabled" at the top of this node (wired-only deploy) */
+	};
 };

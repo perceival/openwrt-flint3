@@ -1,0 +1,65 @@
+From: Kamil Bienkiewicz <perceivalpercy@gmail.com>
+Subject: [PATCH] wifi: ath12k: make AHB build against the tasklet CE-irq core
+
+ath12k ahb.c (backports-6.18.26) uses the upstream BH-workqueue CE-interrupt
+model, but OpenWrt reverts that conversion back to tasklets for the supported
+kernels (see 200-Revert-wifi-ath12k-convert-tasklet-to-BH-workqueue-f.patch),
+which only covered ce.h + pci.c. Apply the same tasklet conversion to ahb.c so
+ATH12K_AHB (IPQ5332 on-SoC radio) compiles.
+
+Also fix the qcom_mdt_load_no_init() call: kernel 6.12 takes an int pas_id as
+the 4th argument. The no-init path never uses pas_id (it does not run PAS
+init), so pass 0 (matching qcom_q6v5_adsp.c).
+
+Signed-off-by: Kamil Bienkiewicz <perceivalpercy@gmail.com>
+---
+--- a/drivers/net/wireless/ath/ath12k/ahb.c	2026-06-08 07:20:39.699665882 +0200
++++ b/drivers/net/wireless/ath/ath12k/ahb.c	2026-06-08 07:21:21.135508936 +0200
+@@ -154,7 +154,7 @@
+ 		if (ath12k_ce_get_attr_flags(ab, i) & CE_ATTR_DIS_INTR)
+ 			continue;
+ 
+-		cancel_work_sync(&ce_pipe->intr_wq);
++		tasklet_kill(&ce_pipe->intr_tq);
+ 	}
+ }
+ 
+@@ -414,7 +414,7 @@
+ 		goto err_fw2;
+ 	}
+ 
+-	ret = qcom_mdt_load_no_init(dev, fw2, fw2_name, mem_region, mem_phys,
++	ret = qcom_mdt_load_no_init(dev, fw2, fw2_name, 0, mem_region, mem_phys,
+ 				    mem_size, &mem_phys);
+ 	if (ret) {
+ 		ath12k_err(ab, "Failed to load MDT segments: %d\n", ret);
+@@ -502,9 +502,9 @@
+ 	ab->qmi.service_ins_id = ab->hw_params->qmi_service_ins_id;
+ }
+ 
+-static void ath12k_ahb_ce_workqueue(struct work_struct *work)
++static void ath12k_ahb_ce_tasklet(struct tasklet_struct *t)
+ {
+-	struct ath12k_ce_pipe *ce_pipe = from_work(ce_pipe, work, intr_wq);
++	struct ath12k_ce_pipe *ce_pipe = from_tasklet(ce_pipe, t, intr_tq);
+ 
+ 	ath12k_ce_per_engine_service(ce_pipe->ab, ce_pipe->pipe_num);
+ 
+@@ -520,7 +520,7 @@
+ 
+ 	ath12k_ahb_ce_irq_disable(ce_pipe->ab, ce_pipe->pipe_num);
+ 
+-	queue_work(system_bh_wq, &ce_pipe->intr_wq);
++	tasklet_schedule(&ce_pipe->intr_tq);
+ 
+ 	return IRQ_HANDLED;
+ }
+@@ -647,7 +647,7 @@
+ 
+ 		irq_idx = ATH12K_IRQ_CE0_OFFSET + i;
+ 
+-		INIT_WORK(&ce_pipe->intr_wq, ath12k_ahb_ce_workqueue);
++		tasklet_setup(&ce_pipe->intr_tq, ath12k_ahb_ce_tasklet);
+ 		irq = platform_get_irq_byname(ab->pdev, irq_name[irq_idx]);
+ 		ret = devm_request_irq(ab->dev, irq, ath12k_ahb_ce_interrupt_handler,
+ 				       IRQF_TRIGGER_RISING, irq_name[irq_idx],
