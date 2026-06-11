@@ -1,0 +1,129 @@
+From: Kamil Bienkiewicz <perceivalpercy@gmail.com>
+Date: Thu, 11 Jun 2026 00:00:00 +0000
+Subject: [PATCH] remoteproc: qcom: q6_mpd: use 3-arg PAS auth_and_reset for
+ vendor TrustZone
+
+The GL.iNet Flint 3 (IPQ5332) ships a vendor TrustZone (QSDK QSEE) whose
+PAS_AUTH_AND_RESET implements three arguments (peripheral, debug,
+reset_cmd_id); the single-argument mainline form is rejected with -EINVAL.
+
+Add a multipd-specific qcom_scm_pas_auth_and_reset_mpd() and thread a
+per-SoC reset_cmd_id (0x18 for the IPQ5332 root PD, 0x14 for IPQ5018)
+through wcss_data so q6_wcss_start() issues the 3-arg call.
+
+Confirmed on hardware: the auth moves from -EINVAL (-22) to being processed
+by the TZ. (A remaining -ENOMEM is a separate, in-progress issue.)
+
+Signed-off-by: Kamil Bienkiewicz <perceivalpercy@gmail.com>
+---
+--- a/drivers/firmware/qcom/qcom_scm.c
++++ b/drivers/firmware/qcom/qcom_scm.c
+@@ -743,6 +743,51 @@
+ EXPORT_SYMBOL_GPL(qcom_scm_pas_auth_and_reset);
+ 
+ /**
++ * qcom_scm_pas_auth_and_reset_mpd() - multipd authenticate-and-reset
++ * @peripheral:	peripheral id
++ * @debug:	debug flag passed to TZ (normally 0)
++ * @reset_cmd_id: per-PD reset command id (e.g. 0x18 for the IPQ5332 root PD)
++ *
++ * The QSDK multipd TrustZone (QSEE) on IPQ5018/IPQ5332 implements
++ * PAS_AUTH_AND_RESET with three arguments. The single-argument
++ * qcom_scm_pas_auth_and_reset() above is rejected (-EINVAL) by such a TZ;
++ * the extra debug + reset_cmd_id select the PD being authenticated.
++ *
++ * Return: 0 on success.
++ */
++int qcom_scm_pas_auth_and_reset_mpd(u32 peripheral, u32 debug, u32 reset_cmd_id)
++{
++	int ret;
++	struct qcom_scm_desc desc = {
++		.svc = QCOM_SCM_SVC_PIL,
++		.cmd = QCOM_SCM_PIL_PAS_AUTH_AND_RESET,
++		.arginfo = QCOM_SCM_ARGS(3),
++		.args[0] = peripheral,
++		.args[1] = debug,
++		.args[2] = reset_cmd_id,
++		.owner = ARM_SMCCC_OWNER_SIP,
++	};
++	struct qcom_scm_res res;
++
++	ret = qcom_scm_clk_enable();
++	if (ret)
++		return ret;
++
++	ret = qcom_scm_bw_enable();
++	if (ret)
++		goto disable_clk;
++
++	ret = qcom_scm_call(__scm->dev, &desc, &res);
++	qcom_scm_bw_disable();
++
++disable_clk:
++	qcom_scm_clk_disable();
++
++	return ret ? : res.result[0];
++}
++EXPORT_SYMBOL_GPL(qcom_scm_pas_auth_and_reset_mpd);
++
++/**
+  * qcom_scm_pas_shutdown() - Shut down the remote processor
+  * @peripheral: peripheral id
+  *
+--- a/include/linux/firmware/qcom/qcom_scm.h
++++ b/include/linux/firmware/qcom/qcom_scm.h
+@@ -77,6 +77,7 @@
+ void qcom_scm_pas_metadata_release(struct qcom_scm_pas_metadata *ctx);
+ int qcom_scm_pas_mem_setup(u32 peripheral, phys_addr_t addr, phys_addr_t size);
+ int qcom_scm_pas_auth_and_reset(u32 peripheral);
++int qcom_scm_pas_auth_and_reset_mpd(u32 peripheral, u32 debug, u32 reset_cmd_id);
+ int qcom_scm_pas_shutdown(u32 peripheral);
+ bool qcom_scm_pas_supported(u32 peripheral);
+ int qcom_scm_internal_wifi_powerup(u32 peripheral);
+--- a/drivers/remoteproc/qcom_q6v5_mpd.c
++++ b/drivers/remoteproc/qcom_q6v5_mpd.c
+@@ -98,6 +98,7 @@
+ 
+ struct wcss_data {
+ 	u32 pasid;
++	u32 reset_cmd_id;
+ 	bool share_upd_info_to_q6;
+ 	u8 bootargs_version;
+ };
+@@ -124,7 +125,12 @@
+ 
+ 	qcom_q6v5_prepare(&wcss->q6);
+ 
+-	ret = qcom_scm_pas_auth_and_reset(desc->pasid);
++	/*
++	 * The vendor (QSDK multipd) TrustZone requires the 3-argument PAS
++	 * auth-and-reset (peripheral, debug, reset_cmd_id); the single-arg
++	 * mainline form is rejected with -EINVAL on this TZ.
++	 */
++	ret = qcom_scm_pas_auth_and_reset_mpd(desc->pasid, 0, desc->reset_cmd_id);
+ 	if (ret) {
+ 		dev_err(wcss->dev, "wcss_reset failed\n");
+ 		return ret;
+@@ -844,6 +850,7 @@
+ 
+ static const struct wcss_data q6_ipq5018_res_init = {
+ 	.pasid = MPD_WCNSS_PAS_ID,
++	.reset_cmd_id = 0x14,
+ 	.share_upd_info_to_q6 = true,
+ 	.bootargs_version = VERSION1,
+ 	// .mdt_load_sec = qcom_mdt_load_pd_seg,
+@@ -851,12 +858,14 @@
+ 
+ static const struct wcss_data q6_ipq5332_res_init = {
+ 	.pasid = MPD_WCNSS_PAS_ID,
++	.reset_cmd_id = 0x18,
+ 	.share_upd_info_to_q6 = true,
+ 	.bootargs_version = VERSION2,
+ };
+ 
+ static const struct wcss_data q6_ipq9574_res_init = {
+ 	.pasid = WCNSS_PAS_ID,
++	/* reset_cmd_id TBD for IPQ9574 (not validated here) */
+ };
+ 
+ static const struct of_device_id q6_wcss_of_match[] = {
