@@ -125,6 +125,16 @@ into `/lib/firmware/IPQ5332/`.
 
 GPL-2.0, matching OpenWrt and the Linux kernel.
 
+## Supporting this work
+
+This is a spare-time, single-unit port — the one Flint 3 I own is also the live AP, which
+makes brick-risky dev and clean A/B testing awkward. If this work has been useful to you, a
+tip toward a **second Flint 3 to develop on** is hugely appreciated:
+
+**☕ [ko-fi.com/perceival](https://ko-fi.com/perceival)**
+
+Testing, bug reports, and pointers help just as much — feel free to open an issue.
+
 ## Credits
 
 Port by Kamil Bienkiewicz (`perceivalpercy@gmail.com`). Built on upstream OpenWrt and
