@@ -536,6 +536,12 @@
 						reg = <0xa 0x6>;
 						#nvmem-cell-cells = <1>;
 					};
+
+					wlan_macaddr: mac-address@4 {
+						compatible = "mac-base";
+						reg = <0x4 0x6>;
+						#nvmem-cell-cells = <1>;
+					};
 				};
 			};
 		};
@@ -565,6 +571,8 @@
 		wifi1: pcie@0 {
 			compatible = "pci17cb,1109";
 			reg = <0x00010000  0 0 0 0>;
+			nvmem-cells = <&wlan_macaddr 1>;
+			nvmem-cell-names = "mac-address";
 			memory-region = <&qcn9274_host_ddr>, <&mlo_mem>;
 			memory-region-names = "host-ddr-mem", "mlo-global-mem";
 			qcom,ath12k-fw-memory-mode = <1>;
@@ -628,6 +636,8 @@
 &wifi0 {
 	firmware-name = "ath12k/IPQ5332/hw1.0/q6_fw1.mdt",
 			"ath12k/IPQ5332/hw1.0/iu_fw.mdt";
+	nvmem-cells = <&wlan_macaddr 0>;
+	nvmem-cell-names = "mac-address";
 	memory-region = <&q6_region>, <&m3_dump>, <&q6_caldb>, <&mlo_mem>;
 	memory-region-names = "q6-region", "m3-dump", "q6-caldb", "mlo-global-mem";
 	qcom,bdf-address-offset = <0x0c00000>;
