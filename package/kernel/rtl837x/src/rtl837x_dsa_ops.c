@@ -10,6 +10,7 @@
 #include <linux/kernel.h>
 #include <linux/phylink.h>
 #include <linux/phy.h>
+#include <linux/slab.h>
 #include <linux/string.h>
 #include <linux/dsa/8021q.h>
 #include <net/dsa.h>
@@ -22,6 +23,29 @@
 static int rtl837x_to_errno(int ret)
 {
 	return ret == RT_ERR_OK ? 0 : -EIO;
+}
+
+static int rtl837x_l2_to_errno(int ret)
+{
+	switch (ret) {
+	case RT_ERR_OK:
+		return 0;
+	case RT_ERR_L2_ENTRY_NOTFOUND:
+		return -ENOENT;
+	case RT_ERR_TBL_FULL:
+	case RT_ERR_L2_NO_EMPTY_ENTRY:
+	case RT_ERR_L2_INDEXTBL_FULL:
+		return -ENOSPC;
+	case RT_ERR_INPUT:
+	case RT_ERR_PORT_ID:
+	case RT_ERR_PORT_MASK:
+	case RT_ERR_MAC:
+	case RT_ERR_L2_FID:
+	case RT_ERR_L2_VID:
+		return -EINVAL;
+	default:
+		return -EIO;
+	}
 }
 
 static int rtl837x_mdio_setup(struct dsa_switch *ds);
@@ -277,6 +301,14 @@ static int rtl837x_setup(struct dsa_switch *ds)
 	if (ret)
 		return rtl837x_to_errno(ret);
 
+	ret = rtk_igmp_state_set(DISABLED);
+	if (ret)
+		return rtl837x_to_errno(ret);
+
+	ret = rtk_l2_ipMcastAddrLookup_set(LOOKUP_MAC);
+	if (ret)
+		return rtl837x_to_errno(ret);
+
 	rtk_l2_table_clear();
 	rtk_l2_aging_set(300);
 	rtk_stat_global_reset();
@@ -342,9 +374,29 @@ static int rtl837x_setup(struct dsa_switch *ds)
 
 static void rtl837x_teardown(struct dsa_switch *ds)
 {
+	struct rtk_gsw *gsw = ds->priv;
+	struct rtl837x_mdb_entry *entry, *tmp;
+	rtk_l2_mcastAddr_t l2 = { 0 };
+	int ret;
+
 	rtnl_lock();
 	dsa_tag_8021q_unregister(ds);
 	rtnl_unlock();
+
+	mutex_lock(&gsw->mdb_lock);
+	list_for_each_entry_safe(entry, tmp, &gsw->mdb_entries, list) {
+		l2.mac = entry->mac;
+		l2.ivl = 1;
+		l2.vid_fid = entry->vid;
+		ret = rtk_l2_mcastAddr_del(&l2);
+		if (ret != RT_ERR_OK && ret != RT_ERR_L2_ENTRY_NOTFOUND)
+			dev_warn(gsw->dev, "failed to remove MDB entry %pM vid %u\n",
+				 entry->mac.octet, entry->vid);
+
+		list_del(&entry->list);
+		kfree(entry);
+	}
+	mutex_unlock(&gsw->mdb_lock);
 
 	rtl837x_mdio_teardown(ds);
 	rtk_cpuTag_enable_set(EXTERNAL_CPU, DISABLED);
@@ -850,6 +902,215 @@ static int rtl837x_port_fdb_del(struct dsa_switch *ds, int port,
 	return rtl837x_to_errno(ret);
 }
 
+static int rtl837x_mdb_key(struct dsa_switch *ds,
+			   const struct switchdev_obj_port_mdb *mdb,
+			   struct dsa_db db, u16 *vid, u8 *db_num)
+{
+	struct rtk_gsw *gsw = ds->priv;
+
+	if (!is_multicast_ether_addr(mdb->addr) || mdb->vid > RTK_VID_MAX)
+		return -EINVAL;
+
+	switch (db.type) {
+	case DSA_DB_PORT:
+		if (!db.dp || db.dp->ds != ds ||
+		    !rtl837x_user_port(gsw, db.dp->index))
+			return -EOPNOTSUPP;
+
+		*db_num = db.dp->index;
+		*vid = mdb->vid ? mdb->vid :
+			dsa_tag_8021q_standalone_vid(db.dp);
+		break;
+	case DSA_DB_BRIDGE:
+		if (!db.bridge.num ||
+		    db.bridge.num > DSA_TAG_8021Q_MAX_NUM_BRIDGES)
+			return -EINVAL;
+
+		*db_num = db.bridge.num;
+		*vid = mdb->vid ? mdb->vid :
+			dsa_tag_8021q_bridge_vid(db.bridge.num);
+		break;
+	default:
+		return -EOPNOTSUPP;
+	}
+
+	return 0;
+}
+
+static struct rtl837x_mdb_entry *
+rtl837x_mdb_find(struct rtk_gsw *gsw, const unsigned char *addr, u16 vid)
+{
+	struct rtl837x_mdb_entry *entry;
+
+	list_for_each_entry(entry, &gsw->mdb_entries, list)
+		if (entry->vid == vid &&
+		    ether_addr_equal(entry->mac.octet, addr))
+			return entry;
+
+	return NULL;
+}
+
+static int rtl837x_mdb_write(struct rtl837x_mdb_entry *entry, u16 port_mask)
+{
+	rtk_l2_mcastAddr_t l2 = { 0 };
+	int ret;
+
+	l2.mac = entry->mac;
+	l2.ivl = 1;
+	l2.vid_fid = entry->vid;
+	l2.portmask.bits[0] = port_mask;
+
+	if (port_mask)
+		ret = rtk_l2_mcastAddr_add(&l2);
+	else
+		ret = rtk_l2_mcastAddr_del(&l2);
+
+	return rtl837x_l2_to_errno(ret);
+}
+
+static u16 rtl837x_mdb_port_mask(struct rtk_gsw *gsw,
+				 struct rtl837x_mdb_entry *entry)
+{
+	if (!entry->port_mask && !entry->host_member)
+		return 0;
+
+	return entry->port_mask | BIT(gsw->cpu_port);
+}
+
+static int rtl837x_port_mdb_add(struct dsa_switch *ds, int port,
+				const struct switchdev_obj_port_mdb *mdb,
+				struct dsa_db db)
+{
+	struct rtk_gsw *gsw = ds->priv;
+	struct rtl837x_mdb_entry *entry, *new_entry;
+	u16 old_port_mask, port_mask;
+	bool old_host_member;
+	u8 db_num;
+	u16 vid;
+	int ret;
+
+	if (!rtl837x_valid_port(gsw, port))
+		return -EINVAL;
+
+	ret = rtl837x_mdb_key(ds, mdb, db, &vid, &db_num);
+	if (ret)
+		return ret;
+	if (!gsw->vlan_table[vid].valid)
+		return -ENOENT;
+
+	new_entry = kzalloc(sizeof(*new_entry), GFP_KERNEL);
+	if (!new_entry)
+		return -ENOMEM;
+
+	mutex_lock(&gsw->mdb_lock);
+	entry = rtl837x_mdb_find(gsw, mdb->addr, vid);
+	if (entry && (entry->db_type != db.type || entry->db_num != db_num)) {
+		ret = -EOPNOTSUPP;
+		goto out;
+	}
+
+	if (!entry) {
+		entry = new_entry;
+		new_entry = NULL;
+		INIT_LIST_HEAD(&entry->list);
+		memcpy(entry->mac.octet, mdb->addr, ETH_ALEN);
+		entry->vid = vid;
+		entry->db_type = db.type;
+		entry->db_num = db_num;
+	}
+
+	old_port_mask = entry->port_mask;
+	old_host_member = entry->host_member;
+	if (db.type == DSA_DB_PORT) {
+		entry->port_mask |= BIT(db.dp->index);
+		entry->host_member = true;
+	} else if (port == gsw->cpu_port) {
+		entry->host_member = true;
+	} else {
+		entry->port_mask |= BIT(port);
+	}
+
+	port_mask = rtl837x_mdb_port_mask(gsw, entry);
+	ret = rtl837x_mdb_write(entry, port_mask);
+	if (ret) {
+		entry->port_mask = old_port_mask;
+		entry->host_member = old_host_member;
+		if (list_empty(&entry->list))
+			new_entry = entry;
+		goto out;
+	}
+
+	if (list_empty(&entry->list))
+		list_add_tail(&entry->list, &gsw->mdb_entries);
+
+out:
+	mutex_unlock(&gsw->mdb_lock);
+	kfree(new_entry);
+	return ret;
+}
+
+static int rtl837x_port_mdb_del(struct dsa_switch *ds, int port,
+				const struct switchdev_obj_port_mdb *mdb,
+				struct dsa_db db)
+{
+	struct rtk_gsw *gsw = ds->priv;
+	struct rtl837x_mdb_entry *entry;
+	u16 old_port_mask, port_mask;
+	bool old_host_member;
+	u8 db_num;
+	u16 vid;
+	int ret;
+
+	if (!rtl837x_valid_port(gsw, port))
+		return -EINVAL;
+
+	ret = rtl837x_mdb_key(ds, mdb, db, &vid, &db_num);
+	if (ret)
+		return ret;
+
+	mutex_lock(&gsw->mdb_lock);
+	entry = rtl837x_mdb_find(gsw, mdb->addr, vid);
+	if (!entry) {
+		ret = 0;
+		goto out;
+	}
+
+	if (entry->db_type != db.type || entry->db_num != db_num) {
+		ret = -EOPNOTSUPP;
+		goto out;
+	}
+
+	old_port_mask = entry->port_mask;
+	old_host_member = entry->host_member;
+	if (db.type == DSA_DB_PORT) {
+		entry->port_mask &= ~BIT(db.dp->index);
+		entry->host_member = false;
+	} else if (port == gsw->cpu_port) {
+		entry->host_member = false;
+	} else {
+		entry->port_mask &= ~BIT(port);
+	}
+
+	port_mask = rtl837x_mdb_port_mask(gsw, entry);
+	ret = rtl837x_mdb_write(entry, port_mask);
+	if (ret == -ENOENT && !port_mask)
+		ret = 0;
+	if (ret) {
+		entry->port_mask = old_port_mask;
+		entry->host_member = old_host_member;
+		goto out;
+	}
+
+	if (!port_mask) {
+		list_del(&entry->list);
+		kfree(entry);
+	}
+
+out:
+	mutex_unlock(&gsw->mdb_lock);
+	return ret;
+}
+
 static const struct dsa_switch_ops rtl837x_dsa_ops = {
 	.get_tag_protocol = rtl837x_get_tag_protocol,
 	.setup = rtl837x_setup,
@@ -871,6 +1132,8 @@ static const struct dsa_switch_ops rtl837x_dsa_ops = {
 	.port_vlan_del = rtl837x_port_vlan_del,
 	.port_fdb_add = rtl837x_port_fdb_add,
 	.port_fdb_del = rtl837x_port_fdb_del,
+	.port_mdb_add = rtl837x_port_mdb_add,
+	.port_mdb_del = rtl837x_port_mdb_del,
 	.tag_8021q_vlan_add = rtl837x_tag_8021q_vlan_add,
 	.tag_8021q_vlan_del = rtl837x_tag_8021q_vlan_del,
 };
@@ -891,6 +1154,8 @@ int rtl837x_dsa_register(struct rtk_gsw *gsw)
 	ds->max_num_bridges = DSA_TAG_8021Q_MAX_NUM_BRIDGES;
 	ds->ageing_time_min = 14000;
 	ds->ageing_time_max = 800000;
+	INIT_LIST_HEAD(&gsw->mdb_entries);
+	mutex_init(&gsw->mdb_lock);
 
 	ret = dsa_register_switch(ds);
 	if (ret)
