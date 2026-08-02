@@ -8,19 +8,44 @@
 # Without a country set, hostapd refuses to start on 6 GHz ("Invalid
 # country_code '00'"), so the radios stay down on a fresh install.
 #
-# Every exit path that leaves the country unset is logged: a silent failure
-# here looks like "Wi-Fi is broken" with nothing in the log to explain it.
+# This is a uci-defaults script. OpenWrt deletes it only when it exits 0.
+# Return non-zero whenever initialization is incomplete so it is retained
+# and retried on the next boot instead of silently becoming a one-shot no-op.
 
 . /lib/functions.sh
 . /lib/functions/system.sh
 
 LOG_TAG=gl-wireless-country
+EXPECTED_RADIOS=3
 
-warn_manual() {
+log_warn() {
 	logger -t "$LOG_TAG" -p daemon.warn "$1"
-	logger -t "$LOG_TAG" -p daemon.warn \
-		"radios may stay down (6 GHz needs a country). Set one manually, e.g.:" \
-		"uci set wireless.radio0.country=US; uci commit wireless; wifi"
+}
+
+retry_later() {
+	log_warn "$1"
+	log_warn "regulatory initialization incomplete; keeping this script for retry"
+	exit 1
+}
+
+list_wifi_devices() {
+	uci -q show wireless |
+		sed -n "s/^wireless\.\([^.]*\)=wifi-device$/\1/p"
+}
+
+normalize_country() {
+	printf '%s' "$1" |
+		tr '[:lower:]' '[:upper:]' |
+		tr -dc 'A-Z0-9'
+}
+
+valid_country() {
+	[ "${#1}" = 2 ] || return 1
+	[ "$1" != "00" ] || return 1
+	case "$1" in
+		*[!A-Z]*) return 1 ;;
+	esac
+	return 0
 }
 
 board=$(board_name)
@@ -30,36 +55,71 @@ gl.inet,gl-be9300) ;;
 *) exit 0 ;;
 esac
 
-art=$(find_mmc_part "0:ART")
-if [ -z "$art" ]; then
-	warn_manual "ART partition (0:ART) not found"
+devices=$(list_wifi_devices)
+set -- $devices
+
+if [ "$#" -lt "$EXPECTED_RADIOS" ]; then
+	log_warn "found $# of $EXPECTED_RADIOS expected wifi-device sections; regenerating wireless config"
+	if ! /sbin/wifi config; then
+		retry_later "wifi config failed"
+	fi
+
+	devices=$(list_wifi_devices)
+	set -- $devices
+fi
+
+if [ "$#" -lt "$EXPECTED_RADIOS" ]; then
+	retry_later "found $# of $EXPECTED_RADIOS expected wifi-device sections after wifi config"
+fi
+
+need_country=0
+for dev in "$@"; do
+	current=$(normalize_country "$(uci -q get "wireless.$dev.country")")
+	if ! valid_country "$current"; then
+		need_country=1
+		break
+	fi
+done
+
+if [ "$need_country" = 0 ]; then
+	logger -t "$LOG_TAG" "all $# radio countries already set; left unchanged"
 	exit 0
 fi
 
-# Offset 0x88, 2 bytes. Accept lower case too - only a value that is not two
-# letters at all means the field is unprogrammed.
+art=$(find_mmc_part "0:ART")
+[ -n "$art" ] || retry_later "ART partition (0:ART) not found"
+
+# Offset 0x88, 2 bytes. Accept lower case too.
 country=$(dd if="$art" bs=1 skip=136 count=2 2>/dev/null |
 	tr '[:lower:]' '[:upper:]' | tr -dc 'A-Z')
 
-if [ "${#country}" != 2 ]; then
-	warn_manual "ART regulatory field at 0x88 is not a valid ISO-3166 code"
-	exit 0
+if ! valid_country "$country"; then
+	retry_later "ART regulatory field at 0x88 is not a valid ISO-3166 code"
 fi
-
-[ -f /etc/config/wireless ] || /sbin/wifi config
 
 changed=0
-for dev in $(uci -q show wireless | sed -n "s/^wireless\.\([^.]*\)=wifi-device$/\1/p"); do
-	[ -n "$(uci -q get wireless.$dev.country)" ] && continue
-	uci set wireless.$dev.country="$country"
-	changed=1
+for dev in "$@"; do
+	current=$(normalize_country "$(uci -q get "wireless.$dev.country")")
+	valid_country "$current" && continue
+
+	if ! uci set "wireless.$dev.country=$country"; then
+		retry_later "failed to set wireless.$dev.country"
+	fi
+	changed=$((changed + 1))
 done
 
-if [ "$changed" = 1 ]; then
-	uci commit wireless
-	logger -t "$LOG_TAG" "set regulatory country '$country' from ART"
-else
-	logger -t "$LOG_TAG" "regulatory country already set; left unchanged"
+if [ "$changed" -gt 0 ]; then
+	if ! uci commit wireless; then
+		retry_later "failed to commit wireless configuration"
+	fi
 fi
 
+for dev in "$@"; do
+	current=$(normalize_country "$(uci -q get "wireless.$dev.country")")
+	if ! valid_country "$current"; then
+		retry_later "wireless.$dev.country is still unset or invalid after commit"
+	fi
+done
+
+logger -t "$LOG_TAG" "set regulatory country '$country' from ART on $changed radio(s)"
 exit 0
