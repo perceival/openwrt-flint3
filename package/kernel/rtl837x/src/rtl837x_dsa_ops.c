@@ -201,10 +201,13 @@ static int rtl837x_tag_8021q_vlan_add(struct dsa_switch *ds, int port, u16 vid,
 	struct rtk_gsw *gsw = ds->priv;
 	bool untagged = flags & BRIDGE_VLAN_INFO_UNTAGGED;
 	bool pvid = flags & BRIDGE_VLAN_INFO_PVID;
+	typeof(gsw->vlan_table[0]) old_vlan;
 	int ret;
 
 	if (!rtl837x_valid_port(gsw, port) || !vid || vid > RTK_VID_MAX)
 		return -EINVAL;
+
+	old_vlan = gsw->vlan_table[vid];
 
 	gsw->vlan_table[vid].valid = 1;
 	gsw->vlan_table[vid].vid = vid;
@@ -216,8 +219,10 @@ static int rtl837x_tag_8021q_vlan_add(struct dsa_switch *ds, int port, u16 vid,
 		gsw->vlan_table[vid].untag &= ~BIT(port);
 
 	ret = rtl837x_write_vlan(gsw, vid);
-	if (ret)
+	if (ret) {
+		gsw->vlan_table[vid] = old_vlan;
 		return ret;
+	}
 
 	if (pvid) {
 		gsw->tag8021q_pvid[port] = vid;
@@ -231,6 +236,7 @@ static int rtl837x_tag_8021q_vlan_add(struct dsa_switch *ds, int port, u16 vid,
 static int rtl837x_tag_8021q_vlan_del(struct dsa_switch *ds, int port, u16 vid)
 {
 	struct rtk_gsw *gsw = ds->priv;
+	typeof(gsw->vlan_table[0]) old_vlan;
 	int ret;
 
 	if (!rtl837x_valid_port(gsw, port) || !vid || vid > RTK_VID_MAX)
@@ -239,6 +245,8 @@ static int rtl837x_tag_8021q_vlan_del(struct dsa_switch *ds, int port, u16 vid)
 	if (!gsw->vlan_table[vid].valid)
 		return 0;
 
+	old_vlan = gsw->vlan_table[vid];
+
 	gsw->vlan_table[vid].mbr &= ~BIT(port);
 	gsw->vlan_table[vid].untag &= ~BIT(port);
 
@@ -246,8 +254,10 @@ static int rtl837x_tag_8021q_vlan_del(struct dsa_switch *ds, int port, u16 vid)
 		gsw->vlan_table[vid].valid = 0;
 
 	ret = rtl837x_write_vlan(gsw, vid);
-	if (ret)
+	if (ret) {
+		gsw->vlan_table[vid] = old_vlan;
 		return ret;
+	}
 
 	if (gsw->tag8021q_pvid_valid[port] && gsw->tag8021q_pvid[port] == vid) {
 		gsw->tag8021q_pvid_valid[port] = false;
@@ -715,6 +725,7 @@ static int rtl837x_port_vlan_add(struct dsa_switch *ds, int port,
 	bool untagged = vlan->flags & BRIDGE_VLAN_INFO_UNTAGGED;
 	bool pvid = vlan->flags & BRIDGE_VLAN_INFO_PVID;
 	u16 vid = vlan->vid;
+	typeof(gsw->vlan_table[0]) old_vlan;
 	int ret;
 
 	if (!rtl837x_valid_port(gsw, port))
@@ -727,6 +738,8 @@ static int rtl837x_port_vlan_add(struct dsa_switch *ds, int port,
 		NL_SET_ERR_MSG_MOD(extack, "VLAN ID out of range");
 		return -EINVAL;
 	}
+
+	old_vlan = gsw->vlan_table[vid];
 
 	gsw->vlan_table[vid].valid = 1;
 	gsw->vlan_table[vid].vid = vid;
@@ -743,6 +756,7 @@ static int rtl837x_port_vlan_add(struct dsa_switch *ds, int port,
 
 	ret = rtl837x_write_vlan(gsw, vid);
 	if (ret) {
+		gsw->vlan_table[vid] = old_vlan;
 		NL_SET_ERR_MSG_MOD(extack, "failed to program VLAN");
 		return ret;
 	}
@@ -761,6 +775,7 @@ static int rtl837x_port_vlan_del(struct dsa_switch *ds, int port,
 {
 	struct rtk_gsw *gsw = ds->priv;
 	u16 vid = vlan->vid;
+	typeof(gsw->vlan_table[0]) old_vlan;
 	int ret;
 
 	if (!rtl837x_valid_port(gsw, port))
@@ -768,6 +783,8 @@ static int rtl837x_port_vlan_del(struct dsa_switch *ds, int port,
 
 	if (!vid || vid > RTK_VID_MAX || !gsw->vlan_table[vid].valid)
 		return 0;
+
+	old_vlan = gsw->vlan_table[vid];
 
 	gsw->vlan_table[vid].mbr &= ~BIT(port);
 	gsw->vlan_table[vid].untag &= ~BIT(port);
@@ -781,8 +798,10 @@ static int rtl837x_port_vlan_del(struct dsa_switch *ds, int port,
 		gsw->vlan_table[vid].valid = 0;
 
 	ret = rtl837x_write_vlan(gsw, vid);
-	if (ret)
+	if (ret) {
+		gsw->vlan_table[vid] = old_vlan;
 		return ret;
+	}
 
 	if (port != gsw->cpu_port && gsw->bridge_pvid_valid[port] &&
 	    gsw->bridge_pvid[port] == vid) {
