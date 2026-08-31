@@ -632,10 +632,13 @@ static int rtl837x_sfp_module_insert(void *upstream, const struct sfp_eeprom_id 
 static void rtl837x_sfp_module_remove(void *upstream)
 {
 	struct rtk_gsw *gsw = upstream;
+	rtk_api_ret_t ret;
 	dev_info(gsw->dev, "SFP module remove\n");
 
 	USE_SERDESMODE(1, SERDES_OFF);
-	rtk_sdsMode_set(1, gsw->sds1mode);
+	ret = rtk_sdsMode_set(1, gsw->sds1mode);
+	if (ret)
+		dev_err(gsw->dev, "failed to disable SFP SerDes: %d\n", ret);
 }
 
 static const struct sfp_upstream_ops sfp_ops = {
