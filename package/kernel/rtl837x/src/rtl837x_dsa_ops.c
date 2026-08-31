@@ -220,9 +220,17 @@ static int rtl837x_tag_8021q_vlan_add(struct dsa_switch *ds, int port, u16 vid,
 		return ret;
 
 	if (pvid) {
+		u16 old_pvid = gsw->tag8021q_pvid[port];
+		bool old_pvid_valid = gsw->tag8021q_pvid_valid[port];
+
 		gsw->tag8021q_pvid[port] = vid;
 		gsw->tag8021q_pvid_valid[port] = true;
-		return rtl837x_commit_pvid(gsw, port);
+		ret = rtl837x_commit_pvid(gsw, port);
+		if (ret) {
+			gsw->tag8021q_pvid[port] = old_pvid;
+			gsw->tag8021q_pvid_valid[port] = old_pvid_valid;
+		}
+		return ret;
 	}
 
 	return 0;
@@ -250,8 +258,16 @@ static int rtl837x_tag_8021q_vlan_del(struct dsa_switch *ds, int port, u16 vid)
 		return ret;
 
 	if (gsw->tag8021q_pvid_valid[port] && gsw->tag8021q_pvid[port] == vid) {
+		u16 old_pvid = gsw->tag8021q_pvid[port];
+		bool old_pvid_valid = gsw->tag8021q_pvid_valid[port];
+
 		gsw->tag8021q_pvid_valid[port] = false;
-		return rtl837x_commit_pvid(gsw, port);
+		ret = rtl837x_commit_pvid(gsw, port);
+		if (ret) {
+			gsw->tag8021q_pvid[port] = old_pvid;
+			gsw->tag8021q_pvid_valid[port] = old_pvid_valid;
+		}
+		return ret;
 	}
 
 	return 0;
@@ -748,9 +764,17 @@ static int rtl837x_port_vlan_add(struct dsa_switch *ds, int port,
 	}
 
 	if (pvid && port != gsw->cpu_port) {
+		u16 old_pvid = gsw->bridge_pvid[port];
+		bool old_pvid_valid = gsw->bridge_pvid_valid[port];
+
 		gsw->bridge_pvid[port] = vid;
 		gsw->bridge_pvid_valid[port] = true;
-		return rtl837x_commit_pvid(gsw, port);
+		ret = rtl837x_commit_pvid(gsw, port);
+		if (ret) {
+			gsw->bridge_pvid[port] = old_pvid;
+			gsw->bridge_pvid_valid[port] = old_pvid_valid;
+		}
+		return ret;
 	}
 
 	return 0;
@@ -786,8 +810,16 @@ static int rtl837x_port_vlan_del(struct dsa_switch *ds, int port,
 
 	if (port != gsw->cpu_port && gsw->bridge_pvid_valid[port] &&
 	    gsw->bridge_pvid[port] == vid) {
+		u16 old_pvid = gsw->bridge_pvid[port];
+		bool old_pvid_valid = gsw->bridge_pvid_valid[port];
+
 		gsw->bridge_pvid_valid[port] = false;
-		return rtl837x_commit_pvid(gsw, port);
+		ret = rtl837x_commit_pvid(gsw, port);
+		if (ret) {
+			gsw->bridge_pvid[port] = old_pvid;
+			gsw->bridge_pvid_valid[port] = old_pvid_valid;
+		}
+		return ret;
 	}
 
 	return 0;
