@@ -592,6 +592,7 @@ static int rtl837x_sfp_module_insert(void *upstream, const struct sfp_eeprom_id 
 {
 	struct rtk_gsw *gsw = upstream;
 	phy_interface_t iface;
+	rtk_api_ret_t ret;
 
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(6,18,0)
 	const struct sfp_module_caps *caps;
@@ -625,7 +626,12 @@ static int rtl837x_sfp_module_insert(void *upstream, const struct sfp_eeprom_id 
 		return -EINVAL;
 	}
 
-	rtk_sdsMode_set(1, gsw->sds1mode);
+	ret = rtk_sdsMode_set(1, gsw->sds1mode);
+	if (ret) {
+		dev_err(gsw->dev, "failed to set SFP SerDes mode: %d\n", ret);
+		return -EIO;
+	}
+
 	return 0;
 }
 
