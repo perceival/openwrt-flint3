@@ -8,6 +8,7 @@
 
 #include <linux/of_mdio.h>
 #include <linux/regmap.h>
+#include <linux/list.h>
 #include <linux/workqueue.h>
 #include <linux/debugfs.h>
 #include <net/dsa.h>
@@ -56,6 +57,16 @@ struct rtl837x_sdsmode_map {
 	const char *name;
 };
 
+struct rtl837x_mdb_entry {
+	struct list_head list;
+	rtk_mac_t mac;
+	u16 vid;
+	u16 port_mask;
+	u8 db_type;
+	u8 db_num;
+	bool host_member;
+};
+
 typedef struct rtl837x_pnswap_cfg_s {
 	uint8_t sds0_rx_swap:1;
 	uint8_t sds0_tx_swap:1;
@@ -101,6 +112,8 @@ struct rtk_gsw {
 	struct dsa_switch ds;
 	struct net_device *bridge_dev[RTK_MAX_NUM_OF_PORT];
 	bool port_enabled[RTK_MAX_NUM_OF_PORT];
+	struct list_head mdb_entries;
+	struct mutex mdb_lock;
 	struct net_device *ethernet_master;
 	struct sfp_bus *sfp_bus;
 
