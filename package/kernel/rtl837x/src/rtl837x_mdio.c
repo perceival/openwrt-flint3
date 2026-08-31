@@ -816,7 +816,11 @@ static int rtl837x_dsa_probe(struct mdio_device *mdiodev)
 
 	gsw->reset_pin = devm_gpiod_get_optional(dev, "reset", GPIOD_OUT_LOW);
 	if (IS_ERR(gsw->reset_pin)) {
-		dev_warn(dev, "failed to get RESET GPIO!!!\n");
+		ret = PTR_ERR(gsw->reset_pin);
+		dev_err_probe(dev, ret, "failed to get reset GPIO\n");
+		if (master)
+			dev_put(master);
+		return ret;
 	}
 
 	if (!of_property_read_string(np, "rtl837x,sds0mode", &sdsmode_name) &&
