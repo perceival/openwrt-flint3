@@ -538,6 +538,7 @@ static void rtl837x_status_check_work_func(struct work_struct *work)
 	struct rtk_gsw *gsw = container_of(work, struct rtk_gsw, status_check_work.work);
 
 	rtk_port_status_t port_status;
+	int ret;
 
 	if (!gsw->ethernet_master)
 		return;
@@ -556,13 +557,23 @@ static void rtl837x_status_check_work_func(struct work_struct *work)
 		rtnl_lock();
 		dev_close(gsw->ethernet_master);
 		rtnl_unlock();
-		rtk_sdsMode_set(0, SERDES_OFF);
+		ret = rtk_sdsMode_set(0, SERDES_OFF);
+		if (ret)
+			dev_warn_ratelimited(gsw->dev,
+					     "failed to disable CPU SerDes: %d\n", ret);
 		mdelay(200);
 
 		rtnl_lock();
-		dev_open(gsw->ethernet_master, NULL);
+		ret = dev_open(gsw->ethernet_master, NULL);
 		rtnl_unlock();
-		rtk_sdsMode_set(0, gsw->sds0mode);
+		if (ret)
+			dev_warn_ratelimited(gsw->dev,
+					     "failed to reopen ethernet master: %d\n", ret);
+
+		ret = rtk_sdsMode_set(0, gsw->sds0mode);
+		if (ret)
+			dev_warn_ratelimited(gsw->dev,
+					     "failed to restore CPU SerDes mode: %d\n", ret);
 
 		mdelay(2000);
 	}
