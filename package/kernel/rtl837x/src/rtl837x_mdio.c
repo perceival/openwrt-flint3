@@ -567,11 +567,8 @@ static void rtl837x_status_check_work_func(struct work_struct *work)
 		mdelay(2000);
 	}
 
-	queue_delayed_work_on(smp_processor_id(), 
-						system_wq, 
-						&gsw->status_check_work, 
-						msecs_to_jiffies(gsw->default_work_delay_ms)
-					);
+	queue_delayed_work(system_wq, &gsw->status_check_work,
+				   msecs_to_jiffies(gsw->default_work_delay_ms));
 }
 
 /* unused */
@@ -674,11 +671,8 @@ static int rtl837x_status_check_work_init(struct rtk_gsw *gsw)
 {
 	gsw->default_work_delay_ms = 1000;
 	INIT_DELAYED_WORK(&gsw->status_check_work, rtl837x_status_check_work_func);
-	queue_delayed_work_on(smp_processor_id(), 
-						system_wq, 
-						&gsw->status_check_work, 
-						msecs_to_jiffies(gsw->default_work_delay_ms)
-					);
+	queue_delayed_work(system_wq, &gsw->status_check_work,
+				   msecs_to_jiffies(gsw->default_work_delay_ms));
 	return 0;
 }
 
