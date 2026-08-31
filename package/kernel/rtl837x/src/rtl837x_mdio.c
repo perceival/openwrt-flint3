@@ -912,6 +912,7 @@ static void rtl837x_mdio_shutdown(struct mdio_device *mdiodev)
 	if (!gsw)
 		return;
 
+	cancel_delayed_work_sync(&gsw->status_check_work);
 	rtl837x_dsa_shutdown(gsw);
 	if (gsw->ethernet_master) {
 		dev_put(gsw->ethernet_master);
