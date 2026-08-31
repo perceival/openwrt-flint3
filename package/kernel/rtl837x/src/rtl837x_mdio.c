@@ -299,13 +299,13 @@ END_DETECT_CHIP:
 
 static int rtl837x_hw_reset(struct rtk_gsw *gsw)
 {
-	if (!IS_ERR(gsw->reset_pin)) {
+	if (!IS_ERR_OR_NULL(gsw->reset_pin)) {
 		dev_info(gsw->dev, "START HW RESET");
-		gpiod_set_value(gsw->reset_pin, 1);
+		gpiod_set_value_cansleep(gsw->reset_pin, 1);
 		mdelay(100);
-		gpiod_set_value(gsw->reset_pin, 0);
+		gpiod_set_value_cansleep(gsw->reset_pin, 0);
 		mdelay(100);
-		gpiod_set_value(gsw->reset_pin, 1);
+		gpiod_set_value_cansleep(gsw->reset_pin, 1);
 		mdelay(100);
 		dev_info(gsw->dev, "FINISH HW RESET");
 	}
