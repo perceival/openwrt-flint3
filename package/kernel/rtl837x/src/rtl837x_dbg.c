@@ -49,7 +49,7 @@ ssize_t _sdsreg_rw_write(struct file *filep, const char __user *ubuf,
 		return PTR_ERR(buf);
 	
 	if(buf[0] == 'w') {
-		if(sscanf(buf, "w %d %x %x %x", &sds_id, &page, &reg, &val) == -1)
+		if (sscanf(buf, "w %u %x %x %x", &sds_id, &page, &reg, &val) != 4)
 			return -EFAULT;
 		else{
 			if (sds_id > 1)
@@ -57,7 +57,7 @@ ssize_t _sdsreg_rw_write(struct file *filep, const char __user *ubuf,
 			rtk_rtl8373_sds_reg_write(sds_id, page, reg, val);
 		}
 	} else if(buf[0] == 'r') {
-		if(sscanf(buf, "r %d %x %x", &sds_id, &page, &reg) == -1)
+		if (sscanf(buf, "r %u %x %x", &sds_id, &page, &reg) != 3)
 			return -EFAULT;
 		else {
 			rtk_rtl8373_sds_reg_read(sds_id, page, reg, &val);
@@ -80,7 +80,7 @@ ssize_t _phyreg_mmd_rw_write(struct file *filep, const char __user *ubuf,
 		return PTR_ERR(buf);
 	
 	if(buf[0] == 'w') {
-		if(sscanf(buf, "w %d %x %x %x", &port, &devad, &reg, &val) == -1)
+		if (sscanf(buf, "w %u %x %x %x", &port, &devad, &reg, &val) != 4)
 			return -EFAULT;
 		else{
 			if (port > 9)
@@ -88,7 +88,7 @@ ssize_t _phyreg_mmd_rw_write(struct file *filep, const char __user *ubuf,
 			rtk_port_phyReg_set(1<<port, devad, reg, val);
 		}
 	} else if(buf[0] == 'r') {
-		if(sscanf(buf, "r %d %x %x", &port, &devad, &reg) == -1)
+		if (sscanf(buf, "r %u %x %x", &port, &devad, &reg) != 3)
 			return -EFAULT;
 		else {
 			rtk_port_phyReg_get(port, devad, reg, &val);
@@ -113,12 +113,12 @@ ssize_t _reg_rw_write(struct file *filep, const char __user *ubuf,
 		return PTR_ERR(buf);
 
 	if(buf[0] == 'w') {
-		if(sscanf(buf, "w %x %x", &reg, &val) == -1)
+		if (sscanf(buf, "w %x %x", &reg, &val) != 2)
 			return -EFAULT;
 		else
 			rtk_rtl8373_setAsicReg(reg, val);
 	} else if(buf[0] == 'r') {
-		if(sscanf(buf, "r %x", &reg) == -1)
+		if (sscanf(buf, "r %x", &reg) != 1)
 			return -EFAULT;
 		else {
 			rtk_rtl8373_getAsicReg(reg, &val);
