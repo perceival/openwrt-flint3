@@ -537,12 +537,19 @@ static void rtl837x_status_check_work_func(struct work_struct *work)
 {
 	struct rtk_gsw *gsw = container_of(work, struct rtk_gsw, status_check_work.work);
 
-	rtk_port_status_t port_status;
+	rtk_port_status_t port_status = { 0 };
+	int ret;
 
 	if (!gsw->ethernet_master)
 		return;
 
-	rtk_port_macStatus_get(gsw->cpu_port, &port_status);
+	ret = rtk_port_macStatus_get(gsw->cpu_port, &port_status);
+	if (ret) {
+		dev_warn_ratelimited(gsw->dev,
+				     "failed to read CPU port status: %d\n", ret);
+		goto reschedule;
+	}
+
 	if (!port_status.link)
 	{
 		if (gsw->cpu_port != UTP_PORT3 && gsw->cpu_port != UTP_PORT8)
@@ -567,6 +574,7 @@ static void rtl837x_status_check_work_func(struct work_struct *work)
 		mdelay(2000);
 	}
 
+reschedule:
 	queue_delayed_work_on(smp_processor_id(), 
 						system_wq, 
 						&gsw->status_check_work, 
