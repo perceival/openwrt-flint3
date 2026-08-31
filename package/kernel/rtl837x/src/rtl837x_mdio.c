@@ -665,6 +665,8 @@ static int rtl837x_sfp_probe(struct rtk_gsw *gsw)
 	gsw->sfp_bus = bus;
 
 	ret = sfp_bus_add_upstream(bus, gsw, &sfp_ops);
+	if (ret)
+		gsw->sfp_bus = NULL;
 	sfp_bus_put(bus);
 
 	return ret;
@@ -879,7 +881,15 @@ static int rtl837x_dsa_probe(struct mdio_device *mdiodev)
 		rtl837x_gpiochip_init(gsw);
 #endif /* CONFIG_GPIOLIB */
 
-	rtl837x_sfp_probe(gsw);
+	ret = rtl837x_sfp_probe(gsw);
+	if (ret) {
+		dev_err_probe(dev, ret, "failed to attach SFP bus\n");
+		rtl837x_dsa_unregister(gsw);
+		if (master)
+			dev_put(master);
+		devm_kfree(dev, gsw);
+		return ret;
+	}
 
 	rtl837x_debug_proc_init(gsw);
 	rtl837x_status_check_work_init(gsw);
