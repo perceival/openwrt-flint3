@@ -1,0 +1,38 @@
+From: Kamil Bienkiewicz <perceivalpercy@gmail.com>
+Subject: [PATCH] AP MLD: do not insert PMKR1Name into EAPOL-Key msg 3/4 for a non-AP MLD
+
+For a non-AP MLD, EAPOL-Key msg 3/4 carries no common RSNE; each
+affiliated link's RSNE is delivered in its MLO Link KDE and must remain
+byte-identical to the RSNE advertised for that link. The FT initial
+mobility-domain association code inserted the PMKR1Name into the (absent)
+common RSNE, which fails on the empty buffer.
+
+Guard that insertion with !is_mld. PMKR1Name does not need to be echoed
+in msg 3/4 for MLO: the non-AP MLD binds PMK-R1 in msg 2/4 and the
+supplicant validates PMKR1Name nowhere on the MLO path. Inserting it into
+the per-link RSNEs (as an earlier revision of this patch did) makes the
+MLO Link KDE RSNE differ from the advertised link RSNE and a spec-strict
+non-AP MLD then rejects msg 3/4 with an unprotected Disassociate.
+
+Signed-off-by: Kamil Bienkiewicz <perceivalpercy@gmail.com>
+---
+--- a/src/ap/wpa_auth.c
++++ b/src/ap/wpa_auth.c
+@@ -5246,7 +5246,16 @@
+ 		pos += wpa_ie_len;
+ 	}
+ #ifdef CONFIG_IEEE80211R_AP
+-	if (wpa_key_mgmt_ft(sm->wpa_key_mgmt)) {
++	/*
++	 * For a non-AP MLD there is no common RSNE in EAPOL-Key msg 3/4 (each
++	 * affiliated link's RSNE is delivered in its own MLO Link KDE, and must
++	 * stay byte-identical to the advertised link RSNE). PMKR1Name is not
++	 * echoed in msg 3/4 for MLO either - the STA already bound PMK-R1 in
++	 * msg 2/4 and the supplicant validates PMKR1Name nowhere in the MLO
++	 * path. So insert PMKR1Name into the common RSNE only for the non-MLD
++	 * case; doing it per-link makes a spec-strict non-AP MLD reject msg 3.
++	 */
++	if (wpa_key_mgmt_ft(sm->wpa_key_mgmt) && !is_mld) {
+ 		int res;
+ 		size_t elen;
+ 
