@@ -1,0 +1,74 @@
+From: Kamil Bienkiewicz <perceivalpercy@gmail.com>
+Subject: [PATCH] AP MLD: insert PMKR1Name into the per-link RSNEs for the FT Reassociation Response MIC
+
+The FTE MIC of the Reassociation Response frame sent to a non-AP MLD is
+calculated over the RSNE of each affiliated AP for the requested links.
+Those RSNEs are the ones the non-AP MLD sees in the frame, i.e., with
+PMKID = PMKR1Name, and not the RSNEs as advertised in the Beacon frames
+(this is also what wlantest does when it verifies the MIC). The AP MLD
+side used the Beacon frame RSNEs, so the MIC never matched: a non-AP MLD
+completed the FT protocol, then immediately sent an unprotected
+Deauthentication frame and fell back to a full SAE authentication.
+
+Insert PMKR1Name into each affiliated AP's RSNE before including it in
+the MIC calculation.
+
+Signed-off-by: Kamil Bienkiewicz <perceivalpercy@gmail.com>
+---
+--- a/src/ap/wpa_auth_ft.c
++++ b/src/ap/wpa_auth_ft.c
+@@ -2247,6 +2247,11 @@
+  * RSNEs (or RSNXEs, if rsnxe) of the affiliated APs of the AP MLD for the
+  * links negotiated by the STA, concatenated in increasing link ID order. The
+  * number of elements included is returned in *count.
++ *
++ * The RSNE of each affiliated AP is included with PMKID = PMKR1Name inserted,
++ * i.e., in the form in which the non-AP MLD sees it in the Reassociation
++ * Response frame (IEEE Std 802.11be, 13.8.5), not as advertised in the Beacon
++ * frame.
+  */
+ static struct wpabuf * wpa_ft_mlo_link_rsn_ies(struct wpa_state_machine *sm,
+ 					       bool rsnxe, unsigned int *count)
+@@ -2255,7 +2260,7 @@
+ 	unsigned int link_id;
+ 
+ 	*count = 0;
+-	buf = wpabuf_alloc(MAX_NUM_MLD_LINKS * 257);
++	buf = wpabuf_alloc(MAX_NUM_MLD_LINKS * (257 + 2 + PMKID_LEN));
+ 	if (!buf)
+ 		return NULL;
+ 
+@@ -2263,6 +2268,8 @@
+ 		const struct mld_link *link = &sm->mld_links[link_id];
+ 		const struct wpa_authenticator *la = link->wpa_auth;
+ 		const u8 *ie;
++		u8 rsne_buf[257 + 2 + PMKID_LEN];
++		size_t rsne_len;
+ 
+ 		if (!link->valid || !la)
+ 			continue;
+@@ -2270,7 +2277,23 @@
+ 			    rsnxe ? WLAN_EID_RSNX : WLAN_EID_RSN);
+ 		if (!ie)
+ 			continue;
+-		wpabuf_put_data(buf, ie, 2 + ie[1]);
++		if (rsnxe) {
++			wpabuf_put_data(buf, ie, 2 + ie[1]);
++			(*count)++;
++			continue;
++		}
++
++		rsne_len = 2 + ie[1];
++		os_memcpy(rsne_buf, ie, rsne_len);
++		if (wpa_insert_pmkid(rsne_buf, &rsne_len, sm->pmk_r1_name,
++				     true) < 0) {
++			wpa_printf(MSG_DEBUG,
++				   "FT: Failed to insert PMKR1Name into the RSNE of link %u",
++				   link_id);
++			wpabuf_free(buf);
++			return NULL;
++		}
++		wpabuf_put_data(buf, rsne_buf, rsne_len);
+ 		(*count)++;
+ 	}
+ 

@@ -1,0 +1,101 @@
+From: Kamil Bienkiewicz <perceivalpercy@gmail.com>
+Subject: [PATCH] AP MLD: fix FT roaming between AP MLDs (RRB self-learning, per-link FT check)
+
+Two problems showed up when a non-AP MLD roamed with FT between two AP
+MLDs whose affiliated APs all share the AP MLD MAC address as R1KH-ID
+and use the wildcard r0kh/r1kh configuration:
+
+1. RRB frames from a sibling link were processed as if they came from a
+   remote key holder. Every affiliated AP of an AP MLD has its own l2
+   socket on the FT interface, so a broadcast PMK-R1 pull or sequence
+   request sent by one link is also received by the other links of the
+   same AP MLD. Because those links carry the same R1KH-ID, the sequence
+   request handler classified the frame as "local R1KH-ID, remote
+   R0KH-ID" and answered it, which taught the requesting link that the
+   remote R0KH-ID lives at its sibling's address. All later pull
+   requests for that R0KH-ID were then sent to the sibling link ("R0KH-ID
+   mismatch") and, after the retries, the R0KH-ID was blocked: the roam
+   failed and the non-AP MLD gave up on the target AP MLD. Ignore RRB
+   frames whose source address is an affiliated AP of our own AP MLD.
+
+2. The FT Reassociation Request validation ran again for every
+   affiliated link in ieee80211_ml_process_link(), with the per-STA
+   profile elements only (no RSNE, MDE or FTE, as those are inherited),
+   so every link other than the association link was rejected with "No
+   RSNIE in Reassoc Req" and the non-AP MLD ended up single-link after
+   the roam. The FT validation covers the whole MLD and has already
+   been done for the association link with the same RSN state machine,
+   so skip it when processing the other links.
+
+Signed-off-by: Kamil Bienkiewicz <perceivalpercy@gmail.com>
+---
+--- a/src/ap/wpa_auth_glue.c
++++ b/src/ap/wpa_auth_glue.c
+@@ -1588,6 +1588,32 @@
+ }
+ 
+ 
++/*
++ * Every affiliated AP of an AP MLD receives the RRB frames that its sibling
++ * links send on the shared FT interface (broadcast pull and sequence requests
++ * with the wildcard configuration). They share the R1KH-ID, so such a frame
++ * would be taken for a request from a remote key holder and answered, which
++ * makes the sending link learn its own AP MLD as the address of the remote
++ * R0KH. Ignore anything that originates from our own AP MLD.
++ */
++static bool hostapd_rrb_from_own_mld(struct hostapd_data *hapd,
++				     const u8 *src_addr)
++{
++#ifdef CONFIG_IEEE80211BE
++	struct hostapd_data *link;
++
++	if (!hapd->conf->mld_ap || !hapd->mld)
++		return false;
++
++	for_each_mld_link(link, hapd) {
++		if (ether_addr_equal(link->own_addr, src_addr))
++			return true;
++	}
++#endif /* CONFIG_IEEE80211BE */
++	return false;
++}
++
++
+ static void hostapd_rrb_receive(void *ctx, const u8 *src_addr, const u8 *buf,
+ 				size_t len)
+ {
+@@ -1601,6 +1627,8 @@
+ 	if (!is_multicast_ether_addr(ethhdr->h_dest) &&
+ 	    !ether_addr_equal(hapd->own_addr, ethhdr->h_dest))
+ 		return;
++	if (hostapd_rrb_from_own_mld(hapd, ethhdr->h_source))
++		return;
+ 	wpa_ft_rrb_rx(hapd->wpa_auth, ethhdr->h_source, buf + sizeof(*ethhdr),
+ 		      len - sizeof(*ethhdr));
+ }
+@@ -1617,6 +1645,8 @@
+ 	if (!is_multicast_ether_addr(dst_addr) &&
+ 	    !ether_addr_equal(hapd->own_addr, dst_addr))
+ 		return;
++	if (hostapd_rrb_from_own_mld(hapd, src_addr))
++		return;
+ 	wpa_ft_rrb_oui_rx(hapd->wpa_auth, src_addr, dst_addr, oui_suffix, buf,
+ 			  len);
+ }
+--- a/src/ap/ieee802_11.c
++++ b/src/ap/ieee802_11.c
+@@ -5749,7 +5749,13 @@
+ #endif /* CONFIG_PMKSA_PRIVACY */
+ 
+ #ifdef CONFIG_IEEE80211R_AP
+-		if (sta->auth_alg == WLAN_AUTH_FT) {
++		/*
++		 * The FT validation covers the whole non-AP MLD and was done
++		 * for the association link; the per-STA profiles of the other
++		 * links do not repeat the inherited RSNE, MDE and FTE, so do
++		 * not run it again when processing those links.
++		 */
++		if (sta->auth_alg == WLAN_AUTH_FT && !assoc_wpa_sm) {
+ 			if (type != LINK_PARSE_REASSOC) {
+ 				wpa_printf(MSG_DEBUG, "FT: " MACSTR " tried "
+ 					   "to use association (not "
