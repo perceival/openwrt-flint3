@@ -1,0 +1,73 @@
+From: Kamil Bienkiewicz <perceivalpercy@gmail.com>
+Subject: [PATCH] AP MLD: do not take a translated MLD MAC address as the link address in handle_auth()
+
+When a non-AP MLD that the driver already knows (e.g., a still
+associated station starting FT authentication towards the same AP MLD)
+sends an Authentication frame, the driver translates the link address
+in the SA field to the MLD MAC address. handle_auth() then stored that
+MLD MAC address as the link address of the association link and, in the
+FT case, ap_sta_re_add() created the driver STA entry with it, so the
+station's frames sent from its real link address were no longer matched
+and the association was dead until the station gave up and associated
+from scratch.
+
+Keep the previously learned link address when the SA of such an
+Authentication frame is the MLD MAC address of a station for which a
+different link address is already known.
+
+Signed-off-by: Kamil Bienkiewicz <perceivalpercy@gmail.com>
+---
+--- a/src/ap/ieee802_11.c
++++ b/src/ap/ieee802_11.c
+@@ -4450,23 +4450,50 @@
+ 	 * peer_addr based on mgmt->sa which would have been translated to the
+ 	 * MLD MAC address. */
+ 	if (!sta->added_unassoc && auth_transaction == 1) {
++		u8 prev_peer_addr[ETH_ALEN];
++
++		os_memcpy(prev_peer_addr,
++			  sta->mld_info.links[hapd->mld_link_id].peer_addr,
++			  ETH_ALEN);
+ 		ap_sta_free_sta_profile(&sta->mld_info);
+ 		os_memset(&sta->mld_info, 0, sizeof(sta->mld_info));
+ 
+ 		if (mld_sta) {
+ 			u8 link_id = hapd->mld_link_id;
++			const u8 *link_addr = mgmt->sa;
+ 
+ 			ap_sta_set_mld(sta, true);
+ 			sta->mld_assoc_link_id = link_id;
+ 
+ 			/*
++			 * The driver translates the link address of a non-AP
++			 * MLD it already knows (e.g., a still associated
++			 * station that starts FT authentication) to the MLD
++			 * MAC address in received frames. Do not take such an
++			 * SA as the link address; keep the link address learned
++			 * from the earlier Authentication or (Re)Association
++			 * Request frame instead, so that the driver STA entry
++			 * is (re)created with the address the station really
++			 * uses on this link.
++			 */
++			if (ether_addr_equal(mgmt->sa, sa) &&
++			    !is_zero_ether_addr(prev_peer_addr) &&
++			    !ether_addr_equal(prev_peer_addr, sa)) {
++				wpa_printf(MSG_DEBUG,
++					   "MLD: Keep link address " MACSTR
++					   " for " MACSTR " (SA is the MLD MAC address)",
++					   MAC2STR(prev_peer_addr), MAC2STR(sa));
++				link_addr = prev_peer_addr;
++			}
++
++			/*
+ 			 * Set the MLD address as the station address and the
+ 			 * station addresses.
+ 			 */
+ 			os_memcpy(sta->mld_info.common_info.mld_addr, sa,
+ 				  ETH_ALEN);
+ 			os_memcpy(sta->mld_info.links[link_id].peer_addr,
+-				  mgmt->sa, ETH_ALEN);
++				  link_addr, ETH_ALEN);
+ 			os_memcpy(sta->mld_info.links[link_id].local_addr,
+ 				  hapd->own_addr, ETH_ALEN);
+ 		}
