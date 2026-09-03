@@ -1,0 +1,46 @@
+From: Kamil Bienkiewicz <perceivalpercy@gmail.com>
+Subject: [PATCH] AP MLD: include the MDE in EAPOL-Key msg 3/4 for a non-AP MLD
+
+For a non-AP MLD the authenticator does not copy the common
+RSNE/RSNXE/MDE block (wpa_ie) into EAPOL-Key msg 3/4; each affiliated
+link's RSNE and RSNXE are delivered in its MLO Link KDE instead. With an
+FT AKM this silently dropped the Mobility Domain element from the Key
+Data, while the FTE was still added. IEEE Std 802.11 12.7.6.4 requires
+the MDE at the top level of msg 3/4 for an FT initial mobility domain
+association, and wpa_supplicant's MLO path (ft_validate_mdie) rejects
+msg 3/4 when it is missing; a Qualcomm-based non-AP MLD answered every
+msg 3/4 with an unprotected Disassociate for the same reason.
+
+Write the MDE into the Key Data before the FTE when the STA is a
+non-AP MLD. The existing FT length reservation already covers it.
+
+Signed-off-by: Kamil Bienkiewicz <perceivalpercy@gmail.com>
+---
+--- a/src/ap/wpa_auth.c
++++ b/src/ap/wpa_auth.c
+@@ -5290,6 +5290,25 @@
+ 	if (wpa_key_mgmt_ft(sm->wpa_key_mgmt)) {
+ 		int res;
+ 
++		if (is_mld) {
++			/*
++			 * The common RSNE/RSNXE/MDE block (wpa_ie) is not copied
++			 * into EAPOL-Key msg 3/4 for a non-AP MLD (each link's
++			 * RSNE/RSNXE travels in its MLO Link KDE instead), but
++			 * the MDE is still required at the top level of the Key
++			 * Data (IEEE Std 802.11 12.7.6.4): the non-AP MLD checks
++			 * it against the (Re)Association Response MDE before it
++			 * accepts the FTE, and rejects msg 3/4 when it is absent.
++			 */
++			res = wpa_write_mdie(conf, pos, kde + kde_len - pos);
++			if (res < 0) {
++				wpa_printf(MSG_ERROR,
++					   "FT: Failed to insert MDE into EAPOL-Key Key Data");
++				goto done;
++			}
++			pos += res;
++		}
++
+ 		if (sm->assoc_resp_ftie &&
+ 		    kde + kde_len - pos >= 2 + sm->assoc_resp_ftie[1]) {
+ 			os_memcpy(pos, sm->assoc_resp_ftie,
