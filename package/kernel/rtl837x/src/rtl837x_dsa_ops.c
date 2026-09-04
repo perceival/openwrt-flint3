@@ -8,6 +8,7 @@
 #include <linux/if_bridge.h>
 #include <linux/if_ether.h>
 #include <linux/kernel.h>
+#include <linux/netdevice.h>
 #include <linux/phylink.h>
 #include <linux/phy.h>
 #include <linux/string.h>
@@ -358,6 +359,295 @@ static int rtl837x_set_mac_eee(struct dsa_switch *ds, int port,
 	}
 
 	return 0;
+}
+
+static int rtl837x_lag_hash_mask(const struct netdev_lag_upper_info *info,
+				 u32 *hash_mask)
+{
+	if (!info || info->tx_type != NETDEV_LAG_TX_TYPE_HASH)
+		return -EOPNOTSUPP;
+
+	switch (info->hash_type) {
+	case NETDEV_LAG_HASH_L2:
+		*hash_mask = RTK_TRUNK_SMAC_HASH_MASK |
+			     RTK_TRUNK_DMAC_HASH_MASK;
+		return 0;
+	case NETDEV_LAG_HASH_L23:
+		*hash_mask = RTK_TRUNK_SMAC_HASH_MASK |
+			     RTK_TRUNK_DMAC_HASH_MASK |
+			     RTK_TRUNK_SIP_HASH_MASK |
+			     RTK_TRUNK_DIP_HASH_MASK;
+		return 0;
+	case NETDEV_LAG_HASH_L34:
+		*hash_mask = RTK_TRUNK_SIP_HASH_MASK |
+			     RTK_TRUNK_DIP_HASH_MASK |
+			     RTK_TRUNK_SPORT_HASH_MASK |
+			     RTK_TRUNK_DPORT_HASH_MASK;
+		return 0;
+	default:
+		return -EOPNOTSUPP;
+	}
+}
+
+static int rtl837x_lag_set_members(struct rtk_gsw *gsw, int group,
+				   u32 members)
+{
+	rtk_portmask_t portmask = { .bits = { members } };
+
+	if (members & ~gsw->valid_port_mask)
+		return -EINVAL;
+
+	return rtl837x_to_errno(rtk_trunk_port_set(group, &portmask));
+}
+
+static u32 rtl837x_lag_get_active_members(struct rtk_gsw *gsw, int group)
+{
+	u32 active_members = 0;
+	int port;
+
+	for (port = 0; port < RTK_MAX_NUM_OF_PORT; port++) {
+		struct dsa_port *dp;
+
+		if (!(gsw->lag_members[group] & BIT(port)))
+			continue;
+
+		dp = dsa_to_port(&gsw->ds, port);
+		if (dp && dp->lag_tx_enabled)
+			active_members |= BIT(port);
+	}
+
+	return active_members;
+}
+
+static int rtl837x_lag_set_active_members(struct rtk_gsw *gsw, int group)
+{
+	u32 active_members = rtl837x_lag_get_active_members(gsw, group);
+	int ret;
+
+	/* DSA keeps lag_tx_enabled in sync with link state and the LACP
+	 * driver's transmit permission.  The RTL837x trunk API only accepts
+	 * one member mask, so use it as the active candidate set while keeping
+	 * lag_members as the configured DSA membership.
+	 */
+	ret = rtl837x_lag_set_members(gsw, group, active_members);
+	if (!ret)
+		gsw->lag_active_members[group] = active_members;
+
+	return ret;
+}
+
+static int rtl837x_lag_clear_hardware(struct rtk_gsw *gsw)
+{
+	rtk_portmask_t empty = { .bits = { 0 } };
+	int group, ret, first_ret = 0;
+
+	for (group = 0; group < TRUNK_GROUP_END; group++) {
+		ret = rtl837x_to_errno(rtk_trunk_port_set(group, &empty));
+		if (ret) {
+			dev_warn(gsw->dev,
+				 "failed to clear RTL837x LAG %d members: %d\n",
+				 group, ret);
+			if (!first_ret)
+				first_ret = ret;
+		}
+
+		ret = rtl837x_to_errno(
+			rtk_trunk_distributionAlgorithm_set(group, 0));
+		if (ret) {
+			dev_warn(gsw->dev,
+				 "failed to clear RTL837x LAG %d hash mask: %d\n",
+				 group, ret);
+			if (!first_ret)
+				first_ret = ret;
+		}
+	}
+
+	return first_ret;
+}
+
+static int rtl837x_lag_group_from_lag(const struct dsa_switch *ds,
+				      const struct dsa_lag *lag)
+{
+	/* DSA LAG IDs are one-based; the RTL837x trunk table is zero-based. */
+	if (!lag->id)
+		return -EOPNOTSUPP;
+	if (lag->id > ds->num_lag_ids)
+		return -EINVAL;
+
+	return lag->id - 1;
+}
+
+static int rtl837x_port_lag_change(struct dsa_switch *ds, int port)
+{
+	struct rtk_gsw *gsw = ds->priv;
+	int group, ret = 0;
+
+	if (!rtl837x_valid_port(gsw, port))
+		return -EINVAL;
+	if (port == gsw->cpu_port)
+		return -EOPNOTSUPP;
+
+	mutex_lock(&gsw->feature_lock);
+
+	for (group = 0; group < TRUNK_GROUP_END; group++) {
+		if (gsw->lag_members[group] & BIT(port))
+			break;
+	}
+
+	if (group < TRUNK_GROUP_END)
+		ret = rtl837x_lag_set_active_members(gsw, group);
+
+	mutex_unlock(&gsw->feature_lock);
+	return ret;
+}
+
+static int rtl837x_port_lag_join(struct dsa_switch *ds, int port,
+				 struct dsa_lag lag,
+				 struct netdev_lag_upper_info *info,
+				 struct netlink_ext_ack *extack)
+{
+	struct rtk_gsw *gsw = ds->priv;
+	u32 hash_mask, members, old_members, old_active_members, old_hash_mask;
+	int group, other_group, ret;
+
+	if (!rtl837x_valid_port(gsw, port))
+		return -EINVAL;
+	if (port == gsw->cpu_port)
+		return -EOPNOTSUPP;
+
+	group = rtl837x_lag_group_from_lag(ds, &lag);
+	if (group == -EOPNOTSUPP) {
+		NL_SET_ERR_MSG_MOD(extack,
+				   "No RTL837x hardware LAG ID is available; using software LAG");
+		return group;
+	}
+	if (group < 0)
+		return group;
+
+	ret = rtl837x_lag_hash_mask(info, &hash_mask);
+	if (ret) {
+		NL_SET_ERR_MSG_MOD(extack,
+				   "RTL837x hardware LAG does not support this hash policy");
+		return ret;
+	}
+
+	mutex_lock(&gsw->feature_lock);
+
+	for (other_group = 0; other_group < TRUNK_GROUP_END; other_group++) {
+		if (other_group != group &&
+		    (gsw->lag_members[other_group] & BIT(port))) {
+			NL_SET_ERR_MSG_MOD(extack,
+					   "port is already a member of another hardware LAG");
+			ret = -EOPNOTSUPP;
+			goto out_unlock;
+		}
+	}
+
+	if (gsw->lag_members[group] & BIT(port)) {
+		ret = 0;
+		goto out_unlock;
+	}
+
+	if (hweight32(gsw->lag_members[group]) >= 4) {
+		NL_SET_ERR_MSG_MOD(extack,
+					   "RTL837x hardware LAGs support at most four ports");
+		ret = -EOPNOTSUPP;
+		goto out_unlock;
+	}
+
+	if (gsw->lag_hash_mask[group] &&
+	    gsw->lag_hash_mask[group] != hash_mask) {
+		NL_SET_ERR_MSG_MOD(extack,
+				   "all ports in a hardware LAG must use the same hash policy");
+		ret = -EOPNOTSUPP;
+		goto out_unlock;
+	}
+
+	old_members = gsw->lag_members[group];
+	old_active_members = gsw->lag_active_members[group];
+	old_hash_mask = gsw->lag_hash_mask[group];
+	if (!old_hash_mask) {
+		ret = rtl837x_to_errno(rtk_trunk_distributionAlgorithm_set(group,
+									       hash_mask));
+		if (ret)
+			goto out_unlock;
+	}
+
+	members = gsw->lag_members[group] | BIT(port);
+	gsw->lag_members[group] = members;
+	gsw->lag_hash_mask[group] = hash_mask;
+	ret = rtl837x_lag_set_active_members(gsw, group);
+	if (ret) {
+		gsw->lag_members[group] = old_members;
+		gsw->lag_hash_mask[group] = old_hash_mask;
+		if (rtl837x_lag_set_members(gsw, group, old_active_members))
+			dev_err(gsw->dev,
+				"failed to restore active members of LAG %d after join failure\n",
+				group);
+		else
+			gsw->lag_active_members[group] = old_active_members;
+
+		if (!old_hash_mask &&
+		    rtk_trunk_distributionAlgorithm_set(group, old_hash_mask))
+			dev_err(gsw->dev,
+				"failed to restore hash algorithm of LAG %d after join failure\n",
+				group);
+		goto out_unlock;
+	}
+	ret = 0;
+
+out_unlock:
+	mutex_unlock(&gsw->feature_lock);
+	return ret;
+}
+
+static int rtl837x_port_lag_leave(struct dsa_switch *ds, int port,
+				  struct dsa_lag lag)
+{
+	struct rtk_gsw *gsw = ds->priv;
+	u32 members, old_members, old_active_members, old_hash_mask;
+	int group, ret;
+
+	if (!rtl837x_valid_port(gsw, port))
+		return -EINVAL;
+	if (port == gsw->cpu_port)
+		return -EOPNOTSUPP;
+
+	group = rtl837x_lag_group_from_lag(ds, &lag);
+	if (group < 0)
+		return group;
+
+	mutex_lock(&gsw->feature_lock);
+
+	if (!(gsw->lag_members[group] & BIT(port))) {
+		ret = -ENOENT;
+		goto out_unlock;
+	}
+
+	old_members = gsw->lag_members[group];
+	old_active_members = gsw->lag_active_members[group];
+	old_hash_mask = gsw->lag_hash_mask[group];
+	members = old_members & ~BIT(port);
+	gsw->lag_members[group] = members;
+	if (!members)
+		gsw->lag_hash_mask[group] = 0;
+	ret = rtl837x_lag_set_active_members(gsw, group);
+	if (ret) {
+		gsw->lag_members[group] = old_members;
+		gsw->lag_hash_mask[group] = old_hash_mask;
+		if (rtl837x_lag_set_members(gsw, group, old_active_members))
+			dev_err(gsw->dev,
+				"failed to restore active members of LAG %d after leave failure\n",
+				group);
+		else
+			gsw->lag_active_members[group] = old_active_members;
+		goto out_unlock;
+	}
+	ret = 0;
+
+out_unlock:
+	mutex_unlock(&gsw->feature_lock);
+	return ret;
 }
 
 /* With tag_8021q, forwarding and isolation are governed entirely by VLAN
@@ -1090,6 +1380,11 @@ static int rtl837x_setup(struct dsa_switch *ds)
 	if (ret)
 		return rtl837x_to_errno(ret);
 
+	/* Do not inherit trunk members or hash masks left by a prior instance. */
+	ret = rtl837x_lag_clear_hardware(gsw);
+	if (ret)
+		return ret;
+
 	ret = rtk_l2_table_clear();
 	if (ret)
 		return rtl837x_to_errno(ret);
@@ -1124,6 +1419,10 @@ static int rtl837x_setup(struct dsa_switch *ds)
 
 	memset(gsw->bridge_dev, 0, sizeof(gsw->bridge_dev));
 	gsw->isolated_port_mask = 0;
+	memset(gsw->port_enabled, 0, sizeof(gsw->port_enabled));
+	memset(gsw->lag_members, 0, sizeof(gsw->lag_members));
+	memset(gsw->lag_active_members, 0, sizeof(gsw->lag_active_members));
+	memset(gsw->lag_hash_mask, 0, sizeof(gsw->lag_hash_mask));
 	memset(gsw->tag8021q_pvid, 0, sizeof(gsw->tag8021q_pvid));
 	memset(gsw->tag8021q_pvid_valid, 0, sizeof(gsw->tag8021q_pvid_valid));
 	memset(gsw->bridge_pvid, 0, sizeof(gsw->bridge_pvid));
@@ -1176,6 +1475,15 @@ static void rtl837x_teardown(struct dsa_switch *ds)
 	rtnl_lock();
 	dsa_tag_8021q_unregister(ds);
 	rtnl_unlock();
+
+	ret = rtl837x_lag_clear_hardware(gsw);
+	if (ret)
+		dev_warn(gsw->dev,
+			 "failed to clear RTL837x LAG state during teardown: %d\n",
+			 ret);
+	memset(gsw->lag_members, 0, sizeof(gsw->lag_members));
+	memset(gsw->lag_active_members, 0, sizeof(gsw->lag_active_members));
+	memset(gsw->lag_hash_mask, 0, sizeof(gsw->lag_hash_mask));
 
 	rtl837x_mdio_teardown(ds);
 	ret = rtk_cpuTag_enable_set(EXTERNAL_CPU, DISABLED);
@@ -1961,6 +2269,9 @@ static const struct dsa_switch_ops rtl837x_dsa_ops = {
 	.port_fdb_del = rtl837x_port_fdb_del,
 	.tag_8021q_vlan_add = rtl837x_tag_8021q_vlan_add,
 	.tag_8021q_vlan_del = rtl837x_tag_8021q_vlan_del,
+	.port_lag_change = rtl837x_port_lag_change,
+	.port_lag_join = rtl837x_port_lag_join,
+	.port_lag_leave = rtl837x_port_lag_leave,
 };
 
 int rtl837x_dsa_register(struct rtk_gsw *gsw)
@@ -1975,6 +2286,7 @@ int rtl837x_dsa_register(struct rtk_gsw *gsw)
 	ds->priv = gsw;
 	ds->ops = &rtl837x_dsa_ops;
 	ds->num_ports = gsw->dsa_num_ports;
+	ds->num_lag_ids = TRUNK_GROUP_END;
 	ds->phys_mii_mask = rtl837x_user_ports(gsw);
 	ds->configure_vlan_while_not_filtering = true;
 	ds->untag_bridge_pvid = true;
