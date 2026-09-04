@@ -1,0 +1,17 @@
+#!/bin/sh
+# SPDX-License-Identifier: GPL-2.0-only
+
+UHTTPD_PREFIX='/rpc=/usr/share/glinet-app-compat/rpc.uc'
+
+[ -f /etc/config/uhttpd ] || exit 0
+
+case "$(uci -q get uhttpd.main.ucode_prefix)" in
+	*"$UHTTPD_PREFIX"*)
+		exit 0
+		;;
+esac
+
+uci -q add_list uhttpd.main.ucode_prefix="$UHTTPD_PREFIX" || exit 1
+uci -q commit uhttpd || exit 1
+
+exit 0
