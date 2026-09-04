@@ -23,6 +23,7 @@
 
 #define EBW_CTRL_RATE_MAX      (0xFFFFF * 16)
 #define EBW_CTRL_MAX_PORT_ID 	(8)
+#define EBW_CTRL_BURST_MAX    (0xFFFF)
 
 
 typedef enum rtk_rate_igrBwCongestSts_e
@@ -179,6 +180,37 @@ extern rtk_api_ret_t rtk_rate_igrBwCtrlIfg_get(rtk_enable_t *pIfgInclude);
 extern rtk_api_ret_t rtk_rate_igrBwCtrlCongestSts_get(rtk_port_t port, rtk_rate_igrBwCongestSts_t *pCongestSts);
 
 /* Function Name:
+ *      rtk_rate_egrBwCtrlPortEn_set
+ * Description:
+ *      Enable or disable port egress bandwidth control
+ */
+extern rtk_api_ret_t rtk_rate_egrBwCtrlPortEn_set(rtk_port_t port, rtk_enable_t bwEn);
+
+/* Function Name:
+ *      rtk_rate_egrBwCtrlPortEn_get
+ * Description:
+ *      Get port egress bandwidth control state
+ */
+extern rtk_api_ret_t rtk_rate_egrBwCtrlPortEn_get(rtk_port_t port, rtk_enable_t *pBwEn);
+
+/*
+ * Set the per-port egress bandwidth rate without changing the chip-global
+ * IFG accounting setting.
+ */
+extern rtk_api_ret_t rtk_rate_egrBwCtrlRate_set(rtk_port_t port,
+						rtk_rate_t rate);
+
+/*
+ * Set/get the per-port egress bandwidth burst in bytes. The RTL8373
+ * implementation rejects values outside the exact hardware field or below
+ * the hardware's minimum bucket size.
+ */
+extern rtk_api_ret_t rtk_rate_egrBwCtrlBurst_set(rtk_port_t port,
+							 rtk_uint32 burst);
+extern rtk_api_ret_t rtk_rate_egrBwCtrlBurst_get(rtk_port_t port,
+							 rtk_uint32 *pBurst);
+
+/* Function Name:
  *      rtk_rate_egrBandwidthCtrlRate_set
  * Description:
  *      Set port egress bandwidth control
@@ -311,5 +343,3 @@ extern rtk_api_ret_t rtk_rate_egrQueueBwCtrlRate_set(rtk_port_t port, rtk_qid_t 
 
 
 #endif /* __RTK_API_RATE_H__ */
-
-
