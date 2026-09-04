@@ -1,0 +1,114 @@
+From: Kamil Bienkiewicz <perceivalpercy@gmail.com>
+Subject: [PATCH] FT: reuse ANonce for a repeated FT Authentication frame with the same SNonce
+
+EXPERIMENTAL, NOT HARDWARE-VERIFIED. Written from a code-audit hypothesis
+(F1 in the FT-over-MLO investigation notes), targeting the status-55
+INVALID_FTIE reject storm observed on hardware: an AP MLD received a
+retried FT auth frame (same SNonce) shortly after the first one and
+generated a brand-new ANonce for it before the client's first response
+had settled, so the FTE the client validated no longer matched.
+
+wpa_ft_process_auth_req() always called random_get_bytes() for a new
+ANonce, even when the incoming FTIE carried the same SNonce as a still
+in-flight authentication. Extract the SNonce into a local buffer first
+and only regenerate the ANonce when the SNonce differs from the one
+already recorded on this state machine, or when more than 1 second has
+passed since the last FT Authentication frame was processed for it.
+
+This does not address the separate, more likely root cause identified
+for the "AP transmits nothing after FT reassoc" data-path failure
+(suspected ath12k/firmware ML-peer state after the FT re-add) -- see
+the FT-over-MLO hostapd patch notes. This patch only targets the
+re-auth/ANonce-churn symptom.
+
+Signed-off-by: Kamil Bienkiewicz <perceivalpercy@gmail.com>
+---
+--- a/src/ap/wpa_auth_i.h
++++ b/src/ap/wpa_auth_i.h
+@@ -56,6 +56,11 @@
+ 	u8 ANonce[WPA_NONCE_LEN];
+ 	u8 SNonce[WPA_NONCE_LEN];
+ 	u8 alt_SNonce[WPA_NONCE_LEN];
++#ifdef CONFIG_IEEE80211R_AP
++	struct os_reltime ft_auth_time; /* time of the last FT Authentication
++					  * frame processed for SNonce/ANonce
++					  * (see wpa_ft_process_auth_req()) */
++#endif /* CONFIG_IEEE80211R_AP */
+ 	u8 alt_replay_counter[WPA_REPLAY_COUNTER_LEN];
+ 	u8 PMK[PMK_LEN_MAX];
+ 	unsigned int pmk_len;
+--- a/src/ap/wpa_auth_ft.c
++++ b/src/ap/wpa_auth_ft.c
+@@ -3491,6 +3491,8 @@
+ 	struct rsn_mdie *mdie;
+ 	u8 pmk_r1[PMK_LEN_MAX], pmk_r1_name[WPA_PMK_NAME_LEN];
+ 	u8 ptk_name[WPA_PMK_NAME_LEN];
++	u8 new_snonce[WPA_NONCE_LEN];
++	struct os_reltime now;
+ 	struct wpa_auth_config *conf;
+ 	struct wpa_ft_ies parse;
+ 	size_t buflen;
+@@ -3641,12 +3643,6 @@
+ 	else
+ 		sm->hash_alg = RSN_HASH_SHA256;
+
+-	if (random_get_bytes(sm->ANonce, WPA_NONCE_LEN)) {
+-		wpa_printf(MSG_DEBUG, "FT: Failed to get random data for "
+-			   "ANonce");
+-		goto out;
+-	}
+-
+ 	/* Now that we know the correct PMK-R1 length and as such, the length
+ 	 * of the MIC field, fetch the SNonce. */
+ 	if (pmk_r1_len == SHA512_MAC_LEN) {
+@@ -3659,7 +3655,7 @@
+ 			goto out;
+ 		}
+
+-		os_memcpy(sm->SNonce, ftie->snonce, WPA_NONCE_LEN);
++		os_memcpy(new_snonce, ftie->snonce, WPA_NONCE_LEN);
+ 	} else if (pmk_r1_len == SHA384_MAC_LEN) {
+ 		const struct rsn_ftie_sha384 *ftie;
+
+@@ -3670,7 +3666,7 @@
+ 			goto out;
+ 		}
+
+-		os_memcpy(sm->SNonce, ftie->snonce, WPA_NONCE_LEN);
++		os_memcpy(new_snonce, ftie->snonce, WPA_NONCE_LEN);
+ 	} else {
+ 		const struct rsn_ftie *ftie;
+
+@@ -3681,8 +3677,31 @@
+ 			goto out;
+ 		}
+
+-		os_memcpy(sm->SNonce, ftie->snonce, WPA_NONCE_LEN);
++		os_memcpy(new_snonce, ftie->snonce, WPA_NONCE_LEN);
++	}
++
++	/*
++	 * A retried FT Authentication frame carrying the same SNonce as the
++	 * one we are still processing (e.g., a client re-sending auth while
++	 * our previous response is in flight) must get the same ANonce back;
++	 * generating a fresh ANonce for it changes the FTE the client already
++	 * validated and can trigger an INVALID_FTIE/status-55 reject storm.
++	 * Reuse the previous ANonce for a repeated SNonce seen within 1
++	 * second; otherwise generate a new one as before.
++	 */
++	if (sm->ft_auth_time.sec &&
++	    os_memcmp(new_snonce, sm->SNonce, WPA_NONCE_LEN) == 0 &&
++	    os_get_reltime(&now) == 0 &&
++	    !os_reltime_expired(&now, &sm->ft_auth_time, 1)) {
++		wpa_printf(MSG_DEBUG,
++			   "FT: Reusing previous ANonce for a repeated auth with the same SNonce");
++	} else if (random_get_bytes(sm->ANonce, WPA_NONCE_LEN)) {
++		wpa_printf(MSG_DEBUG, "FT: Failed to get random data for "
++			   "ANonce");
++		goto out;
+ 	}
++	os_memcpy(sm->SNonce, new_snonce, WPA_NONCE_LEN);
++	os_get_reltime(&sm->ft_auth_time);
+
+ 	wpa_hexdump(MSG_DEBUG, "FT: Received SNonce",
+ 		    sm->SNonce, WPA_NONCE_LEN);
