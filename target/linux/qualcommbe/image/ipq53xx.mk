@@ -95,6 +95,6 @@ define Device/glinet_gl-be9300
 		kmod-usb-core kmod-usb2 kmod-usb3 kmod-usb-dwc3 \
 		kmod-usb-dwc3-qcom kmod-usb-xhci-hcd kmod-scsi-core \
 		kmod-usb-storage kmod-usb-storage-uas kmod-fs-ext4 \
-		block-mount blockd usbutils
+		block-mount blockd usbutils glinet-app-compat
 endef
 TARGET_DEVICES += glinet_gl-be9300
