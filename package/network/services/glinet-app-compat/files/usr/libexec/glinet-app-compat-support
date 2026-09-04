@@ -1,0 +1,129 @@
+#!/bin/sh
+# SPDX-License-Identifier: GPL-2.0-only
+
+set -u
+
+output="${1:--}"
+if [ "$output" != '-' ]; then
+	case "$output" in
+		/tmp/*) ;;
+		*)
+			printf 'output must be - or a path below /tmp\n' >&2
+			exit 2
+			;;
+	esac
+	output_name=${output#/tmp/}
+	case "$output_name" in
+		''|.|..|.*|*/*|*[!A-Za-z0-9._-]*)
+			printf 'output must be a simple filename below /tmp\n' >&2
+			exit 2
+			;;
+	esac
+	if [ -e "$output" ] || [ -L "$output" ]; then
+		printf 'output already exists; choose a new path below /tmp\n' >&2
+		exit 2
+	fi
+
+	umask 077
+	set -C
+	exec >"$output" || exit 1
+	set +C
+fi
+
+redact()
+{
+	sed -E \
+		-e "s/((password|passwd|psk|key|secret|private[_-]?key|hash|nonce|sid|session[_-]?id|cookie|admin[-_]?token|token)[^=:{]*=[[:space:]]*)'[^']*'/\1<redacted>/Ig" \
+		-e 's/((password|passwd|psk|key|secret|private[_-]?key|hash|nonce|sid|session[_-]?id|cookie|admin[-_]?token|token)[^=:{]*=[[:space:]]*)"[^"]*"/\1<redacted>/Ig' \
+		-e 's/((password|passwd|psk|key|secret|private[_-]?key|hash|nonce|sid|session[_-]?id|cookie|admin[-_]?token|token)[^=:{]*=[[:space:]]*)[^[:space:],;}]+/\1<redacted>/Ig' \
+		-e 's/("?(password|passwd|psk|key|secret|private[_-]?key|hash|nonce|sid|session[_-]?id|cookie|admin[-_]?token|token)"?[[:space:]]*:[[:space:]]*)"[^"]*"/\1<redacted>/Ig' \
+		-e 's/((password|passwd|psk|key|secret|private[_-]?key|hash|nonce|sid|session[_-]?id|cookie|admin[-_]?token|token)[[:space:]]*:[[:space:]]*)[^[:space:],;}]+/\1<redacted>/Ig'
+}
+
+section()
+{
+	printf '\n=== %s ===\n' "$1"
+}
+
+run_command()
+{
+	if command -v "$1" >/dev/null 2>&1; then
+		"$@" 2>&1 | redact
+	else
+		printf 'unavailable: %s\n' "$1"
+	fi
+}
+
+run_uci()
+{
+	if command -v uci >/dev/null 2>&1; then
+		uci -q show "$1" 2>&1 | redact
+	else
+		printf 'unavailable: uci\n'
+	fi
+}
+
+run_firewall_redirects()
+{
+	if ! command -v uci >/dev/null 2>&1; then
+		printf 'unavailable: uci\n'
+		return
+	fi
+
+	uci -q show firewall 2>&1 |
+		sed -n -E \
+			-e '/^firewall\.[^=]*=redirect$/p' \
+			-e '/^firewall\.[^=]*\.(name|target|family|src|dest|proto|src_dport|dest_ip|dest_port|enabled|glinet_app_compat)=/p' |
+		redact
+}
+
+run_compat_logs()
+{
+	if ! command -v logread >/dev/null 2>&1; then
+		printf 'unavailable: logread\n'
+		return
+	fi
+
+	if command -v tail >/dev/null 2>&1; then
+		logread 2>&1 | grep 'glinet-app-compat' | tail -n 200 | redact
+	else
+		logread 2>&1 | grep 'glinet-app-compat' | redact
+	fi
+}
+
+section 'package'
+run_command opkg status glinet-app-compat
+run_command uname -a
+
+section 'system'
+run_command ubus -S call system board
+run_command ubus -S call system info
+
+section 'interfaces'
+run_command ubus -S call network.interface.lan status
+run_command ubus -S call network.interface.wan status
+
+section 'wireless'
+run_command ubus -S call network.wireless status
+run_command ubus -S call iwinfo devices
+
+section 'network UCI (sanitized)'
+run_uci network
+
+section 'DHCP UCI (sanitized)'
+run_uci dhcp
+
+section 'wireless UCI (sanitized)'
+run_uci wireless
+
+section 'firewall redirects (sanitized)'
+run_firewall_redirects
+run_command ubus -S call service list '{"name":"firewall"}'
+run_command service firewall status
+
+section 'glinet-app-compat logs (last 200 matching lines)'
+run_compat_logs
+
+section 'collection policy'
+printf '%s\n' 'No /etc/shadow, session/challenge state, cookies, nonces, keys or private keys are collected.'
+printf '%s\n' 'No data is uploaded; stdout is the default output and file output is limited to /tmp.'

@@ -1,0 +1,104 @@
+#!/bin/sh
+# SPDX-License-Identifier: GPL-2.0-only
+
+set -u
+
+passed=0
+failed=0
+
+check()
+{
+	label="$1"
+	shift
+
+	if "$@"; then
+		printf 'PASS %s\n' "$label"
+		passed=$((passed + 1))
+	else
+		printf 'FAIL %s\n' "$label"
+		failed=$((failed + 1))
+	fi
+}
+
+package_payload_ready()
+{
+	[ -f /usr/share/glinet-app-compat/rpc.uc ] &&
+		command -v ucode >/dev/null 2>&1
+}
+
+rpc_registered()
+{
+	command -v uci >/dev/null 2>&1 || return 1
+
+	value="$(uci -q get uhttpd.main.ucode_prefix 2>/dev/null)" || return 1
+	case "$value" in
+		*'/rpc=/usr/share/glinet-app-compat/rpc.uc'*) return 0 ;;
+		*) return 1 ;;
+	esac
+}
+
+compat_enabled()
+{
+	command -v uci >/dev/null 2>&1 || return 1
+
+	value="$(uci -q get glinet-app-compat.main.enabled 2>/dev/null)" || return 1
+	case "$value" in
+		1|true) return 0 ;;
+		*) return 1 ;;
+	esac
+}
+
+uci_readable()
+{
+	command -v uci >/dev/null 2>&1 &&
+		uci -q show glinet-app-compat >/dev/null 2>&1
+}
+
+ubus_available()
+{
+	command -v ubus >/dev/null 2>&1 &&
+		ubus -S call system board >/dev/null 2>&1
+}
+
+ubus_status_available()
+{
+	command -v ubus >/dev/null 2>&1 &&
+		ubus -S call "$1" status >/dev/null 2>&1
+}
+
+iwinfo_available()
+{
+	command -v ubus >/dev/null 2>&1 &&
+		ubus -S call iwinfo devices >/dev/null 2>&1
+}
+
+firewall_available()
+{
+	command -v fw4 >/dev/null 2>&1 && return 0
+	command -v ubus >/dev/null 2>&1 &&
+		ubus -S call service list '{"name":"firewall"}' >/dev/null 2>&1
+}
+
+state_directory_safe()
+{
+	command -v stat >/dev/null 2>&1 || return 1
+
+	metadata="$(stat -c '%u:%g:%a:%F' /var/run/glinet-app-compat 2>/dev/null)" ||
+		return 1
+	[ "$metadata" = '0:0:700:directory' ]
+}
+
+check 'package payload' package_payload_ready
+check '/rpc uhttpd registration' rpc_registered
+check 'compatibility enabled' compat_enabled
+check 'UCI configuration readable' uci_readable
+check 'ubus available' ubus_available
+check 'network.interface.lan' ubus_status_available network.interface.lan
+check 'network.interface.wan' ubus_status_available network.interface.wan
+check 'network.wireless' ubus_status_available network.wireless
+check 'iwinfo backend' iwinfo_available
+check 'firewall4/service backend' firewall_available
+check 'state directory root:root 0700' state_directory_safe
+
+printf 'SUMMARY passed=%s failed=%s\n' "$passed" "$failed"
+[ "$failed" -eq 0 ]
