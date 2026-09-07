@@ -7,7 +7,10 @@
 #define __RTL8372_COMMON_H__
 
 #include <linux/of_mdio.h>
+#include <linux/netdevice.h>
+#include <linux/mutex.h>
 #include <linux/regmap.h>
+#include <linux/spinlock.h>
 #include <linux/workqueue.h>
 #include <linux/debugfs.h>
 #include <net/dsa.h>
@@ -56,6 +59,26 @@ struct rtl837x_sdsmode_map {
 	const char *name;
 };
 
+struct rtl837x_mib_snapshot {
+	u64 rx_octets;
+	u64 tx_octets;
+	u64 rx_ucast_pkts;
+	u64 rx_mcast_pkts;
+	u64 rx_bcast_pkts;
+	u64 tx_ucast_pkts;
+	u64 tx_mcast_pkts;
+	u64 tx_bcast_pkts;
+	u32 tx_discards; /* RTL8373 ifOutDiscards is 32-bit. */
+	u32 collisions; /* RTL8373 tx_etherStatsCollisions is 32-bit. */
+};
+
+struct rtl837x_port_stats {
+	spinlock_t lock;
+	struct rtnl_link_stats64 stats;
+	struct rtl837x_mib_snapshot snapshot;
+	bool snapshot_valid;
+};
+
 typedef struct rtl837x_pnswap_cfg_s {
 	uint8_t sds0_rx_swap:1;
 	uint8_t sds0_tx_swap:1;
@@ -75,6 +98,7 @@ struct rtk_gsw {
 	struct regmap		*map;
 	struct regmap		*map_nolock;
 	struct mutex		map_lock;
+	struct mutex		flood_lock;
 
 	struct gpio_desc *reset_pin;
 	int mdio_addr;
@@ -100,7 +124,9 @@ struct rtk_gsw {
 	bool dsa_registered;
 	struct dsa_switch ds;
 	struct net_device *bridge_dev[RTK_MAX_NUM_OF_PORT];
-	bool port_enabled[RTK_MAX_NUM_OF_PORT];
+	/* Hardware-indexed mask of ports with BR_ISOLATED enabled. */
+	u32 isolated_port_mask;
+	struct mutex isolation_lock;
 	struct net_device *ethernet_master;
 	struct sfp_bus *sfp_bus;
 
@@ -130,6 +156,9 @@ struct rtk_gsw {
 
 	int default_work_delay_ms;
 	struct delayed_work status_check_work;
+	struct delayed_work stats_work;
+	struct rtl837x_port_stats port_stats[RTK_MAX_NUM_OF_PORT];
+	bool stats_work_stopping;
 };
 
 extern int rtl8372n_hw_init(struct rtk_gsw *gsw, rtl837x_pnswap_cfg_t swap_cfg);

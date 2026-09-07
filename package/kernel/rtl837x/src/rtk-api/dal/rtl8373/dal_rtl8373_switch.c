@@ -1953,7 +1953,7 @@ void RL6818C_pwr_on_patch_phy_v008_rls_lockmain(rtk_uint32 phymask)
         {
             dal_rtl8373_phy_regbits_read(port, 31, 0xa600, 0xff, &pcs_state);
             counter--;
-        } while (pcs_state == 1 || counter == 0);
+		} while (!(pcs_state == 1 || counter == 0));
 
         dal_rtl8373_phy_regbits_write(1 << port, 31, 0xa436, 0xffff, 0x801e);
 
@@ -2012,7 +2012,7 @@ void RL6818C_pwr_on_patch_phy_v008(rtk_uint32 phymask)
                 dal_rtl8373_phy_regbits_read(port, 31, 0xb800, 1 << 6, &patch_rdy);
                 delay_loop(10);
                 counter--;
-            } while (patch_rdy != 1 || counter == 0);
+			} while (!(patch_rdy == 1 || counter == 0));
 
             // # Set patch_key & patch_lock
             dal_rtl8373_phy_regbits_write(1 << port, 31, 0xa436, 0xffff, patch_key_addr);
@@ -2065,7 +2065,7 @@ void RL6818C_pwr_on_patch_phy_v008(rtk_uint32 phymask)
             delay_loop(10);
             dal_rtl8373_phy_regbits_read(port, 31, 0xb800, 1 << 6, &patch_rdy);
             counter--;
-        } while (patch_rdy != 0 || counter == 0);
+		} while (!(patch_rdy == 0 || counter == 0));
 
         // ## Lock Main
         dal_rtl8373_phy_regbits_write(1 << port, 31, 0xa4a0, 1 << 10, 1);
@@ -2076,7 +2076,7 @@ void RL6818C_pwr_on_patch_phy_v008(rtk_uint32 phymask)
             delay_loop(10);
             dal_rtl8373_phy_regbits_read(port, 31, 0xa600, 0xff, &pcs_state);
             counter--;
-        } while (pcs_state != 1 || counter == 0);
+		} while (!(pcs_state == 1 || counter == 0));
 
         // RTCT patch
 

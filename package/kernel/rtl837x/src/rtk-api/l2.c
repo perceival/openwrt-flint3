@@ -574,9 +574,8 @@ rtk_api_ret_t rtk_l2_table_clearStatus_get(rtk_l2_clearStatus_t *pStatus)
 /* Function Name:
  *      rtk_l2_flushLinkDownPortAddrEnable_set
  * Description:
- *      Set HW flush linkdown port mac configuration of the specified device.
+ *      Set HW flush linkdown port mac configuration.
  * Input:
- *      port - Port id.
  *      enable - link down flush status
  * Output:
  *      None
@@ -584,21 +583,18 @@ rtk_api_ret_t rtk_l2_table_clearStatus_get(rtk_l2_clearStatus_t *pStatus)
  *      RT_ERR_OK           - OK
  *      RT_ERR_FAILED       - Failed
  *      RT_ERR_SMI          - SMI access error
- *      RT_ERR_PORT_ID      - Invalid port number.
  *      RT_ERR_ENABLE       - Invalid enable input.
  * Note:
  *      The status of flush linkdown port address is as following:
  *      - DISABLED
  *      - ENABLED
  */
-rtk_api_ret_t rtk_l2_flushLinkDownPortAddrEnable_set(rtk_port_t port, rtk_enable_t enable)
+rtk_api_ret_t rtk_l2_flushLinkDownPortAddrEnable_set(rtk_enable_t enable)
 {
     rtk_api_ret_t retVal;
 
     if (NULL == RT_MAPPER->l2_flushLinkDownPortAddrEnable_set)
         return RT_ERR_DRIVER_NOT_FOUND;
-	else if (port > RTK_PORT_ID_MAX)
-		return RT_ERR_DRIVER_NOT_FOUND;
 
     RTK_API_LOCK();
     retVal = RT_MAPPER->l2_flushLinkDownPortAddrEnable_set(enable);
@@ -610,29 +606,25 @@ rtk_api_ret_t rtk_l2_flushLinkDownPortAddrEnable_set(rtk_port_t port, rtk_enable
 /* Function Name:
  *      rtk_l2_flushLinkDownPortAddrEnable_get
  * Description:
- *      Get HW flush linkdown port mac configuration of the specified device.
+ *      Get HW flush linkdown port mac configuration.
  * Input:
- *      port - Port id.
  * Output:
  *      pEnable - link down flush status
  * Return:
  *      RT_ERR_OK           - OK
  *      RT_ERR_FAILED       - Failed
  *      RT_ERR_SMI          - SMI access error
- *      RT_ERR_PORT_ID      - Invalid port number.
  * Note:
  *      The status of flush linkdown port address is as following:
  *      - DISABLED
  *      - ENABLED
  */
-rtk_api_ret_t rtk_l2_flushLinkDownPortAddrEnable_get(rtk_port_t port, rtk_enable_t *pEnable)
+rtk_api_ret_t rtk_l2_flushLinkDownPortAddrEnable_get(rtk_enable_t *pEnable)
 {
     rtk_api_ret_t retVal;
 
     if (NULL == RT_MAPPER->l2_flushLinkDownPortAddrEnable_get)
         return RT_ERR_DRIVER_NOT_FOUND;
-	else if (port > RTK_PORT_ID_MAX)
-		return RT_ERR_DRIVER_NOT_FOUND;
 
     RTK_API_LOCK();
     retVal = RT_MAPPER->l2_flushLinkDownPortAddrEnable_get(pEnable);
@@ -2183,4 +2175,3 @@ rtk_api_ret_t rtk_trap_portUnmatchMacPktAction_get(rtk_port_t port, rtk_trap_uca
 
 
 #endif
-

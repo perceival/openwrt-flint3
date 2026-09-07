@@ -155,10 +155,10 @@ rtk_api_ret_t dal_rlt8373_phy_autoNegoAbility_set(rtk_port_t port, rtk_port_phy_
 
     if ((ret = dal_rtl8373_phy_write( 1UL<<port, PHY_MMD_VEND2, 0xA412, phyData)) != RT_ERR_OK)
         return ret;
-    if ((ret = dal_rlt8373_phy_common_c45_an_restart(port) != RT_ERR_OK))
-    {
-    //printf("line %d\n",(uint16)__LINE__);
-    return ret;
+    ret = dal_rlt8373_phy_common_c45_an_restart(port);
+    if (ret != RT_ERR_OK) {
+        //printf("line %d\n",(uint16)__LINE__);
+        return ret;
     }
 
     return ret;

@@ -75,6 +75,15 @@ Short version: from stock firmware, use the **factory** image with
 required and the "missing section" warnings for `u-boot`/`tz`/`sb11` are
 expected. Do **not** force the plain sysupgrade image from stock.
 
+Stock QSDK firmware may report `qcom,ipq5332-ap-mi01.6` as its board name.
+That is the generic Qualcomm MI01.6/RDP468 identity used by the vendor path,
+not the OpenWrt GL-BE9300 device identifier. The same compatible is used by
+the upstream Qualcomm RDP468 device tree, so it is intentionally not added to
+this profile's `SUPPORTED_DEVICES`: doing so would advertise the Flint 3 image
+as compatible with other hardware using that generic identity. The resulting
+stock compatibility warning is therefore expected; use the documented `-F`
+factory-image path instead (see [issue #9](https://github.com/perceival/openwrt-flint3/issues/9)).
+
 **Back up your eMMC first** — the ART partition holds this unit's radio
 calibration and MAC addresses and cannot be recovered from anywhere else.
 

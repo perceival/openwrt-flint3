@@ -9,6 +9,7 @@
 #include <linux/proc_fs.h>
 #include <linux/u64_stats_sync.h>
 #include <linux/slab.h>
+#include <linux/errno.h>
 
 #include "./rtl837x_common.h"
 
@@ -43,7 +44,9 @@ ssize_t _sdsreg_rw_write(struct file *filep, const char __user *ubuf,
 {
 	char *buf;
 	uint32_t sds_id, page, reg, val;
+	int ret;
 
+	_buf_rd_sdsreg[0] = '\0';
 	buf = memdup_user_nul(ubuf, count);
 	if (IS_ERR(buf))
 		return PTR_ERR(buf);
@@ -57,14 +60,26 @@ ssize_t _sdsreg_rw_write(struct file *filep, const char __user *ubuf,
 				kfree(buf);
 				return -EFAULT;
 			}
-			rtk_rtl8373_sds_reg_write(sds_id, page, reg, val);
+			ret = rtk_rtl8373_sds_reg_write(sds_id, page, reg, val);
+			if (ret) {
+				kfree(buf);
+				return -EIO;
+			}
 		}
 	} else if(buf[0] == 'r') {
 		if (sscanf(buf, "r %u %x %x", &sds_id, &page, &reg) != 3) {
 			kfree(buf);
 			return -EFAULT;
 		} else {
-			rtk_rtl8373_sds_reg_read(sds_id, page, reg, &val);
+			if (sds_id > 1) {
+				kfree(buf);
+				return -EFAULT;
+			}
+			ret = rtk_rtl8373_sds_reg_read(sds_id, page, reg, &val);
+			if (ret) {
+				kfree(buf);
+				return -EIO;
+			}
 			snprintf(_buf_rd_sdsreg, 64, "sds_id: %d, page: 0x%08x, reg: 0x%08x, val: 0x%08x\n", sds_id, page, reg, val);
 		}
 	} else {
@@ -79,7 +94,9 @@ ssize_t _phyreg_mmd_rw_write(struct file *filep, const char __user *ubuf,
 {
 	char *buf;
 	uint32_t port, devad, reg, val;
+	int ret;
 
+	_buf_rd_phyreg_mmd[0] = '\0';
 	buf = memdup_user_nul(ubuf, count);
 	if (IS_ERR(buf))
 		return PTR_ERR(buf);
@@ -93,14 +110,26 @@ ssize_t _phyreg_mmd_rw_write(struct file *filep, const char __user *ubuf,
 				kfree(buf);
 				return -EFAULT;
 			}
-			rtk_port_phyReg_set(1<<port, devad, reg, val);
+			ret = rtk_port_phyReg_set(1 << port, devad, reg, val);
+			if (ret) {
+				kfree(buf);
+				return -EIO;
+			}
 		}
 	} else if(buf[0] == 'r') {
 		if (sscanf(buf, "r %u %x %x", &port, &devad, &reg) != 3) {
 			kfree(buf);
 			return -EFAULT;
 		} else {
-			rtk_port_phyReg_get(port, devad, reg, &val);
+			if (port > 9) {
+				kfree(buf);
+				return -EFAULT;
+			}
+			ret = rtk_port_phyReg_get(port, devad, reg, &val);
+			if (ret) {
+				kfree(buf);
+				return -EIO;
+			}
 			snprintf(_buf_rd_phyreg_mmd, 64, "port: %d, devad: 0x%08x, reg: 0x%08x, val: 0x%08x\n", port, devad, reg, val);
 		}
 	} else {
@@ -115,6 +144,10 @@ ssize_t _reg_rw_write(struct file *filep, const char __user *ubuf,
 {
 	char *buf;
 	uint32_t reg, val;
+	int ret;
+
+	_buf_rd_reg[0] = '\0';
+
 	if (*offp)
 		return 0;
 
@@ -126,14 +159,23 @@ ssize_t _reg_rw_write(struct file *filep, const char __user *ubuf,
 		if (sscanf(buf, "w %x %x", &reg, &val) != 2) {
 			kfree(buf);
 			return -EFAULT;
-		} else
-			rtk_rtl8373_setAsicReg(reg, val);
+		} else {
+			ret = rtk_rtl8373_setAsicReg(reg, val);
+			if (ret) {
+				kfree(buf);
+				return -EIO;
+			}
+		}
 	} else if(buf[0] == 'r') {
 		if (sscanf(buf, "r %x", &reg) != 1) {
 			kfree(buf);
 			return -EFAULT;
 		} else {
-			rtk_rtl8373_getAsicReg(reg, &val);
+			ret = rtk_rtl8373_getAsicReg(reg, &val);
+			if (ret) {
+				kfree(buf);
+				return -EIO;
+			}
 			snprintf(_buf_rd_reg, 64, "reg: 0x%08x, val: 0x%08x\n", reg, val);
 		}
 	} else {

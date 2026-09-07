@@ -54,6 +54,7 @@ ret_t _dal_rtl8373_setAsicVlan4kEntry(dal_rtl8373_user_vlan4kentry *pVlan4kEntry
     rtk_uint32  vlanEntryVal = 0;
     rtk_uint32  retVal = 0;
     rtk_uint32  regData = 0;
+	rtk_uint32 busyCounter = 0;
   
     if(pVlan4kEntry->vid > RTL8373_VIDMAX)
         return RT_ERR_VLAN_VID;
@@ -113,10 +114,14 @@ ret_t _dal_rtl8373_setAsicVlan4kEntry(dal_rtl8373_user_vlan4kentry *pVlan4kEntry
 
 
     /*wait access finished */
+	busyCounter = RTL8373_VLAN_BUSY_CHECK_NO;
     do{
         retVal = rtl8373_getAsicReg(RTL8373_ITA_CTRL0_ADDR, &regData);
         if(retVal != RT_ERR_OK)
             return retVal;
+		busyCounter--;
+		if (busyCounter == 0)
+			return RT_ERR_BUSYWAIT_TIMEOUT;
     }while(regData & 0x1);
 
 #if defined(CONFIG_RTL8373_ASICDRV_TEST)
