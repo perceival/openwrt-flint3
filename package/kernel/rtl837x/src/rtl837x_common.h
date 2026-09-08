@@ -127,6 +127,15 @@ struct rtk_gsw {
 	/* Hardware-indexed mask of ports with BR_ISOLATED enabled. */
 	u32 isolated_port_mask;
 	struct mutex isolation_lock;
+	bool port_enabled[RTK_MAX_NUM_OF_PORT];
+	/* RTL837x has one global mirror destination and separate RX/TX masks. */
+	int mirror_port;
+	u32 mirror_rx_mask;
+	u32 mirror_tx_mask;
+	unsigned int mirror_rx_refcnt[RTK_MAX_NUM_OF_PORT];
+	unsigned int mirror_tx_refcnt[RTK_MAX_NUM_OF_PORT];
+	bool mirror_direction_valid;
+	bool mirror_ingress;
 	struct net_device *ethernet_master;
 	struct sfp_bus *sfp_bus;
 
