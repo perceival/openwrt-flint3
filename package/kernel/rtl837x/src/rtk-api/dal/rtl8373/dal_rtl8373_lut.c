@@ -206,7 +206,6 @@ static rtk_api_ret_t _rtl8373_getL2LookupTb(rtk_uint32 method, rtl8373_luttb *pL
             retVal = rtl8373_setAsicRegBits(RTL8373_ITA_CTRL0_ADDR, RTL8373_ITA_CTRL0_TBL_ADDR_MASK, pL2Table->address);
             if(retVal != RT_ERR_OK)
                 return retVal;
-            rtlglue_printf("spa is %d\n",pL2Table->spa);
             retVal = rtl8373_setAsicRegBits(RTL8373_ITA_L2_CTRL_ADDR, RTL8373_ITA_L2_CTRL_PORT_NUM_MASK, pL2Table->spa);
             if(retVal != RT_ERR_OK)
                 return retVal;
@@ -215,7 +214,6 @@ static rtk_api_ret_t _rtl8373_getL2LookupTb(rtk_uint32 method, rtl8373_luttb *pL
             retVal = rtl8373_setAsicReg(RTL8373_ITA_CTRL0_ADDR, tblCmd);
             if(retVal != RT_ERR_OK)
                 return retVal;
-            rtlglue_printf("tblcmd is 0x%x\n",tblCmd);
             break;
         default:
             return RT_ERR_INPUT;

@@ -1929,6 +1929,50 @@ static int rtl837x_port_fdb_del(struct dsa_switch *ds, int port,
 	return rtl837x_to_errno(ret);
 }
 
+static int rtl837x_port_fdb_dump(struct dsa_switch *ds, int port,
+				 dsa_fdb_dump_cb_t *cb, void *data)
+{
+	struct rtk_gsw *gsw = ds->priv;
+	u32 max = RTK_MAX_LUT_ADDRESS;
+	u32 address = 0;
+	int ret;
+
+	if (!rtl837x_valid_port(gsw, port))
+		return -EINVAL;
+
+	while (address < max) {
+		rtk_l2_ucastAddr_t l2 = { 0 };
+		u16 vid;
+
+		ret = rtk_l2_addr_next_get(READMETHOD_NEXT_L2UCSPA, port,
+					   &address, &l2);
+		if (ret == RT_ERR_L2_ENTRY_NOTFOUND)
+			break;
+		if (ret != RT_ERR_OK)
+			return rtl837x_to_errno(ret);
+		if (l2.port != port || is_multicast_ether_addr(l2.mac.octet)) {
+			address++;
+			continue;
+		}
+
+		/* tag_8021q VIDs are this driver's own transport, not
+		 * something the bridge configured, so report them as 0 the
+		 * way an unaware entry is reported.
+		 */
+		vid = l2.ivl ? l2.vid_fid : 0;
+		if (vid_is_dsa_8021q(vid))
+			vid = 0;
+
+		ret = cb(l2.mac.octet, vid, l2.is_static, data);
+		if (ret)
+			return ret;
+
+		address++;
+	}
+
+	return 0;
+}
+
 static const struct dsa_switch_ops rtl837x_dsa_ops = {
 	.get_tag_protocol = rtl837x_get_tag_protocol,
 	.devlink_info_get = rtl837x_devlink_info_get,
@@ -1959,6 +2003,7 @@ static const struct dsa_switch_ops rtl837x_dsa_ops = {
 	.port_vlan_del = rtl837x_port_vlan_del,
 	.port_fdb_add = rtl837x_port_fdb_add,
 	.port_fdb_del = rtl837x_port_fdb_del,
+	.port_fdb_dump = rtl837x_port_fdb_dump,
 	.tag_8021q_vlan_add = rtl837x_tag_8021q_vlan_add,
 	.tag_8021q_vlan_del = rtl837x_tag_8021q_vlan_del,
 };
