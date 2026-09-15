@@ -129,6 +129,11 @@ struct rtk_gsw {
 	struct mutex isolation_lock;
 	struct net_device *ethernet_master;
 	struct sfp_bus *sfp_bus;
+	unsigned long rate_egress_mask;
+	unsigned long rate_egress_cookie[RTK_MAX_NUM_OF_PORT];
+	rtk_rate_t rate_egress_rate[RTK_MAX_NUM_OF_PORT];
+	u32 rate_egress_burst[RTK_MAX_NUM_OF_PORT];
+	bool rate_egress_cleanup_pending[RTK_MAX_NUM_OF_PORT];
 
 	struct rtl837x_mib_counter *mib_counters;
 	unsigned int num_mib_counters;

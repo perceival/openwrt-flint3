@@ -207,6 +207,23 @@ extern rtk_api_ret_t dal_rtl8373_rate_egrBwCtrlPortEn_set(rtk_port_t port, rtk_e
  */
 extern rtk_api_ret_t dal_rtl8373_rate_egrBwCtrlPortEn_get(rtk_port_t port, rtk_enable_t *pBwEn);
 
+/* Function Name:
+ *      dal_rtl8373_rate_egrBwCtrlRateOnly_set
+ * Description:
+ *      Set the per-port egress bandwidth rate without changing the
+ *      chip-global IFG accounting setting.
+ */
+extern rtk_api_ret_t dal_rtl8373_rate_egrBwCtrlRateOnly_set(rtk_port_t port,
+							    rtk_rate_t rate);
+
+/*
+ * Set/get the per-port egress bandwidth burst in bytes.
+ */
+extern rtk_api_ret_t dal_rtl8373_rate_egrBwCtrlBurst_set(rtk_port_t port,
+								 rtk_uint32 burst);
+extern rtk_api_ret_t dal_rtl8373_rate_egrBwCtrlBurst_get(rtk_port_t port,
+								 rtk_uint32 *pBurst);
+
 
 /* Function Name:
  *      dal_rtl8373_rate_egrBwCtrlRate_set
@@ -351,5 +368,4 @@ extern rtk_api_ret_t dal_rtl8373_rate_egrQueueMaxBwRate_get(rtk_port_t port, rtk
 
 
 #endif /*  __DAL_RTL8373_RATE_H__ */
-
 

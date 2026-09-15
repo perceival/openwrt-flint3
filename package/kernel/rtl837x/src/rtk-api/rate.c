@@ -253,6 +253,98 @@ rtk_api_ret_t rtk_rate_igrBwCtrlCongestSts_get(rtk_port_t port, rtk_rate_igrBwCo
     return retVal;
 }
 
+/* Function Name:
+ *      rtk_rate_egrBwCtrlPortEn_set
+ * Description:
+ *      Enable or disable port egress bandwidth control
+ */
+rtk_api_ret_t rtk_rate_egrBwCtrlPortEn_set(rtk_port_t port, rtk_enable_t bwEn)
+{
+	rtk_api_ret_t retVal;
+
+	if (!RT_MAPPER->rate_egrBwCtrlPortEn_set)
+		return RT_ERR_DRIVER_NOT_FOUND;
+
+	RTK_API_LOCK();
+	retVal = RT_MAPPER->rate_egrBwCtrlPortEn_set(port, bwEn);
+	RTK_API_UNLOCK();
+
+	return retVal;
+}
+
+/* Function Name:
+ *      rtk_rate_egrBwCtrlPortEn_get
+ * Description:
+ *      Get port egress bandwidth control state
+ */
+rtk_api_ret_t rtk_rate_egrBwCtrlPortEn_get(rtk_port_t port, rtk_enable_t *pBwEn)
+{
+	rtk_api_ret_t retVal;
+
+	if (!RT_MAPPER->rate_egrBwCtrlPortEn_get)
+		return RT_ERR_DRIVER_NOT_FOUND;
+
+	RTK_API_LOCK();
+	retVal = RT_MAPPER->rate_egrBwCtrlPortEn_get(port, pBwEn);
+	RTK_API_UNLOCK();
+
+	return retVal;
+}
+
+/* Function Name:
+ *      rtk_rate_egrBwCtrlRate_set
+ * Description:
+ *      Set the per-port egress bandwidth rate without changing the
+ *      chip-global IFG accounting setting.
+ */
+rtk_api_ret_t rtk_rate_egrBwCtrlRate_set(rtk_port_t port, rtk_rate_t rate)
+{
+	rtk_api_ret_t retVal;
+
+	if (!RT_MAPPER->rate_egrBwCtrlRate_set)
+		return RT_ERR_DRIVER_NOT_FOUND;
+
+	RTK_API_LOCK();
+	retVal = RT_MAPPER->rate_egrBwCtrlRate_set(port, rate);
+	RTK_API_UNLOCK();
+
+	return retVal;
+}
+
+/*
+ * Set the per-port egress bandwidth burst in bytes.
+ */
+rtk_api_ret_t rtk_rate_egrBwCtrlBurst_set(rtk_port_t port, rtk_uint32 burst)
+{
+	rtk_api_ret_t retVal;
+
+	if (!RT_MAPPER->rate_egrBwCtrlBurst_set)
+		return RT_ERR_DRIVER_NOT_FOUND;
+
+	RTK_API_LOCK();
+	retVal = RT_MAPPER->rate_egrBwCtrlBurst_set(port, burst);
+	RTK_API_UNLOCK();
+
+	return retVal;
+}
+
+/*
+ * Get the per-port egress bandwidth burst in bytes.
+ */
+rtk_api_ret_t rtk_rate_egrBwCtrlBurst_get(rtk_port_t port, rtk_uint32 *pBurst)
+{
+	rtk_api_ret_t retVal;
+
+	if (!RT_MAPPER->rate_egrBwCtrlBurst_get)
+		return RT_ERR_DRIVER_NOT_FOUND;
+
+	RTK_API_LOCK();
+	retVal = RT_MAPPER->rate_egrBwCtrlBurst_get(port, pBurst);
+	RTK_API_UNLOCK();
+
+	return retVal;
+}
+
 
 /* Function Name:
  *      rtk_rate_egrBandwidthCtrlRate_set
@@ -455,5 +547,3 @@ rtk_api_ret_t rtk_rate_egrQueueBwCtrlRate_set(rtk_port_t port, rtk_qid_t queue, 
 
     return retVal;
 }
-
-
