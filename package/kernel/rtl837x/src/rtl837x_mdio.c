@@ -965,6 +965,7 @@ static int rtl837x_dsa_probe(struct mdio_device *mdiodev)
 
 	mutex_init(&gsw->map_lock);
 	mutex_init(&gsw->flood_lock);
+	mutex_init(&gsw->feature_lock);
 	
 	rc = rtl837x_mdio_regmap_config;
 	rc.lock_arg = gsw;

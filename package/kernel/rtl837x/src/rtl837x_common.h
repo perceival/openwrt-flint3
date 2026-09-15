@@ -23,6 +23,7 @@
 #include "./rtk-api/vlan.h"
 #include "./rtk-api/chip.h"
 #include "./rtk-api/eee.h"
+#include "./rtk-api/trunk.h"
 #include "./rtk-api/rma.h"
 #include "./rtk-api/cpuTag.h"
 #include "./rtk-api/mib.h"
@@ -99,6 +100,7 @@ struct rtk_gsw {
 	struct regmap		*map_nolock;
 	struct mutex		map_lock;
 	struct mutex		flood_lock;
+	struct mutex		feature_lock;
 
 	struct gpio_desc *reset_pin;
 	int mdio_addr;
@@ -123,6 +125,9 @@ struct rtk_gsw {
 	unsigned int dsa_num_ports;
 	bool dsa_registered;
 	struct dsa_switch ds;
+	u32 lag_members[TRUNK_GROUP_END];
+	u32 lag_active_members[TRUNK_GROUP_END];
+	u32 lag_hash_mask[TRUNK_GROUP_END];
 	struct net_device *bridge_dev[RTK_MAX_NUM_OF_PORT];
 	/* Hardware-indexed mask of ports with BR_ISOLATED enabled. */
 	u32 isolated_port_mask;
