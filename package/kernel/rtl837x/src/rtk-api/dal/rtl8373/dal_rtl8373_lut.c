@@ -88,7 +88,6 @@ static void _rtl8373_fdbStSmi2User( rtl8373_luttb *pLutSt, rtk_uint32 *pFdbSmi)
     }
     else if((pFdbSmi[1] >> 8) & 0x01) /*Multicast L2 Lookup*/
     {
-        rtlglue_printf("l2 multicast\n");
         pLutSt->mac.octet[5]    = pFdbSmi[0] & 0xFF;
         pLutSt->mac.octet[4]    = (pFdbSmi[0] & 0xFF00) >> 8;
         pLutSt->mac.octet[3]    = (pFdbSmi[0] & 0xFF0000) >> 16;
