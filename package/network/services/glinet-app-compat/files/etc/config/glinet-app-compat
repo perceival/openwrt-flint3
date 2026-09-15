@@ -1,0 +1,3 @@
+config glinet_app_compat 'main'
+	option enabled '1'
+	option log_level 'info'
