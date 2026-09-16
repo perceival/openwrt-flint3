@@ -1,0 +1,166 @@
+From: Kamil Bienkiewicz <perceivalpercy@gmail.com>
+Subject: [PATCH] net: ethernet: qualcomm: ppe: lock flow/host table
+ indirect ops
+
+The flow and host tables (0411, 0412) are each accessed through a
+single shared command/data/result register triplet: write the entry's
+data words, write a trigger command, poll the result register. Nothing
+serializes this three-step sequence against a second concurrent
+add/del on the same table -- a second caller's data-word writes or
+trigger command can land in the middle of an in-flight operation,
+corrupting both.
+
+This was always latent but unreachable, since nothing has called these
+functions concurrently (or indeed at all) until now. It becomes
+reachable with the refcounted host/nexthop pool this driver is about
+to grow: pool get/deref calls happen from flow-offload TC callbacks,
+which the kernel does not serialize against each other for different
+flows, so concurrent add/del on the same table is now a real path, not
+a hypothetical one.
+
+Add a mutex per table (flow_tbl_lock, host_tbl_lock) to struct
+ppe_device and hold it for the full write-data/trigger/poll sequence
+in ppe_flow_entry_add/del() and ppe_host_entry_add/del(). The two
+tables use entirely separate registers, so they get independent locks
+rather than one shared lock across both.
+
+Compile-tested only.
+
+Signed-off-by: Kamil Bienkiewicz <perceivalpercy@gmail.com>
+---
+--- a/drivers/net/ethernet/qualcomm/ppe/ppe.h
++++ b/drivers/net/ethernet/qualcomm/ppe/ppe.h
+@@ -8,6 +8,7 @@
+ 
+ #include <linux/compiler.h>
+ #include <linux/interconnect.h>
++#include <linux/mutex.h>
+ 
+ struct device;
+ struct regmap;
+@@ -23,6 +24,13 @@
+  * @num_ports: Number of PPE ports.
+  * @debugfs_root: Debugfs root entry.
+  * @ports: PPE MAC ports.
++ * @flow_tbl_lock: Serializes access to the flow table's shared
++ * command/data/result register triplet (see ppe_flow.c) against
++ * concurrent add/del calls.
++ * @host_tbl_lock: Serializes access to the host table's shared
++ * command/data/result register triplet (see ppe_host.c) against
++ * concurrent add/del calls. Independent of @flow_tbl_lock: the two
++ * tables use entirely separate registers.
+  * @num_icc_paths: Number of interconnect paths.
+  * @icc_paths: Interconnect path array.
+  *
+@@ -37,6 +45,8 @@
+ 	unsigned int num_ports;
+ 	struct dentry *debugfs_root;
+ 	struct ppe_ports *ports;
++	struct mutex flow_tbl_lock;
++	struct mutex host_tbl_lock;
+ 	unsigned int num_icc_paths;
+ 	struct icc_bulk_data icc_paths[] __counted_by(num_icc_paths);
+ };
+--- a/drivers/net/ethernet/qualcomm/ppe/ppe.c
++++ b/drivers/net/ethernet/qualcomm/ppe/ppe.c
+@@ -232,6 +232,8 @@
+ 	ppe_dev->clk_rate = PPE_CLK_RATE;
+ 	ppe_dev->num_ports = num_ports;
+ 	ppe_dev->num_icc_paths = num_icc;
++	mutex_init(&ppe_dev->flow_tbl_lock);
++	mutex_init(&ppe_dev->host_tbl_lock);
+ 
+ 	ret = ppe_clock_init_and_reset(ppe_dev, ppe_icc_data);
+ 	if (ret)
+--- a/drivers/net/ethernet/qualcomm/ppe/ppe_flow.c
++++ b/drivers/net/ethernet/qualcomm/ppe/ppe_flow.c
+@@ -12,6 +12,7 @@
+  */
+ 
+ #include <linux/bitfield.h>
++#include <linux/mutex.h>
+ #include <linux/regmap.h>
+ 
+ #include "ppe.h"
+@@ -78,15 +79,20 @@
+ 	int ret;
+ 	int i;
+ 
++	mutex_lock(&ppe_dev->flow_tbl_lock);
++
+ 	for (i = 0; i < PPE_FLOW_TBL_ENTRY_WORDS; i++) {
+ 		ret = regmap_write(ppe_dev->regmap,
+ 				    PPE_IN_FLOW_TBL_OP_DATA_ADDR + i * PPE_IN_FLOW_TBL_OP_DATA_INC,
+ 				    entry[i]);
+ 		if (ret)
+-			return ret;
++			goto out;
+ 	}
+ 
+-	return ppe_flow_tbl_op_wait(ppe_dev, PPE_FLOW_TBL_OP_ADD, mode, index);
++	ret = ppe_flow_tbl_op_wait(ppe_dev, PPE_FLOW_TBL_OP_ADD, mode, index);
++out:
++	mutex_unlock(&ppe_dev->flow_tbl_lock);
++	return ret;
+ }
+ 
+ /**
+@@ -98,5 +104,11 @@
+  */
+ int ppe_flow_entry_del(struct ppe_device *ppe_dev, u32 index)
+ {
+-	return ppe_flow_tbl_op_wait(ppe_dev, PPE_FLOW_TBL_OP_DEL, PPE_FLOW_OP_MODE_INDEX, &index);
++	int ret;
++
++	mutex_lock(&ppe_dev->flow_tbl_lock);
++	ret = ppe_flow_tbl_op_wait(ppe_dev, PPE_FLOW_TBL_OP_DEL, PPE_FLOW_OP_MODE_INDEX, &index);
++	mutex_unlock(&ppe_dev->flow_tbl_lock);
++
++	return ret;
+ }
+--- a/drivers/net/ethernet/qualcomm/ppe/ppe_host.c
++++ b/drivers/net/ethernet/qualcomm/ppe/ppe_host.c
+@@ -10,6 +10,7 @@
+  */
+ 
+ #include <linux/bitfield.h>
++#include <linux/mutex.h>
+ #include <linux/regmap.h>
+ 
+ #include "ppe.h"
+@@ -82,15 +83,20 @@
+ 	if (num_words > PPE_HOST_TBL_OP_DATA_ENTRIES)
+ 		return -EINVAL;
+ 
++	mutex_lock(&ppe_dev->host_tbl_lock);
++
+ 	for (i = 0; i < num_words; i++) {
+ 		ret = regmap_write(ppe_dev->regmap,
+ 				    PPE_HOST_TBL_OP_DATA_ADDR + i * PPE_HOST_TBL_OP_DATA_INC,
+ 				    entry[i]);
+ 		if (ret)
+-			return ret;
++			goto out;
+ 	}
+ 
+-	return ppe_host_tbl_op_wait(ppe_dev, PPE_HOST_TBL_OP_ADD, mode, index);
++	ret = ppe_host_tbl_op_wait(ppe_dev, PPE_HOST_TBL_OP_ADD, mode, index);
++out:
++	mutex_unlock(&ppe_dev->host_tbl_lock);
++	return ret;
+ }
+ 
+ /**
+@@ -102,5 +108,11 @@
+  */
+ int ppe_host_entry_del(struct ppe_device *ppe_dev, u32 index)
+ {
+-	return ppe_host_tbl_op_wait(ppe_dev, PPE_HOST_TBL_OP_DEL, PPE_FLOW_OP_MODE_INDEX, &index);
++	int ret;
++
++	mutex_lock(&ppe_dev->host_tbl_lock);
++	ret = ppe_host_tbl_op_wait(ppe_dev, PPE_HOST_TBL_OP_DEL, PPE_FLOW_OP_MODE_INDEX, &index);
++	mutex_unlock(&ppe_dev->host_tbl_lock);
++
++	return ret;
+ }
