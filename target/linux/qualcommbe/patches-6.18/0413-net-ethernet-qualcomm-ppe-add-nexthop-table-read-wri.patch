@@ -1,0 +1,290 @@
+From: Kamil Bienkiewicz <perceivalpercy@gmail.com>
+Subject: [PATCH] net: ethernet: qualcomm: ppe: add nexthop table read/write
+
+Continuation of 0411/0412 -- see project_flint3_ppe_hw_offload_research.md
+for the full architectural context. The PPE nexthop table (destination
+MAC/IP rewrite applied when a flow or host table entry forwards a
+packet) is, unlike flow and host, directly addressed: one fixed 4-word
+entry per index, matching this driver's existing scheduler-table style
+(ppe_scheduler_l0_queue_map_set()/_get()) rather than another instance
+of 0411/0412's indirect command/data/result sequence. Confirmed via
+hppe_in_nexthop_tbl_get()/_set() (src/hsl/hppe/hppe_ip.c), which are
+plain hppe_reg_tbl_get()/_set() bulk reads/writes with no trigger
+register involved.
+
+Two details here needed checking against the vendor's actual code
+rather than trusted from field/struct naming, and both would have been
+real, silent hardware-behavior bugs if guessed wrong:
+
+ - The TYPE bit's sense is the opposite of what the vendor's own union
+   member naming suggests. The header pairs a "port" struct with what
+   its comments imply is type 0 and a "vsi" struct with type 1, but the
+   actual runtime assignment (adpt_hppe_ip_nexthop_set(), src/adpt/hppe/
+   adpt_hppe_ip.c) does "if (entry->type == 0) ...vsi... else ...port..."
+   -- exactly backwards from the naming. This driver's TYPE bit follows
+   the verified runtime logic (0 = VSI, 1 = port), not the naming.
+
+ - The 48-bit destination MAC is split 16/32 across two words at a
+   non-obvious boundary. Confirmed the exact byte packing against the
+   vendor's own assignment (mac_addr_0 = uc[5] | uc[4] << 8; mac_addr_1
+   = uc[3] | uc[2] << 8 | uc[1] << 16 | uc[0] << 24), which is exactly
+   ether_addr_to_u64()'s byte order split at bit 16 -- so this driver
+   uses ether_addr_to_u64()/u64_to_ether_addr() directly rather than
+   reimplementing the packing by hand.
+
+The destination IP (for a DNAT nexthop) is stored as a plain 32-bit
+value matching a network-byte-order __be32 via be32_to_cpu()/
+cpu_to_be32(), confirmed via fal_ip4_addr_t's definition (a bare
+a_uint32_t assigned to the register field with no byte manipulation in
+the vendor code) and the standard Linux convention for that
+representation.
+
+Verified the set/get bit-packing round-trips correctly for a
+representative entry (all fields, including the MAC split and DNAT IP)
+with an out-of-tree Python model of the same FIELD_PREP/FIELD_GET logic,
+independent of compiling the real code, before writing this patch.
+
+As with 0411/0412: not wired into anything yet, no behavioral effect.
+Compile-tested only (module builds and links cleanly, both new symbols
+confirmed present via nm); no hardware testing, since nothing calls
+these functions yet.
+
+Signed-off-by: Kamil Bienkiewicz <perceivalpercy@gmail.com>
+---
+--- a/drivers/net/ethernet/qualcomm/ppe/Makefile
++++ b/drivers/net/ethernet/qualcomm/ppe/Makefile
+@@ -4,7 +4,7 @@
+ #
+ 
+ obj-$(CONFIG_QCOM_PPE) += qcom-ppe.o
+-qcom-ppe-objs := ppe.o ppe_config.o ppe_debugfs.o ppe_port.o ppe_api.o ppe_flow.o ppe_host.o
++qcom-ppe-objs := ppe.o ppe_config.o ppe_debugfs.o ppe_port.o ppe_api.o ppe_flow.o ppe_host.o ppe_nexthop.o
+ 
+ #EDMA
+ qcom-ppe-objs += edma.o edma_cfg_rx.o edma_cfg_tx.o edma_debugfs.o edma_port.o edma_rx.o edma_tx.o edma_ethtool.o
+--- a/drivers/net/ethernet/qualcomm/ppe/ppe_regs.h
++++ b/drivers/net/ethernet/qualcomm/ppe/ppe_regs.h
+@@ -1160,4 +1160,32 @@
+ #define PPE_HOST_TBL_OP_RSLT_OP_RSLT		BIT(4)
+ #define PPE_HOST_TBL_OP_RSLT_ENTRY_INDEX	GENMASK(17, 5)
+ #define PPE_HOST_TBL_OP_RSLT_VALID_CNT		GENMASK(21, 18)
++
++/* Nexthop table, unlike the flow and host tables above, is addressed
++ * directly: one fixed-size (4-word) entry per index, no indirect
++ * command/data/result sequence. Each entry rewrites a packet's
++ * destination MAC (and, for a DNAT nexthop, its destination IP) before
++ * it egresses through a physical/virtual port or into a VSI.
++ */
++#define PPE_IN_NEXTHOP_TBL_ADDR			0x260000
++#define PPE_IN_NEXTHOP_TBL_ENTRIES		768
++#define PPE_IN_NEXTHOP_TBL_INC			0x10
++
++/* Word 0. */
++#define PPE_IN_NEXTHOP_TBL_TYPE			BIT(0)
++#define PPE_IN_NEXTHOP_TBL_PORT_VSI		GENMASK(8, 1)
++#define PPE_IN_NEXTHOP_TBL_POST_L3_IF		GENMASK(16, 9)
++#define PPE_IN_NEXTHOP_TBL_IP_TO_ME		BIT(17)
++#define PPE_IN_NEXTHOP_TBL_STAG_FMT		BIT(18)
++#define PPE_IN_NEXTHOP_TBL_SVID			GENMASK(30, 19)
++#define PPE_IN_NEXTHOP_TBL_CTAG_FMT		BIT(31)
++
++/* Word 1. */
++#define PPE_IN_NEXTHOP_TBL_CVID			GENMASK(11, 0)
++#define PPE_IN_NEXTHOP_TBL_PUB_ADDR_INDEX	GENMASK(15, 12)
++#define PPE_IN_NEXTHOP_TBL_MAC_ADDR_0		GENMASK(31, 16)
++
++/* Word 2 (MAC_ADDR_1) and word 3 (IP_ADDR_DNAT) are each a single
++ * whole-word value, so need no bitfield mask.
++ */
+ #endif
+--- /dev/null
++++ b/drivers/net/ethernet/qualcomm/ppe/ppe_nexthop.h
+@@ -0,0 +1,53 @@
++/* SPDX-License-Identifier: GPL-2.0-only
++ *
++ * Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.
++ */
++
++#ifndef __PPE_NEXTHOP_H__
++#define __PPE_NEXTHOP_H__
++
++#include <linux/if_ether.h>
++#include <linux/types.h>
++
++#include "ppe.h"
++
++/**
++ * struct ppe_nexthop_entry - PPE nexthop table entry.
++ * @port_valid: True if @port is a physical/virtual port index; false if
++ * @vsi is a VSI (bridge domain) index instead. The two share the same
++ * hardware field and are mutually exclusive.
++ * @port: Egress port index, when @port_valid.
++ * @vsi: Egress VSI index, when !@port_valid.
++ * @post_l3_if: L3 interface index applied after this nexthop.
++ * @ip_to_me: True if traffic hitting this nexthop terminates locally.
++ * @stag_fmt: Whether to insert/rewrite an S-VLAN tag on egress.
++ * @svid: S-VLAN ID, when @stag_fmt.
++ * @ctag_fmt: Whether to insert/rewrite a C-VLAN tag on egress.
++ * @cvid: C-VLAN ID, when @ctag_fmt.
++ * @pub_addr_index: Index into the public-IP-address table to use for
++ * SNAT, when this nexthop is used by an SNAT flow. Unused otherwise.
++ * @dmac: Destination MAC address to rewrite the packet to.
++ * @dnat_ip: Destination IPv4 address to rewrite to, for a DNAT nexthop.
++ * Unused otherwise.
++ */
++struct ppe_nexthop_entry {
++	bool port_valid;
++	u16 port;
++	u16 vsi;
++	u16 post_l3_if;
++	bool ip_to_me;
++	bool stag_fmt;
++	u16 svid;
++	bool ctag_fmt;
++	u16 cvid;
++	u8 pub_addr_index;
++	u8 dmac[ETH_ALEN];
++	__be32 dnat_ip;
++};
++
++int ppe_nexthop_entry_set(struct ppe_device *ppe_dev, u32 index,
++			   const struct ppe_nexthop_entry *entry);
++int ppe_nexthop_entry_get(struct ppe_device *ppe_dev, u32 index,
++			   struct ppe_nexthop_entry *entry);
++
++#endif
+--- /dev/null
++++ b/drivers/net/ethernet/qualcomm/ppe/ppe_nexthop.c
+@@ -0,0 +1,132 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/*
++ * Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.
++ */
++
++/* PPE nexthop table -- egress rewrite rules (destination MAC, optional
++ * DNAT destination IP, VLAN tags) applied when a flow or host table
++ * entry forwards through this nexthop. Unlike the flow and host tables,
++ * this one is addressed directly: one fixed 4-word entry per index, the
++ * same style this driver already uses for its scheduler tables.
++ *
++ * The TYPE bit selects which of two mutually exclusive interpretations
++ * of the same bit range applies: TYPE=0 means the entry egresses into a
++ * VSI (bridge domain), TYPE=1 means it egresses through a physical or
++ * virtual port. This is confirmed against the vendor SDK's own
++ * assignment logic (adpt_hppe_ip_nexthop_set(): "if (entry->type == 0)
++ * ...vsi... else ...port..."), not inferred from field naming -- the
++ * vendor's own union member names (a "port" struct paired with type 0,
++ * a "vsi" struct paired with type 1) suggest the opposite of what the
++ * code actually does, so this needed checking, not guessing.
++ *
++ * The destination MAC address is packed into two hardware fields split
++ * at a 16/32-bit boundary: the low 16 bits of the 48-bit MAC in the top
++ * half of word 1, the high 32 bits in the whole of word 2. Confirmed
++ * against the vendor's own packing (mac_addr_0 = uc[5] | uc[4] << 8;
++ * mac_addr_1 = uc[3] | uc[2] << 8 | uc[1] << 16 | uc[0] << 24), which is
++ * exactly ether_addr_to_u64()'s byte order split at bit 16.
++ */
++
++#include <linux/bitfield.h>
++#include <linux/etherdevice.h>
++#include <linux/regmap.h>
++
++#include "ppe.h"
++#include "ppe_nexthop.h"
++#include "ppe_regs.h"
++
++/**
++ * ppe_nexthop_entry_set() - Write a PPE nexthop table entry.
++ * @ppe_dev: PPE device.
++ * @index: The entry index to write.
++ * @entry: The nexthop entry to write.
++ *
++ * Return: 0 on success, a negative error code on failure.
++ */
++int ppe_nexthop_entry_set(struct ppe_device *ppe_dev, u32 index,
++			   const struct ppe_nexthop_entry *entry)
++{
++	u32 base, val[4] = {};
++	u64 mac;
++	int ret;
++	int i;
++
++	if (index >= PPE_IN_NEXTHOP_TBL_ENTRIES)
++		return -EINVAL;
++
++	mac = ether_addr_to_u64(entry->dmac);
++
++	val[0] = FIELD_PREP(PPE_IN_NEXTHOP_TBL_TYPE, entry->port_valid ? 1 : 0);
++	val[0] |= FIELD_PREP(PPE_IN_NEXTHOP_TBL_PORT_VSI,
++			      entry->port_valid ? entry->port : entry->vsi);
++	val[0] |= FIELD_PREP(PPE_IN_NEXTHOP_TBL_POST_L3_IF, entry->post_l3_if);
++	val[0] |= entry->ip_to_me ? PPE_IN_NEXTHOP_TBL_IP_TO_ME : 0;
++	val[0] |= entry->stag_fmt ? PPE_IN_NEXTHOP_TBL_STAG_FMT : 0;
++	val[0] |= FIELD_PREP(PPE_IN_NEXTHOP_TBL_SVID, entry->svid);
++	val[0] |= entry->ctag_fmt ? PPE_IN_NEXTHOP_TBL_CTAG_FMT : 0;
++
++	val[1] = FIELD_PREP(PPE_IN_NEXTHOP_TBL_CVID, entry->cvid);
++	val[1] |= FIELD_PREP(PPE_IN_NEXTHOP_TBL_PUB_ADDR_INDEX, entry->pub_addr_index);
++	val[1] |= FIELD_PREP(PPE_IN_NEXTHOP_TBL_MAC_ADDR_0, mac & GENMASK(15, 0));
++
++	val[2] = mac >> 16;
++
++	val[3] = be32_to_cpu(entry->dnat_ip);
++
++	base = PPE_IN_NEXTHOP_TBL_ADDR + index * PPE_IN_NEXTHOP_TBL_INC;
++	for (i = 0; i < 4; i++) {
++		ret = regmap_write(ppe_dev->regmap, base + i * 4, val[i]);
++		if (ret)
++			return ret;
++	}
++
++	return 0;
++}
++
++/**
++ * ppe_nexthop_entry_get() - Read a PPE nexthop table entry.
++ * @ppe_dev: PPE device.
++ * @index: The entry index to read.
++ * @entry: Where to store the entry read back.
++ *
++ * Return: 0 on success, a negative error code on failure.
++ */
++int ppe_nexthop_entry_get(struct ppe_device *ppe_dev, u32 index,
++			   struct ppe_nexthop_entry *entry)
++{
++	u32 base, val[4];
++	u64 mac;
++	int ret;
++	int i;
++
++	if (index >= PPE_IN_NEXTHOP_TBL_ENTRIES)
++		return -EINVAL;
++
++	base = PPE_IN_NEXTHOP_TBL_ADDR + index * PPE_IN_NEXTHOP_TBL_INC;
++	for (i = 0; i < 4; i++) {
++		ret = regmap_read(ppe_dev->regmap, base + i * 4, &val[i]);
++		if (ret)
++			return ret;
++	}
++
++	entry->port_valid = FIELD_GET(PPE_IN_NEXTHOP_TBL_TYPE, val[0]);
++	if (entry->port_valid)
++		entry->port = FIELD_GET(PPE_IN_NEXTHOP_TBL_PORT_VSI, val[0]);
++	else
++		entry->vsi = FIELD_GET(PPE_IN_NEXTHOP_TBL_PORT_VSI, val[0]);
++	entry->post_l3_if = FIELD_GET(PPE_IN_NEXTHOP_TBL_POST_L3_IF, val[0]);
++	entry->ip_to_me = !!(val[0] & PPE_IN_NEXTHOP_TBL_IP_TO_ME);
++	entry->stag_fmt = !!(val[0] & PPE_IN_NEXTHOP_TBL_STAG_FMT);
++	entry->svid = FIELD_GET(PPE_IN_NEXTHOP_TBL_SVID, val[0]);
++	entry->ctag_fmt = !!(val[0] & PPE_IN_NEXTHOP_TBL_CTAG_FMT);
++
++	entry->cvid = FIELD_GET(PPE_IN_NEXTHOP_TBL_CVID, val[1]);
++	entry->pub_addr_index = FIELD_GET(PPE_IN_NEXTHOP_TBL_PUB_ADDR_INDEX, val[1]);
++
++	mac = (u64)val[2] << 16 | FIELD_GET(PPE_IN_NEXTHOP_TBL_MAC_ADDR_0, val[1]);
++	u64_to_ether_addr(mac, entry->dmac);
++
++	entry->dnat_ip = cpu_to_be32(val[3]);
++
++	return 0;
++}
