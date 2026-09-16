@@ -1,0 +1,21 @@
+From: village <village@flint3-port>
+Subject: hsl: hsl_phy: drop removed phy_device.eee_enabled field write
+
+phy_device.eee_enabled was removed upstream; EEE state is now tracked via
+phy_device.eee_active (private, managed by phylib itself) and the
+linkmode-based advertising_eee bitmask this same function already sets
+correctly via linkmode_mod_bit() immediately below. The removed line was
+a plain boolean mirror of what the linkmode bits already express, not
+additional information -- safe to drop rather than map to a new field.
+
+--- a/src/hsl/phy/hsl_phy.c
++++ b/src/hsl/phy/hsl_phy.c
+@@ -1881,8 +1881,6 @@
+ 	rv = hsl_phy_phydev_get(dev_id, phy_addr, &phydev);
+ 	SW_RTN_ON_ERROR(rv);
+
+-	phydev->eee_enabled = (adv == 0 ? A_FALSE : A_TRUE);
+-
+ 	linkmode_mod_bit(ETHTOOL_LINK_MODE_100baseT_Full_BIT,
+ 		phydev->advertising_eee, adv & FAL_PHY_EEE_100BASE_T);
+ 	linkmode_mod_bit(ETHTOOL_LINK_MODE_1000baseT_Full_BIT,
