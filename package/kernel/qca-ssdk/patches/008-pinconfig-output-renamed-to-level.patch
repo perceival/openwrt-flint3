@@ -1,0 +1,21 @@
+--- a/src/init/ssdk_mht_pinctrl.c
++++ b/src/init/ssdk_mht_pinctrl.c
+@@ -287,7 +287,17 @@
+                 rv = mht_gpio_pin_cfg_set_drvs(dev_id, pin, arg);
+                 break;
+ 
+-            case PIN_CONFIG_OUTPUT:
++            /*
++             * Current kernels split the old combined PIN_CONFIG_OUTPUT
++             * (drive to a level, from DT "output-high"/"output-low")
++             * into PIN_CONFIG_LEVEL for the level and a separate
++             * PIN_CONFIG_OUTPUT_ENABLE for output mode -- see the
++             * "output-high"/"output-low" entries in
++             * drivers/pinctrl/pinconf-generic.c's dt_params[] table,
++             * which now emit PIN_CONFIG_LEVEL instead of the removed
++             * PIN_CONFIG_OUTPUT.
++             */
++            case PIN_CONFIG_LEVEL:
+                 rv = mht_gpio_pin_cfg_set_oe(dev_id, pin, A_TRUE);
+                 rv = mht_gpio_set_bit(dev_id, pin, arg);
+                 break;

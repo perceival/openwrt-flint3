@@ -39,6 +39,15 @@ Kernel module providing Qualcomm's FAL (Forwarding Abstraction Layer) for
 register-level access to the IPQ53xx PPE hardware. Required by qca-nss-ppe.
 endef
 
+# SWCONFIG=FALSE excludes src/ref/{ref_uci,ref_misc,ref_athtag,ref_vport,
+# ref_mapt,ref_tunnel}.c -- an optional legacy interactive UCI-CLI shell for
+# reconfiguring AR8327-family switches at runtime. It depends on a
+# switch_ext/ext_val vendor extension to the swconfig subsystem's
+# struct switch_val that this open-source drop never defines anywhere
+# (only used, never declared) -- presumably carried in QCA's own
+# downstream kernel fork. We don't need an interactive CLI shell; our
+# actual dependency is the FAL/HSL/ADPT driver code in src/fal, src/hsl,
+# src/adpt (unaffected by SWCONFIG) that qca-nss-ppe calls directly.
 QCASSDK_CONFIG_OPTS:= \
 	TOOL_PATH=$(TOOLCHAIN_DIR)/bin \
 	SYS_PATH=$(LINUX_DIR) \
@@ -47,6 +56,7 @@ QCASSDK_CONFIG_OPTS:= \
 	ARCH=$(LINUX_KARCH) \
 	SoC=$(hal_arch) \
 	CHIP_TYPE=MPPE \
+	SWCONFIG=FALSE \
 	CFLAGS=-I$(STAGING_DIR)/usr/include \
 	EXTRA_CFLAGS=-Wno-missing-prototypes
 

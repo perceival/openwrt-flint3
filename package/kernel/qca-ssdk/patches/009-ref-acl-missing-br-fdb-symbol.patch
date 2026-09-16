@@ -1,0 +1,22 @@
+--- a/src/ref/ref_acl.c
++++ b/src/ref/ref_acl.c
+@@ -229,7 +229,18 @@
+ 		eth_dev = dev_get_by_name(&init_net, entry->ifname);
+ 		if (eth_dev)
+ 		{
+-			br_fdb_delete_by_netdev(eth_dev, entry->src_mac.uc, 0);
++			/*
++			 * br_fdb_delete_by_netdev() is a QCA downstream
++			 * addition to net/bridge/br_fdb.c, not present (or
++			 * exported) in mainline kernels. This was a proactive
++			 * flush of the bridge's software-learned FDB entry
++			 * for a MAC leaving ACL bypass; skipping it just
++			 * means the bridge's own aging/relearning catches up
++			 * on next traffic instead of being flushed
++			 * immediately, so it's safe to drop rather than
++			 * fabricate a call into a kernel symbol that doesn't
++			 * exist here.
++			 */
+ 			dev_put(eth_dev);
+ 		}
+ 	}
