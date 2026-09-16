@@ -1,0 +1,44 @@
+From: Kamil Bienkiewicz <perceivalpercy@gmail.com>
+Subject: [PATCH] net: ethernet: qualcomm: ppe: enable NETIF_F_HW_TC
+
+This is the switch: adds NETIF_F_HW_TC to EDMA_NETDEV_FEATURES, so it
+gets set on every EDMA port netdevice's features/hw_features/
+vlan_features/wanted_features alongside the existing checksum/TSO/SG
+flags. Everything from 0411 onward was inert specifically because this
+bit was never set (ethtool showed "hw-tc-offload: off [fixed]" -- not
+just off, but not even user-toggleable, since the feature bit wasn't
+in hw_features at all). With this patch, the kernel's flow-offload
+infrastructure will actually invoke ppe_offload_setup_tc() for
+TC_SETUP_BLOCK/_FT on these netdevices when something (nftables'
+flowtable with the hw flag, in practice) requests it.
+
+Confirmed on live hardware before this patch (session notes,
+project_flint3_ppe_hw_offload_research.md): flow lookup is genuinely
+unbypassed for external ingress traffic (PPE_SC_BYPASS_INGRESS_FLOW_LOOKUP
+bit clear at service code 0, read directly via
+/sys/kernel/debug/regmap/3a000000.ethernet/registers on ap2), so
+programmed flow entries should actually be consulted by hardware, not
+silently ignored at an earlier pipeline stage.
+
+Compile-tested only in isolation; this patch is being tested live on
+ap2 (a secondary/nested router behind pfSense, not the household's
+sole gateway) immediately after landing, with a pre-recorded baseline
+throughput (iperf3, LAN client behind ap2 -> ap1 across ap2's WAN NAT
+path: ~1.6 Gbit/s single-stream, ~1.78 Gbit/s 4-stream, both without
+any flowtable configured yet) to compare against once nftables is
+configured to actually request hardware offload.
+
+Signed-off-by: Kamil Bienkiewicz <perceivalpercy@gmail.com>
+---
+--- a/drivers/net/ethernet/qualcomm/ppe/edma_port.h
++++ b/drivers/net/ethernet/qualcomm/ppe/edma_port.h
+@@ -14,7 +14,8 @@
+ 					| NETIF_F_RXCSUM \
+ 					| NETIF_F_HW_CSUM \
+ 					| NETIF_F_TSO \
+-					| NETIF_F_TSO6)
++					| NETIF_F_TSO6 \
++					| NETIF_F_HW_TC)
+ 
+ /**
+  * struct edma_port_rx_stats - EDMA Rx per CPU stats for the port.
