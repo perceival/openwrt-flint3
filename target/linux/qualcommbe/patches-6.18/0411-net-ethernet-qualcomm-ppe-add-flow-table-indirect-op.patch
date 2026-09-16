@@ -1,0 +1,218 @@
+From: Kamil Bienkiewicz <perceivalpercy@gmail.com>
+Subject: [PATCH] net: ethernet: qualcomm: ppe: add flow table indirect-op
+ primitive
+
+This driver's PPE flow table (per-connection routing/NAT entries, the
+building block for hardware flow offload) is accessed differently from
+every other table this driver already manages: instead of a fixed MMIO
+offset per entry, it uses a shared command/data/result register triplet.
+Adding an entry means writing its data words to PPE_IN_FLOW_TBL_OP_DATA,
+writing a command (operation type, addressing mode, target index) to
+PPE_IN_FLOW_TBL_OP to trigger it, then polling PPE_IN_FLOW_TBL_OP_RSLT
+until hardware reports the operation's outcome.
+
+Add this indirect-op primitive as its own ppe_flow.c/.h pair, plus the
+register/bitfield definitions it needs in ppe_regs.h. This does not yet
+wire the flow table into anything -- it is not called from probe or any
+other existing code path, so this patch has no behavioral effect. It is
+the first piece of infrastructure a future hardware NAT/flow-offload TC
+hook (ppe_drv_v4_create()'s functional equivalent) will build on.
+
+Register offsets and bitfield layouts are cross-referenced against
+Qualcomm's own QSDK reference implementation (qca-ssdk,
+src/hsl/hppe/hppe_flow.c and include/hsl/hppe/hppe_flow_reg.h), which
+targets the same PPE hardware block. That implementation busy-polls the
+result register a fixed number of iterations with no real timeout; this
+version uses regmap_read_poll_timeout with an explicit microsecond
+budget instead, since a fixed iteration count says nothing about actual
+elapsed time and Linux already has the idiom for this.
+
+Compile-tested only (module builds and links cleanly, all three new
+symbols present); no hardware testing has been done, since these
+functions are not yet called from anywhere.
+
+Signed-off-by: Kamil Bienkiewicz <perceivalpercy@gmail.com>
+---
+--- a/drivers/net/ethernet/qualcomm/ppe/Makefile
++++ b/drivers/net/ethernet/qualcomm/ppe/Makefile
+@@ -4,7 +4,7 @@
+ #
+
+ obj-$(CONFIG_QCOM_PPE) += qcom-ppe.o
+-qcom-ppe-objs := ppe.o ppe_config.o ppe_debugfs.o ppe_port.o ppe_api.o
++qcom-ppe-objs := ppe.o ppe_config.o ppe_debugfs.o ppe_port.o ppe_api.o ppe_flow.o
+
+ #EDMA
+ qcom-ppe-objs += edma.o edma_cfg_rx.o edma_cfg_tx.o edma_debugfs.o edma_port.o edma_rx.o edma_tx.o edma_ethtool.o
+--- a/drivers/net/ethernet/qualcomm/ppe/ppe_regs.h
++++ b/drivers/net/ethernet/qualcomm/ppe/ppe_regs.h
+@@ -1113,4 +1113,29 @@
+
+ #define PPE_P1_MULTICAST_DROP_CNT_TBL_ADDR	\
+ 	(PPE_P0_MULTICAST_DROP_CNT_TBL_ADDR + PPE_MULTICAST_QUEUE_PORT_ADDR_INC)
++
++/* IPv4/IPv6 flow entry table, accessed indirectly: write the entry words to
++ * PPE_IN_FLOW_TBL_OP_DATA, write a command to PPE_IN_FLOW_TBL_OP to trigger
++ * the operation, then poll PPE_IN_FLOW_TBL_OP_RSLT until VALID_CNT is set.
++ * Register offsets include the 0x200000 base of the flow-table sub-block
++ * (named IPE_L3 in the vendor SDK) within the PPE's MMIO window.
++ */
++#define PPE_IN_FLOW_TBL_OP_ADDR			0x2003b8
++#define PPE_IN_FLOW_TBL_OP_CMD_ID		GENMASK(3, 0)
++#define PPE_IN_FLOW_TBL_OP_BYP_RSLT_EN		BIT(4)
++#define PPE_IN_FLOW_TBL_OP_OP_TYPE		GENMASK(7, 5)
++#define PPE_IN_FLOW_TBL_OP_HASH_BLOCK_BITMAP	GENMASK(9, 8)
++#define PPE_IN_FLOW_TBL_OP_OP_MODE		BIT(10)
++#define PPE_IN_FLOW_TBL_OP_OP_HOST_EN		BIT(11)
++#define PPE_IN_FLOW_TBL_OP_ENTRY_INDEX		GENMASK(23, 12)
++
++#define PPE_IN_FLOW_TBL_OP_DATA_ADDR		0x2003c0
++#define PPE_IN_FLOW_TBL_OP_DATA_ENTRIES		9
++#define PPE_IN_FLOW_TBL_OP_DATA_INC		0x4
++
++#define PPE_IN_FLOW_TBL_OP_RSLT_ADDR		0x20040c
++#define PPE_IN_FLOW_TBL_OP_RSLT_CMD_ID		GENMASK(3, 0)
++#define PPE_IN_FLOW_TBL_OP_RSLT_OP_RSLT		BIT(4)
++#define PPE_IN_FLOW_TBL_OP_RSLT_ENTRY_INDEX	GENMASK(16, 5)
++#define PPE_IN_FLOW_TBL_OP_RSLT_VALID_CNT	GENMASK(20, 17)
+ #endif
+--- /dev/null
++++ b/drivers/net/ethernet/qualcomm/ppe/ppe_flow.h
+@@ -0,0 +1,32 @@
++/* SPDX-License-Identifier: GPL-2.0-only
++ *
++ * Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.
++ */
++
++#ifndef __PPE_FLOW_H__
++#define __PPE_FLOW_H__
++
++#include <linux/types.h>
++
++#include "ppe.h"
++
++/* Number of 32-bit words that make up one IPv4 5-tuple flow entry. */
++#define PPE_FLOW_TBL_ENTRY_WORDS		9
++
++/**
++ * enum ppe_flow_op_mode - PPE flow table addressing mode.
++ * @PPE_FLOW_OP_MODE_HASH: Hardware selects the entry slot by hashing the
++ * entry's key fields; the assigned index is returned to the caller.
++ * @PPE_FLOW_OP_MODE_INDEX: Caller supplies the exact entry index to
++ * operate on.
++ */
++enum ppe_flow_op_mode {
++	PPE_FLOW_OP_MODE_HASH = 0,
++	PPE_FLOW_OP_MODE_INDEX,
++};
++
++int ppe_flow_entry_add(struct ppe_device *ppe_dev, enum ppe_flow_op_mode mode,
++			const u32 entry[PPE_FLOW_TBL_ENTRY_WORDS], u32 *index);
++int ppe_flow_entry_del(struct ppe_device *ppe_dev, u32 index);
++
++#endif
+--- /dev/null
++++ b/drivers/net/ethernet/qualcomm/ppe/ppe_flow.c
+@@ -0,0 +1,102 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/*
++ * Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.
++ */
++
++/* PPE flow table -- hardware NAT/routing flow entries. Unlike the rest of
++ * the PPE's tables, which are addressed directly (one MMIO offset per
++ * entry), the flow table is accessed indirectly through a fixed
++ * command/data/result register triplet: write the entry's data words,
++ * write a command describing the operation and target index, then poll
++ * the result register until hardware reports the operation done.
++ */
++
++#include <linux/bitfield.h>
++#include <linux/regmap.h>
++
++#include "ppe.h"
++#include "ppe_flow.h"
++#include "ppe_regs.h"
++
++/* Values for PPE_IN_FLOW_TBL_OP's OP_TYPE field. */
++enum ppe_flow_tbl_op_type {
++	PPE_FLOW_TBL_OP_ADD = 0,
++	PPE_FLOW_TBL_OP_DEL,
++	PPE_FLOW_TBL_OP_GET,
++	PPE_FLOW_TBL_OP_FLUSH,
++};
++
++/* Trigger the given flow table operation and wait for hardware to
++ * complete it. *index is the entry index to operate on for
++ * PPE_FLOW_OP_MODE_INDEX (input); for PPE_FLOW_OP_MODE_HASH it is
++ * ignored on input and set to the hardware-assigned index on success.
++ */
++static int ppe_flow_tbl_op_wait(struct ppe_device *ppe_dev,
++				 enum ppe_flow_tbl_op_type op_type,
++				 enum ppe_flow_op_mode mode, u32 *index)
++{
++	u32 val, rslt;
++	int ret;
++
++	val = FIELD_PREP(PPE_IN_FLOW_TBL_OP_OP_TYPE, op_type);
++	val |= FIELD_PREP(PPE_IN_FLOW_TBL_OP_HASH_BLOCK_BITMAP, 3);
++	val |= FIELD_PREP(PPE_IN_FLOW_TBL_OP_OP_MODE, mode);
++	val |= FIELD_PREP(PPE_IN_FLOW_TBL_OP_ENTRY_INDEX, *index);
++
++	ret = regmap_write(ppe_dev->regmap, PPE_IN_FLOW_TBL_OP_ADDR, val);
++	if (ret)
++		return ret;
++
++	ret = regmap_read_poll_timeout(ppe_dev->regmap, PPE_IN_FLOW_TBL_OP_RSLT_ADDR,
++					rslt, FIELD_GET(PPE_IN_FLOW_TBL_OP_RSLT_VALID_CNT, rslt),
++					10, 2000);
++	if (ret)
++		return ret;
++
++	if (FIELD_GET(PPE_IN_FLOW_TBL_OP_RSLT_OP_RSLT, rslt))
++		return -EIO;
++
++	*index = FIELD_GET(PPE_IN_FLOW_TBL_OP_RSLT_ENTRY_INDEX, rslt);
++
++	return 0;
++}
++
++/**
++ * ppe_flow_entry_add() - Add (or overwrite) a PPE flow table entry.
++ * @ppe_dev: PPE device.
++ * @mode: Hash-based or caller-indexed entry placement.
++ * @entry: The flow entry to write, as PPE_FLOW_TBL_ENTRY_WORDS 32-bit words.
++ * @index: In PPE_FLOW_OP_MODE_INDEX, the entry index to write to (input).
++ * On success, always holds the entry's final hardware index: unchanged
++ * for PPE_FLOW_OP_MODE_INDEX, hardware-assigned for PPE_FLOW_OP_MODE_HASH.
++ *
++ * Return: 0 on success, a negative error code on failure.
++ */
++int ppe_flow_entry_add(struct ppe_device *ppe_dev, enum ppe_flow_op_mode mode,
++			const u32 entry[PPE_FLOW_TBL_ENTRY_WORDS], u32 *index)
++{
++	int ret;
++	int i;
++
++	for (i = 0; i < PPE_FLOW_TBL_ENTRY_WORDS; i++) {
++		ret = regmap_write(ppe_dev->regmap,
++				    PPE_IN_FLOW_TBL_OP_DATA_ADDR + i * PPE_IN_FLOW_TBL_OP_DATA_INC,
++				    entry[i]);
++		if (ret)
++			return ret;
++	}
++
++	return ppe_flow_tbl_op_wait(ppe_dev, PPE_FLOW_TBL_OP_ADD, mode, index);
++}
++
++/**
++ * ppe_flow_entry_del() - Delete a PPE flow table entry by index.
++ * @ppe_dev: PPE device.
++ * @index: The entry index to delete.
++ *
++ * Return: 0 on success, a negative error code on failure.
++ */
++int ppe_flow_entry_del(struct ppe_device *ppe_dev, u32 index)
++{
++	return ppe_flow_tbl_op_wait(ppe_dev, PPE_FLOW_TBL_OP_DEL, PPE_FLOW_OP_MODE_INDEX, &index);
++}
