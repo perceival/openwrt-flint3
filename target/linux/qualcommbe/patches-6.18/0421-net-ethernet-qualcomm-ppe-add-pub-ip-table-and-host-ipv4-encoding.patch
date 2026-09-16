@@ -1,0 +1,472 @@
+From: Kamil Bienkiewicz <perceivalpercy@gmail.com>
+Subject: [PATCH] net: ethernet: qualcomm: ppe: add public IP table and
+ host IPv4 encoding
+
+Continuation of the PPE hardware flow-offload port -- see
+project_flint3_ppe_hw_offload_research.md for the full architectural
+context. Both gaps here surfaced only while wiring the actual TC-hook
+shim's hardware-programming logic (the next patch), not from the
+original gap analysis:
+
+- A SNAT nexthop needs somewhere to put the translated (post-NAT)
+  source IPv4 address -- neither the flow entry nor the nexthop entry
+  itself has a field for it. The vendor SDK keeps it in a separate,
+  small (16-entry) "public IP" table, referenced by a nexthop entry's
+  pub_addr_index (confirmed via ppe_drv_nexthop_v4_get_and_ref():
+  "Get public ip address index for SNAT... ppe_drv_pub_ip_get_and_ref()").
+  Adds ppe_pub_ip.c (the direct-addressed single-word primitive) and
+  ppe_pub_ip_pool.c (a refcounted allocator matching
+  ppe_nexthop_pool.c's shape: this table also has no hardware dedup,
+  confirmed by ppe_drv_pub_ip_get_and_ref()'s own linear IP-match
+  search over an active list before allocating).
+
+- ppe_host.c (0412) only ever got the raw word-count primitive, never
+  the field-level encoding -- unlike the flow table, which got both
+  in 0411 and 0415. Adds ppe_host_ipv4.c, encoding the small set of
+  fields this driver's SNAT-flow use case actually needs (valid,
+  lan/wan, ip_addr); key_type/fwd_cmd/syn_toggle/dst_info are
+  hardcoded to the values the vendor SDK's own ppe_drv_host_v4_add()
+  always uses for this case rather than exposed as struct fields,
+  since there's no other host-entry use case yet that would need them
+  to vary.
+
+Register offsets for both tables confirmed against the vendor SDK's
+own address computation (hppe_in_pub_ip_addr_tbl_get/set()), not
+assumed from the field-offset tables alone: IPE_L3_BASE_ADDR
+(0x200000) + 0x378 for the public IP table, same base already relied
+on for every other IPE L3 table this driver has.
+
+Compile-tested only (module builds and links cleanly, all ten new
+symbols present); no hardware testing has been done, since these
+functions are not yet called from anywhere.
+
+Signed-off-by: Kamil Bienkiewicz <perceivalpercy@gmail.com>
+---
+--- a/drivers/net/ethernet/qualcomm/ppe/ppe_regs.h
++++ b/drivers/net/ethernet/qualcomm/ppe/ppe_regs.h
+@@ -1161,6 +1161,23 @@
+ #define PPE_HOST_TBL_OP_RSLT_ENTRY_INDEX	GENMASK(17, 5)
+ #define PPE_HOST_TBL_OP_RSLT_VALID_CNT		GENMASK(21, 18)
+ 
++/* Field layout of an IPv4 host table entry (PPE_HOST_TBL_IPV4_ENTRY_WORDS
++ * words, written/read through ppe_host_entry_add/del() -- see
++ * ppe_host.c). Confirmed against the vendor SDK's non-APPE
++ * struct host_tbl (include/hsl/hppe/hppe_ip_reg.h) and its actual
++ * assignment code (adpt_hppe_ip_host_add(), ppe_drv_host_v4_add()).
++ */
++
++/* Word 0. */
++#define PPE_HOST_TBL_VALID			BIT(0)
++#define PPE_HOST_TBL_KEY_TYPE			GENMASK(2, 1)
++#define PPE_HOST_TBL_FWD_CMD			GENMASK(4, 3)
++#define PPE_HOST_TBL_SYN_TOGGLE			BIT(5)
++#define PPE_HOST_TBL_DST_INFO			GENMASK(19, 6)
++#define PPE_HOST_TBL_LAN_WAN			BIT(20)
++
++/* Word 1 (IP_ADDR) is a single whole-word value, no bitfield mask. */
++
+ /* Nexthop table, unlike the flow and host tables above, is addressed
+  * directly: one fixed-size (4-word) entry per index, no indirect
+  * command/data/result sequence. Each entry rewrites a packet's
+@@ -1250,6 +1267,18 @@
+ /* Word 2. */
+ #define PPE_EG_L3_IF_TBL_PPPOE_EN		BIT(0)
+ 
++/* Public IP address table: holds the translated (post-SNAT) source
++ * IPv4 address for a SNAT nexthop, referenced by a nexthop entry's
++ * PUB_ADDR_INDEX. Small (16 entries) and direct-addressed, a single
++ * whole-word IP value per entry -- confirmed against
++ * hppe_in_pub_ip_addr_tbl_get/set()'s own address computation:
++ * IPE_L3_BASE_ADDR (0x200000) + IN_PUB_IP_ADDR_TBL_ADDRESS (0x378,
++ * non-APPE), within this driver's already-mapped "IPE L3" range.
++ */
++#define PPE_PUB_IP_ADDR_TBL_ADDR		0x200378
++#define PPE_PUB_IP_ADDR_TBL_ENTRIES		16
++#define PPE_PUB_IP_ADDR_TBL_INC		0x4
++
+ /* Field layout of an IPv4 5-tuple flow entry (PPE_FLOW_TBL_ENTRY_WORDS
+  * words, written through PPE_IN_FLOW_TBL_OP_DATA / read back through
+  * PPE_IN_FLOW_TBL_OP_RSLT -- see ppe_flow.h/.c). This is the
+--- a/drivers/net/ethernet/qualcomm/ppe/Makefile
++++ b/drivers/net/ethernet/qualcomm/ppe/Makefile
+@@ -4,7 +4,7 @@
+ #
+ 
+ obj-$(CONFIG_QCOM_PPE) += qcom-ppe.o
+-qcom-ppe-objs := ppe.o ppe_config.o ppe_debugfs.o ppe_port.o ppe_api.o ppe_flow.o ppe_host.o ppe_nexthop.o ppe_flow_ipv4.o ppe_l3_if.o ppe_host_pool.o ppe_nexthop_pool.o ppe_offload.o
++qcom-ppe-objs := ppe.o ppe_config.o ppe_debugfs.o ppe_port.o ppe_api.o ppe_flow.o ppe_host.o ppe_nexthop.o ppe_flow_ipv4.o ppe_host_ipv4.o ppe_l3_if.o ppe_host_pool.o ppe_nexthop_pool.o ppe_pub_ip.o ppe_pub_ip_pool.o ppe_offload.o
+ 
+ #EDMA
+ qcom-ppe-objs += edma.o edma_cfg_rx.o edma_cfg_tx.o edma_debugfs.o edma_port.o edma_rx.o edma_tx.o edma_ethtool.o
+--- /dev/null
++++ b/drivers/net/ethernet/qualcomm/ppe/ppe_host_ipv4.h
+@@ -0,0 +1,30 @@
++/* SPDX-License-Identifier: GPL-2.0-only
++ *
++ * Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.
++ */
++
++#ifndef __PPE_HOST_IPV4_H__
++#define __PPE_HOST_IPV4_H__
++
++#include <linux/types.h>
++
++#include "ppe_host.h"
++
++/**
++ * struct ppe_host_ipv4_entry - IPv4 host table entry.
++ * @valid: Whether this entry is active.
++ * @wan: True if @ip_addr is a WAN-side address, false if LAN-side.
++ * @ip_addr: The IPv4 address this entry represents (network byte order).
++ */
++struct ppe_host_ipv4_entry {
++	bool valid;
++	bool wan;
++	__be32 ip_addr;
++};
++
++void ppe_host_ipv4_entry_encode(const struct ppe_host_ipv4_entry *entry,
++				 u32 words[PPE_HOST_TBL_IPV4_ENTRY_WORDS]);
++void ppe_host_ipv4_entry_decode(const u32 words[PPE_HOST_TBL_IPV4_ENTRY_WORDS],
++				 struct ppe_host_ipv4_entry *entry);
++
++#endif
+--- /dev/null
++++ b/drivers/net/ethernet/qualcomm/ppe/ppe_host_ipv4.c
+@@ -0,0 +1,51 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/*
++ * Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.
++ */
++
++/* IPv4 host table entry field encoding.
++ *
++ * key_type, fwd_cmd, syn_toggle and dst_info are hardcoded to the
++ * values the vendor SDK's own SNAT-flow host entries always use
++ * (ppe_drv_host_v4_add(): key_type=0 selects the plain-IPv4 entry
++ * variant, fwd_cmd=FAL_MAC_FRWRD=0 is "forward normally", syn_toggle
++ * and dst_info are left zero) rather than exposed as struct fields --
++ * this driver has no other host entry use case yet that would need
++ * them to vary.
++ */
++
++#include <linux/bitfield.h>
++#include <linux/types.h>
++
++#include "ppe_host.h"
++#include "ppe_host_ipv4.h"
++#include "ppe_regs.h"
++
++/**
++ * ppe_host_ipv4_entry_encode() - Pack an IPv4 host table entry.
++ * @entry: The entry to pack.
++ * @words: Where to write the packed PPE_HOST_TBL_IPV4_ENTRY_WORDS words.
++ */
++void ppe_host_ipv4_entry_encode(const struct ppe_host_ipv4_entry *entry,
++				 u32 words[PPE_HOST_TBL_IPV4_ENTRY_WORDS])
++{
++	words[0] = entry->valid ? PPE_HOST_TBL_VALID : 0;
++	words[0] |= entry->wan ? PPE_HOST_TBL_LAN_WAN : 0;
++
++	words[1] = be32_to_cpu(entry->ip_addr);
++
++	words[2] = 0;
++}
++
++/**
++ * ppe_host_ipv4_entry_decode() - Unpack an IPv4 host table entry.
++ * @words: The packed PPE_HOST_TBL_IPV4_ENTRY_WORDS words to unpack.
++ * @entry: Where to store the unpacked entry.
++ */
++void ppe_host_ipv4_entry_decode(const u32 words[PPE_HOST_TBL_IPV4_ENTRY_WORDS],
++				 struct ppe_host_ipv4_entry *entry)
++{
++	entry->valid = !!(words[0] & PPE_HOST_TBL_VALID);
++	entry->wan = !!(words[0] & PPE_HOST_TBL_LAN_WAN);
++	entry->ip_addr = cpu_to_be32(words[1]);
++}
+--- /dev/null
++++ b/drivers/net/ethernet/qualcomm/ppe/ppe_pub_ip.h
+@@ -0,0 +1,16 @@
++/* SPDX-License-Identifier: GPL-2.0-only
++ *
++ * Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.
++ */
++
++#ifndef __PPE_PUB_IP_H__
++#define __PPE_PUB_IP_H__
++
++#include <linux/types.h>
++
++#include "ppe.h"
++
++int ppe_pub_ip_entry_set(struct ppe_device *ppe_dev, u32 index, __be32 ip_addr);
++int ppe_pub_ip_entry_get(struct ppe_device *ppe_dev, u32 index, __be32 *ip_addr);
++
++#endif
+--- /dev/null
++++ b/drivers/net/ethernet/qualcomm/ppe/ppe_pub_ip.c
+@@ -0,0 +1,62 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/*
++ * Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.
++ */
++
++/* PPE public IP address table -- direct-addressed, one whole-word IPv4
++ * address per entry. See ppe_regs.h for the register layout and its
++ * verification notes.
++ */
++
++#include <linux/regmap.h>
++
++#include "ppe.h"
++#include "ppe_pub_ip.h"
++#include "ppe_regs.h"
++
++/**
++ * ppe_pub_ip_entry_set() - Write a PPE public IP address table entry.
++ * @ppe_dev: PPE device.
++ * @index: The entry index to write.
++ * @ip_addr: The IPv4 address to write (network byte order).
++ *
++ * Return: 0 on success, a negative error code on failure.
++ */
++int ppe_pub_ip_entry_set(struct ppe_device *ppe_dev, u32 index, __be32 ip_addr)
++{
++	u32 base;
++
++	if (index >= PPE_PUB_IP_ADDR_TBL_ENTRIES)
++		return -EINVAL;
++
++	base = PPE_PUB_IP_ADDR_TBL_ADDR + index * PPE_PUB_IP_ADDR_TBL_INC;
++
++	return regmap_write(ppe_dev->regmap, base, be32_to_cpu(ip_addr));
++}
++
++/**
++ * ppe_pub_ip_entry_get() - Read a PPE public IP address table entry.
++ * @ppe_dev: PPE device.
++ * @index: The entry index to read.
++ * @ip_addr: Where to store the IPv4 address read back (network byte order).
++ *
++ * Return: 0 on success, a negative error code on failure.
++ */
++int ppe_pub_ip_entry_get(struct ppe_device *ppe_dev, u32 index, __be32 *ip_addr)
++{
++	u32 base, val;
++	int ret;
++
++	if (index >= PPE_PUB_IP_ADDR_TBL_ENTRIES)
++		return -EINVAL;
++
++	base = PPE_PUB_IP_ADDR_TBL_ADDR + index * PPE_PUB_IP_ADDR_TBL_INC;
++
++	ret = regmap_read(ppe_dev->regmap, base, &val);
++	if (ret)
++		return ret;
++
++	*ip_addr = cpu_to_be32(val);
++
++	return 0;
++}
+--- /dev/null
++++ b/drivers/net/ethernet/qualcomm/ppe/ppe_pub_ip_pool.h
+@@ -0,0 +1,54 @@
++/* SPDX-License-Identifier: GPL-2.0-only
++ *
++ * Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.
++ */
++
++#ifndef __PPE_PUB_IP_POOL_H__
++#define __PPE_PUB_IP_POOL_H__
++
++#include <linux/list.h>
++#include <linux/mutex.h>
++#include <linux/refcount.h>
++#include <linux/types.h>
++
++#include "ppe.h"
++#include "ppe_regs.h"
++
++struct ppe_pub_ip_pool_entry {
++	struct list_head list;
++	refcount_t ref;
++	u32 index;
++	bool active;
++	__be32 ip_addr;
++};
++
++/**
++ * struct ppe_pub_ip_pool - Deduplicating, refcounted public IP table allocator.
++ * @entry: One entry per hardware index, threaded onto @free or @active.
++ * @free: Indices not currently programmed into hardware.
++ * @active: Indices currently programmed, each holding the IP address it
++ * was programmed with in @entry[i].ip_addr, for matching future requests.
++ * @lock: Serializes get/deref against concurrent callers.
++ *
++ * Like the nexthop table, the public IP table is direct-addressed with
++ * no hardware dedup, so this does the same linear-search-then-allocate
++ * dedup the vendor SDK's ppe_drv_pub_ip_get_and_ref() does in software.
++ * Only PPE_PUB_IP_ADDR_TBL_ENTRIES (16) exist -- typically just the
++ * router's own WAN address or two, but real exhaustion is possible on
++ * a multi-WAN setup and callers must handle -ENOSPC.
++ */
++struct ppe_pub_ip_pool {
++	struct ppe_pub_ip_pool_entry entry[PPE_PUB_IP_ADDR_TBL_ENTRIES];
++	struct list_head free;
++	struct list_head active;
++	struct mutex lock;
++};
++
++void ppe_pub_ip_pool_init(struct ppe_pub_ip_pool *pool);
++void ppe_pub_ip_pool_destroy(struct ppe_device *ppe_dev, struct ppe_pub_ip_pool *pool);
++
++int ppe_pub_ip_pool_get_and_ref(struct ppe_device *ppe_dev, struct ppe_pub_ip_pool *pool,
++				 __be32 ip_addr, u32 *index);
++void ppe_pub_ip_pool_deref(struct ppe_device *ppe_dev, struct ppe_pub_ip_pool *pool, u32 index);
++
++#endif
+--- /dev/null
++++ b/drivers/net/ethernet/qualcomm/ppe/ppe_pub_ip_pool.c
+@@ -0,0 +1,141 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/*
++ * Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.
++ */
++
++/* Refcounted, deduplicating allocator on top of the public IP address
++ * table primitive (ppe_pub_ip.c). See ppe_pub_ip_pool.h for why this
++ * needs its own software dedup, same reasoning as ppe_nexthop_pool.c.
++ */
++
++#include <linux/errno.h>
++#include <linux/list.h>
++#include <linux/refcount.h>
++
++#include "ppe.h"
++#include "ppe_pub_ip.h"
++#include "ppe_pub_ip_pool.h"
++
++/**
++ * ppe_pub_ip_pool_init() - Initialize a public IP table pool.
++ * @pool: The pool to initialize.
++ */
++void ppe_pub_ip_pool_init(struct ppe_pub_ip_pool *pool)
++{
++	unsigned int i;
++
++	INIT_LIST_HEAD(&pool->free);
++	INIT_LIST_HEAD(&pool->active);
++	mutex_init(&pool->lock);
++
++	for (i = 0; i < PPE_PUB_IP_ADDR_TBL_ENTRIES; i++) {
++		pool->entry[i].index = i;
++		pool->entry[i].active = false;
++		list_add_tail(&pool->entry[i].list, &pool->free);
++	}
++}
++
++/**
++ * ppe_pub_ip_pool_destroy() - Tear down a public IP table pool.
++ * @ppe_dev: PPE device.
++ * @pool: The pool to tear down.
++ *
++ * Clears every hardware entry the pool is still tracking. Callers are
++ * expected to have already stopped issuing get/deref calls against
++ * this pool.
++ */
++void ppe_pub_ip_pool_destroy(struct ppe_device *ppe_dev, struct ppe_pub_ip_pool *pool)
++{
++	struct ppe_pub_ip_pool_entry *e, *tmp;
++
++	list_for_each_entry_safe(e, tmp, &pool->active, list)
++		ppe_pub_ip_entry_set(ppe_dev, e->index, 0);
++}
++
++/**
++ * ppe_pub_ip_pool_get_and_ref() - Add a public IP entry, or ref a matching one.
++ * @ppe_dev: PPE device.
++ * @pool: The pool to allocate from.
++ * @ip_addr: The IPv4 address to write, or match against an already-active one.
++ * @index: On success, the entry's hardware index (new or reused).
++ *
++ * Return: 0 on success, a negative error code on failure (-ENOSPC if
++ * the table is full).
++ */
++int ppe_pub_ip_pool_get_and_ref(struct ppe_device *ppe_dev, struct ppe_pub_ip_pool *pool,
++				 __be32 ip_addr, u32 *index)
++{
++	struct ppe_pub_ip_pool_entry *e;
++	int ret;
++
++	mutex_lock(&pool->lock);
++
++	list_for_each_entry(e, &pool->active, list) {
++		if (e->ip_addr == ip_addr) {
++			refcount_inc(&e->ref);
++			mutex_unlock(&pool->lock);
++			*index = e->index;
++			return 0;
++		}
++	}
++
++	e = list_first_entry_or_null(&pool->free, struct ppe_pub_ip_pool_entry, list);
++	if (!e) {
++		mutex_unlock(&pool->lock);
++		return -ENOSPC;
++	}
++
++	ret = ppe_pub_ip_entry_set(ppe_dev, e->index, ip_addr);
++	if (ret) {
++		mutex_unlock(&pool->lock);
++		return ret;
++	}
++
++	e->ip_addr = ip_addr;
++	e->active = true;
++	refcount_set(&e->ref, 1);
++	list_move_tail(&e->list, &pool->active);
++
++	mutex_unlock(&pool->lock);
++	*index = e->index;
++
++	return 0;
++}
++
++/**
++ * ppe_pub_ip_pool_deref() - Drop a reference on a pooled public IP entry.
++ * @ppe_dev: PPE device.
++ * @pool: The pool @index was allocated from.
++ * @index: The entry index, as returned by ppe_pub_ip_pool_get_and_ref().
++ *
++ * Clears the underlying hardware entry once its last reference is
++ * dropped.
++ */
++void ppe_pub_ip_pool_deref(struct ppe_device *ppe_dev, struct ppe_pub_ip_pool *pool, u32 index)
++{
++	struct ppe_pub_ip_pool_entry *e;
++
++	if (index >= PPE_PUB_IP_ADDR_TBL_ENTRIES)
++		return;
++
++	mutex_lock(&pool->lock);
++
++	e = &pool->entry[index];
++	if (!e->active) {
++		mutex_unlock(&pool->lock);
++		return;
++	}
++
++	if (!refcount_dec_and_test(&e->ref)) {
++		mutex_unlock(&pool->lock);
++		return;
++	}
++
++	e->active = false;
++	e->ip_addr = 0;
++	list_move_tail(&e->list, &pool->free);
++
++	mutex_unlock(&pool->lock);
++
++	ppe_pub_ip_entry_set(ppe_dev, index, 0);
++}
