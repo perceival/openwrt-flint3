@@ -1,0 +1,496 @@
+From: Kamil Bienkiewicz <perceivalpercy@gmail.com>
+Subject: [PATCH] net: ethernet: qualcomm: ppe: add host/nexthop refcount
+ pools
+
+Continuation of the PPE hardware flow-offload port -- see
+project_flint3_ppe_hw_offload_research.md for the full architectural
+context. Multiple flows commonly need the same host or nexthop table
+entry: every connection through one LAN client or one public WAN IP
+shares a host entry, every connection through one gateway/next-hop
+shares a nexthop entry. The raw table primitives (ppe_host.c,
+ppe_nexthop.c) have no notion of this -- each add/del call operates on
+exactly one hardware index with no dedup or lifetime tracking, so a
+caller programming N flows through the same gateway would either
+duplicate the entry N times or have to hand-roll its own tracking.
+
+Add a small allocator on top of each table, deliberately shaped
+differently per table's actual hardware behavior rather than sharing
+one generic design:
+
+- ppe_host_pool.c: the host table is hash-addressed and hardware
+  itself deduplicates by key -- confirmed against the vendor SDK's
+  ppe_drv_host_v4_add(), which calls fal_ip_host_add() unconditionally
+  on every request and only checks *after the fact* whether the
+  returned index was already tracked in software (kref_read() on a
+  per-index slot). This pool mirrors exactly that: always add, then
+  refcount whatever index comes back, keyed in an xarray since the
+  table's real depth isn't confirmed and an xarray needs no fixed
+  bound.
+
+- ppe_nexthop_pool.c: the nexthop table is direct-addressed with no
+  hardware dedup -- two identical entries at different indices are
+  just two independent entries. This pool does the same
+  search-active-list-before-allocating dedup the vendor SDK's
+  ppe_drv_nexthop_v4_get_and_ref()/ppe_drv_nexthop_v4_match() do in
+  software, backed by a fixed array sized to
+  PPE_IN_NEXTHOP_TBL_ENTRIES (a known, already-confirmed constant),
+  threaded with free/active list_heads the same way the vendor's own
+  p->nh_free/p->nh_active lists are.
+
+This surfaced a real latent bug in the already-committed table
+primitives, fixed separately in the preceding patch (0417): neither
+ppe_flow_entry_add/del() nor ppe_host_entry_add/del() serialized their
+shared indirect command/data/result register sequence against a
+concurrent call on the same table. That was unreachable until
+something could call them concurrently -- which these pools, backing
+what will become per-flow TC-offload callbacks running on different
+CPUs, are the first thing to actually do.
+
+Compile-tested only (module builds and links cleanly, all eight new
+symbols present); no hardware testing has been done, since these
+functions are not yet called from anywhere.
+
+Signed-off-by: Kamil Bienkiewicz <perceivalpercy@gmail.com>
+---
+--- a/drivers/net/ethernet/qualcomm/ppe/Makefile
++++ b/drivers/net/ethernet/qualcomm/ppe/Makefile
+@@ -4,7 +4,7 @@
+ #
+ 
+ obj-$(CONFIG_QCOM_PPE) += qcom-ppe.o
+-qcom-ppe-objs := ppe.o ppe_config.o ppe_debugfs.o ppe_port.o ppe_api.o ppe_flow.o ppe_host.o ppe_nexthop.o ppe_flow_ipv4.o ppe_l3_if.o
++qcom-ppe-objs := ppe.o ppe_config.o ppe_debugfs.o ppe_port.o ppe_api.o ppe_flow.o ppe_host.o ppe_nexthop.o ppe_flow_ipv4.o ppe_l3_if.o ppe_host_pool.o ppe_nexthop_pool.o
+ 
+ #EDMA
+ qcom-ppe-objs += edma.o edma_cfg_rx.o edma_cfg_tx.o edma_debugfs.o edma_port.o edma_rx.o edma_tx.o edma_ethtool.o
+--- /dev/null
++++ b/drivers/net/ethernet/qualcomm/ppe/ppe_host_pool.h
+@@ -0,0 +1,45 @@
++/* SPDX-License-Identifier: GPL-2.0-only
++ *
++ * Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.
++ */
++
++#ifndef __PPE_HOST_POOL_H__
++#define __PPE_HOST_POOL_H__
++
++#include <linux/mutex.h>
++#include <linux/types.h>
++#include <linux/xarray.h>
++
++#include "ppe.h"
++#include "ppe_host.h"
++
++/**
++ * struct ppe_host_pool - Refcounted host table entry allocator.
++ * @entries: Live host table entries, keyed by hardware index.
++ * @lock: Serializes get/deref against concurrent callers.
++ *
++ * The host table is hash-addressed: hardware itself returns the same
++ * index for two adds with the same key (confirmed against the vendor
++ * SDK's ppe_drv_host_v4_add(), which calls fal_ip_host_add()
++ * unconditionally on every request and only checks *after the fact*
++ * whether the returned index was already tracked in software). This
++ * pool exists purely to count how many callers reference each
++ * already-deduplicated hardware entry, releasing it only once the
++ * last one is done -- unlike the nexthop pool, it does not need to
++ * search for a matching entry itself, since hardware already
++ * guarantees that.
++ */
++struct ppe_host_pool {
++	struct xarray entries;
++	struct mutex lock;
++};
++
++void ppe_host_pool_init(struct ppe_host_pool *pool);
++void ppe_host_pool_destroy(struct ppe_device *ppe_dev, struct ppe_host_pool *pool);
++
++int ppe_host_pool_get_and_ref(struct ppe_device *ppe_dev, struct ppe_host_pool *pool,
++			       enum ppe_flow_op_mode mode, const u32 *entry,
++			       unsigned int num_words, u32 *index);
++void ppe_host_pool_deref(struct ppe_device *ppe_dev, struct ppe_host_pool *pool, u32 index);
++
++#endif
+--- /dev/null
++++ b/drivers/net/ethernet/qualcomm/ppe/ppe_host_pool.c
+@@ -0,0 +1,153 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/*
++ * Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.
++ */
++
++/* Refcounted allocator on top of the host table primitive (ppe_host.c).
++ *
++ * Multiple flows commonly share one host table entry -- every
++ * connection through the same LAN client or the same public WAN IP
++ * references the same entry. The host table's own hardware add
++ * operation already deduplicates by key (see ppe_host_pool.h), so this
++ * layer's only job is counting callers per hardware index and freeing
++ * the entry once the last one is gone.
++ */
++
++#include <linux/errno.h>
++#include <linux/gfp.h>
++#include <linux/refcount.h>
++#include <linux/slab.h>
++#include <linux/xarray.h>
++
++#include "ppe.h"
++#include "ppe_host.h"
++#include "ppe_host_pool.h"
++
++struct ppe_host_pool_entry {
++	refcount_t ref;
++	u32 index;
++};
++
++/**
++ * ppe_host_pool_init() - Initialize a host table pool.
++ * @pool: The pool to initialize.
++ */
++void ppe_host_pool_init(struct ppe_host_pool *pool)
++{
++	xa_init(&pool->entries);
++	mutex_init(&pool->lock);
++}
++
++/**
++ * ppe_host_pool_destroy() - Tear down a host table pool.
++ * @ppe_dev: PPE device.
++ * @pool: The pool to tear down.
++ *
++ * Releases every hardware entry the pool is still tracking. Callers
++ * are expected to have already stopped issuing get/deref calls
++ * against this pool.
++ */
++void ppe_host_pool_destroy(struct ppe_device *ppe_dev, struct ppe_host_pool *pool)
++{
++	struct ppe_host_pool_entry *e;
++	unsigned long index;
++
++	xa_for_each(&pool->entries, index, e) {
++		ppe_host_entry_del(ppe_dev, e->index);
++		kfree(e);
++	}
++
++	xa_destroy(&pool->entries);
++}
++
++/**
++ * ppe_host_pool_get_and_ref() - Add a host table entry, or ref an existing one.
++ * @ppe_dev: PPE device.
++ * @pool: The pool to allocate from.
++ * @mode: Hash-based or caller-indexed entry placement -- see
++ * ppe_host_entry_add(). Dedup only applies for %PPE_FLOW_OP_MODE_HASH,
++ * matching hardware's own behavior.
++ * @entry: The host entry to write -- see ppe_host_entry_add().
++ * @num_words: Number of words in @entry.
++ * @index: On success, the entry's hardware index (new or reused).
++ *
++ * Return: 0 on success, a negative error code on failure.
++ */
++int ppe_host_pool_get_and_ref(struct ppe_device *ppe_dev, struct ppe_host_pool *pool,
++			       enum ppe_flow_op_mode mode, const u32 *entry,
++			       unsigned int num_words, u32 *index)
++{
++	struct ppe_host_pool_entry *e;
++	u32 idx;
++	int ret;
++
++	ret = ppe_host_entry_add(ppe_dev, mode, entry, num_words, &idx);
++	if (ret)
++		return ret;
++
++	mutex_lock(&pool->lock);
++
++	e = xa_load(&pool->entries, idx);
++	if (e) {
++		refcount_inc(&e->ref);
++		mutex_unlock(&pool->lock);
++		*index = idx;
++		return 0;
++	}
++
++	e = kzalloc(sizeof(*e), GFP_KERNEL);
++	if (!e) {
++		mutex_unlock(&pool->lock);
++		ppe_host_entry_del(ppe_dev, idx);
++		return -ENOMEM;
++	}
++
++	refcount_set(&e->ref, 1);
++	e->index = idx;
++
++	ret = xa_err(xa_store(&pool->entries, idx, e, GFP_KERNEL));
++	if (ret) {
++		mutex_unlock(&pool->lock);
++		kfree(e);
++		ppe_host_entry_del(ppe_dev, idx);
++		return ret;
++	}
++
++	mutex_unlock(&pool->lock);
++	*index = idx;
++
++	return 0;
++}
++
++/**
++ * ppe_host_pool_deref() - Drop a reference on a pooled host table entry.
++ * @ppe_dev: PPE device.
++ * @pool: The pool @index was allocated from.
++ * @index: The entry index, as returned by ppe_host_pool_get_and_ref().
++ *
++ * Deletes the underlying hardware entry once its last reference is
++ * dropped.
++ */
++void ppe_host_pool_deref(struct ppe_device *ppe_dev, struct ppe_host_pool *pool, u32 index)
++{
++	struct ppe_host_pool_entry *e;
++
++	mutex_lock(&pool->lock);
++
++	e = xa_load(&pool->entries, index);
++	if (!e) {
++		mutex_unlock(&pool->lock);
++		return;
++	}
++
++	if (!refcount_dec_and_test(&e->ref)) {
++		mutex_unlock(&pool->lock);
++		return;
++	}
++
++	xa_erase(&pool->entries, index);
++	mutex_unlock(&pool->lock);
++
++	ppe_host_entry_del(ppe_dev, index);
++	kfree(e);
++}
+--- /dev/null
++++ b/drivers/net/ethernet/qualcomm/ppe/ppe_nexthop_pool.h
+@@ -0,0 +1,58 @@
++/* SPDX-License-Identifier: GPL-2.0-only
++ *
++ * Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.
++ */
++
++#ifndef __PPE_NEXTHOP_POOL_H__
++#define __PPE_NEXTHOP_POOL_H__
++
++#include <linux/list.h>
++#include <linux/mutex.h>
++#include <linux/refcount.h>
++#include <linux/types.h>
++
++#include "ppe.h"
++#include "ppe_nexthop.h"
++#include "ppe_regs.h"
++
++struct ppe_nexthop_pool_entry {
++	struct list_head list;
++	refcount_t ref;
++	u32 index;
++	bool active;
++	struct ppe_nexthop_entry key;
++};
++
++/**
++ * struct ppe_nexthop_pool - Deduplicating, refcounted nexthop table allocator.
++ * @entry: One entry per hardware index, threaded onto @free or @active.
++ * @free: Indices not currently programmed into hardware.
++ * @active: Indices currently programmed, each holding a copy of the
++ * entry it was programmed with in @entry[i].key, for matching future
++ * requests against.
++ * @lock: Serializes get/deref against concurrent callers.
++ *
++ * Unlike the host table, the nexthop table is direct-addressed with no
++ * hardware-side dedup: two identical entries programmed at different
++ * indices are simply two separate, independent hardware entries. This
++ * pool does the same linear-search-then-allocate-or-reuse dedup the
++ * vendor SDK's ppe_drv_nexthop_v4_get_and_ref()/ppe_drv_nexthop_v4_match()
++ * do in software, backed by a fixed array sized to the hardware table
++ * instead of a kzalloc-per-entry list, since the table's size
++ * (PPE_IN_NEXTHOP_TBL_ENTRIES) is fixed and known up front.
++ */
++struct ppe_nexthop_pool {
++	struct ppe_nexthop_pool_entry entry[PPE_IN_NEXTHOP_TBL_ENTRIES];
++	struct list_head free;
++	struct list_head active;
++	struct mutex lock;
++};
++
++void ppe_nexthop_pool_init(struct ppe_nexthop_pool *pool);
++void ppe_nexthop_pool_destroy(struct ppe_device *ppe_dev, struct ppe_nexthop_pool *pool);
++
++int ppe_nexthop_pool_get_and_ref(struct ppe_device *ppe_dev, struct ppe_nexthop_pool *pool,
++				  const struct ppe_nexthop_entry *key, u32 *index);
++void ppe_nexthop_pool_deref(struct ppe_device *ppe_dev, struct ppe_nexthop_pool *pool, u32 index);
++
++#endif
+--- /dev/null
++++ b/drivers/net/ethernet/qualcomm/ppe/ppe_nexthop_pool.c
+@@ -0,0 +1,163 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/*
++ * Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.
++ */
++
++/* Refcounted, deduplicating allocator on top of the nexthop table
++ * primitive (ppe_nexthop.c). See ppe_nexthop_pool.h for why this
++ * needs its own software dedup, unlike the host table pool.
++ */
++
++#include <linux/errno.h>
++#include <linux/list.h>
++#include <linux/refcount.h>
++#include <linux/string.h>
++
++#include "ppe.h"
++#include "ppe_nexthop.h"
++#include "ppe_nexthop_pool.h"
++
++static bool ppe_nexthop_entry_equal(const struct ppe_nexthop_entry *a,
++				     const struct ppe_nexthop_entry *b)
++{
++	if (a->port_valid != b->port_valid)
++		return false;
++	if (a->port_valid ? a->port != b->port : a->vsi != b->vsi)
++		return false;
++
++	return a->post_l3_if == b->post_l3_if &&
++	       a->ip_to_me == b->ip_to_me &&
++	       a->stag_fmt == b->stag_fmt &&
++	       a->svid == b->svid &&
++	       a->ctag_fmt == b->ctag_fmt &&
++	       a->cvid == b->cvid &&
++	       a->pub_addr_index == b->pub_addr_index &&
++	       a->dnat_ip == b->dnat_ip &&
++	       !memcmp(a->dmac, b->dmac, ETH_ALEN);
++}
++
++/**
++ * ppe_nexthop_pool_init() - Initialize a nexthop table pool.
++ * @pool: The pool to initialize.
++ */
++void ppe_nexthop_pool_init(struct ppe_nexthop_pool *pool)
++{
++	unsigned int i;
++
++	INIT_LIST_HEAD(&pool->free);
++	INIT_LIST_HEAD(&pool->active);
++	mutex_init(&pool->lock);
++
++	for (i = 0; i < PPE_IN_NEXTHOP_TBL_ENTRIES; i++) {
++		pool->entry[i].index = i;
++		pool->entry[i].active = false;
++		list_add_tail(&pool->entry[i].list, &pool->free);
++	}
++}
++
++/**
++ * ppe_nexthop_pool_destroy() - Tear down a nexthop table pool.
++ * @ppe_dev: PPE device.
++ * @pool: The pool to tear down.
++ *
++ * Clears every hardware entry the pool is still tracking. Callers are
++ * expected to have already stopped issuing get/deref calls against
++ * this pool.
++ */
++void ppe_nexthop_pool_destroy(struct ppe_device *ppe_dev, struct ppe_nexthop_pool *pool)
++{
++	struct ppe_nexthop_pool_entry *e, *tmp;
++	struct ppe_nexthop_entry zero = {};
++
++	list_for_each_entry_safe(e, tmp, &pool->active, list)
++		ppe_nexthop_entry_set(ppe_dev, e->index, &zero);
++}
++
++/**
++ * ppe_nexthop_pool_get_and_ref() - Add a nexthop entry, or ref a matching one.
++ * @ppe_dev: PPE device.
++ * @pool: The pool to allocate from.
++ * @key: The nexthop entry to write, or match against an already-active one.
++ * @index: On success, the entry's hardware index (new or reused).
++ *
++ * Return: 0 on success, a negative error code on failure (-ENOSPC if
++ * the table is full).
++ */
++int ppe_nexthop_pool_get_and_ref(struct ppe_device *ppe_dev, struct ppe_nexthop_pool *pool,
++				  const struct ppe_nexthop_entry *key, u32 *index)
++{
++	struct ppe_nexthop_pool_entry *e;
++	int ret;
++
++	mutex_lock(&pool->lock);
++
++	list_for_each_entry(e, &pool->active, list) {
++		if (ppe_nexthop_entry_equal(&e->key, key)) {
++			refcount_inc(&e->ref);
++			mutex_unlock(&pool->lock);
++			*index = e->index;
++			return 0;
++		}
++	}
++
++	e = list_first_entry_or_null(&pool->free, struct ppe_nexthop_pool_entry, list);
++	if (!e) {
++		mutex_unlock(&pool->lock);
++		return -ENOSPC;
++	}
++
++	ret = ppe_nexthop_entry_set(ppe_dev, e->index, key);
++	if (ret) {
++		mutex_unlock(&pool->lock);
++		return ret;
++	}
++
++	e->key = *key;
++	e->active = true;
++	refcount_set(&e->ref, 1);
++	list_move_tail(&e->list, &pool->active);
++
++	mutex_unlock(&pool->lock);
++	*index = e->index;
++
++	return 0;
++}
++
++/**
++ * ppe_nexthop_pool_deref() - Drop a reference on a pooled nexthop entry.
++ * @ppe_dev: PPE device.
++ * @pool: The pool @index was allocated from.
++ * @index: The entry index, as returned by ppe_nexthop_pool_get_and_ref().
++ *
++ * Clears the underlying hardware entry once its last reference is
++ * dropped.
++ */
++void ppe_nexthop_pool_deref(struct ppe_device *ppe_dev, struct ppe_nexthop_pool *pool, u32 index)
++{
++	struct ppe_nexthop_entry zero = {};
++	struct ppe_nexthop_pool_entry *e;
++
++	if (index >= PPE_IN_NEXTHOP_TBL_ENTRIES)
++		return;
++
++	mutex_lock(&pool->lock);
++
++	e = &pool->entry[index];
++	if (!e->active) {
++		mutex_unlock(&pool->lock);
++		return;
++	}
++
++	if (!refcount_dec_and_test(&e->ref)) {
++		mutex_unlock(&pool->lock);
++		return;
++	}
++
++	e->active = false;
++	memset(&e->key, 0, sizeof(e->key));
++	list_move_tail(&e->list, &pool->free);
++
++	mutex_unlock(&pool->lock);
++
++	ppe_nexthop_entry_set(ppe_dev, index, &zero);
++}
