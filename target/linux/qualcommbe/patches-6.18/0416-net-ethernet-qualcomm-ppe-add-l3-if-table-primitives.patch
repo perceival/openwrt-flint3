@@ -1,0 +1,374 @@
+From: Kamil Bienkiewicz <perceivalpercy@gmail.com>
+Subject: [PATCH] net: ethernet: qualcomm: ppe: add L3 interface table
+ primitives
+
+Continuation of 0411-0415 -- see project_flint3_ppe_hw_offload_research.md
+for the full architectural context. A working hardware flow-offload TC
+hook needs a fourth table this driver has no infrastructure for at all:
+a nexthop entry's post_l3_if unconditionally indexes the egress L3
+interface table (confirmed against the vendor SDK's
+ppe_drv_nexthop_v4_get_and_ref(), which sets fal_nh.if_index for every
+nexthop, not just tunnel/PPPoE ones), and a flow entry's optional
+src_l3_if indexes the ingress side.
+
+Both tables are, like the nexthop table, addressed directly -- one
+fixed-size entry per index, no indirect command/data/result sequence.
+They are per-interface resources populated once at interface
+registration time in the vendor stack (ppe_drv_iface_l3_if_set(),
+called from ppe_drv_dp.c/ppe_drv_br.c/ppe_drv_lag.c/etc.), not per-flow
+state, so this driver's eventual TC-hook shim is expected to follow the
+same pattern: set up one entry per netdevice once, then reference its
+index from flow/nexthop entries.
+
+Register offsets cross-referenced against qca-ssdk's own address
+computation (hppe_in_l3_if_tbl_get/set(), hppe_eg_l3_if_tbl_get/set())
+rather than assumed from the field-offset tables alone: IN_L3_IF_TBL
+sits at IPE_L3_BASE_ADDR (0x200000) + 0x2000, EG_L3_IF_TBL at
+NSS_PTX_CSR_BASE_ADDR (0x020000) + 0xe000 -- both confirmed within this
+driver's already-mapped "IPE L3" and "PTX CSR" regmap ranges. Field
+layout uses the vendor SDK's non-APPE union in_l3_if_tbl_u/
+eg_l3_if_tbl_u variant, consistent with every other table this driver
+has ported so far. MAC address byte-order for the egress table
+confirmed against adpt_hppe_ip.c's actual packing code, not inferred
+from struct field order.
+
+Compile-tested only (module builds and links cleanly, all four new
+symbols present); no hardware testing has been done, since these
+functions are not yet called from anywhere.
+
+Signed-off-by: Kamil Bienkiewicz <perceivalpercy@gmail.com>
+---
+--- a/drivers/net/ethernet/qualcomm/ppe/Makefile
++++ b/drivers/net/ethernet/qualcomm/ppe/Makefile
+@@ -4,7 +4,7 @@
+ #
+ 
+ obj-$(CONFIG_QCOM_PPE) += qcom-ppe.o
+-qcom-ppe-objs := ppe.o ppe_config.o ppe_debugfs.o ppe_port.o ppe_api.o ppe_flow.o ppe_host.o ppe_nexthop.o ppe_flow_ipv4.o
++qcom-ppe-objs := ppe.o ppe_config.o ppe_debugfs.o ppe_port.o ppe_api.o ppe_flow.o ppe_host.o ppe_nexthop.o ppe_flow_ipv4.o ppe_l3_if.o
+ 
+ #EDMA
+ qcom-ppe-objs += edma.o edma_cfg_rx.o edma_cfg_tx.o edma_debugfs.o edma_port.o edma_rx.o edma_tx.o edma_ethtool.o
+--- a/drivers/net/ethernet/qualcomm/ppe/ppe_regs.h
++++ b/drivers/net/ethernet/qualcomm/ppe/ppe_regs.h
+@@ -1189,6 +1189,67 @@
+  * whole-word value, so need no bitfield mask.
+  */
+ 
++/* Ingress L3 interface table: per-L3-interface MTU/MRU/route-enable
++ * config, referenced by a flow entry's SRC_L3_IF and consulted on
++ * ingress. Addressed directly, two words per entry (the vendor SDK's
++ * non-APPE union in_l3_if_tbl_u -- APPE adds extra IPv6-specific
++ * fields this chip's field layout doesn't have, same #if defined(APPE)
++ * split already relied on throughout this driver). Final address is
++ * IPE_L3_BASE_ADDR (0x200000) + IN_L3_IF_TBL_ADDRESS (0x2000, non-APPE)
++ * -- confirmed against hppe_in_l3_if_tbl_get/set()'s own address
++ * computation, and within this driver's already-mapped "IPE L3"
++ * regmap range (0x200000-0x2fffff).
++ */
++#define PPE_IN_L3_IF_TBL_ADDR			0x202000
++#define PPE_IN_L3_IF_TBL_ENTRIES		256
++#define PPE_IN_L3_IF_TBL_INC			0x8
++
++/* Word 0. */
++#define PPE_IN_L3_IF_TBL_MRU			GENMASK(13, 0)
++#define PPE_IN_L3_IF_TBL_MTU			GENMASK(27, 14)
++#define PPE_IN_L3_IF_TBL_TTL_DEC_BYPASS		BIT(28)
++#define PPE_IN_L3_IF_TBL_IPV4_UC_ROUTE_EN	BIT(29)
++#define PPE_IN_L3_IF_TBL_IPV6_UC_ROUTE_EN	BIT(30)
++#define PPE_IN_L3_IF_TBL_ICMP_TRIGGER_EN	BIT(31)
++
++/* Word 1. */
++#define PPE_IN_L3_IF_TBL_TTL_EXCEED_CMD		GENMASK(1, 0)
++#define PPE_IN_L3_IF_TBL_TTL_EXCEED_DE_ACCE	BIT(2)
++#define PPE_IN_L3_IF_TBL_MAC_BITMAP		GENMASK(10, 3)
++#define PPE_IN_L3_IF_TBL_PPPOE_EN		BIT(11)
++
++/* Egress L3 interface table: per-L3-interface source MAC (and, when
++ * PPPoE-encapsulating, session ID) applied on egress. Referenced by a
++ * nexthop entry's POST_L3_IF and unconditionally required by every
++ * nexthop, not just tunnel/PPPoE ones -- confirmed via
++ * ppe_drv_nexthop_v4_get_and_ref() unconditionally setting
++ * fal_nh.if_index. Addressed directly, three words per entry (the
++ * vendor SDK's non-APPE union eg_l3_if_tbl_u; APPE adds tunnel fields
++ * this chip doesn't have). Final address is NSS_PTX_CSR_BASE_ADDR
++ * (0x020000) + EG_L3_IF_TBL_ADDRESS (0xe000, non-APPE) -- confirmed
++ * against hppe_eg_l3_if_tbl_get/set()'s own address computation, and
++ * within this driver's already-mapped "PTX CSR" regmap range
++ * (0x20000-0x5ffff).
++ *
++ * MAC address byte-order confirmed against the vendor's own packing
++ * (adpt_hppe_ip.c: mac_addr_0 = uc[5] | uc[4] << 8 | uc[3] << 16 |
++ * uc[2] << 24; mac_addr_1 = uc[1] | uc[0] << 8) -- this is
++ * ether_addr_to_u64()'s low 32 bits in word 0 and high 16 bits in the
++ * low half of word 1, the mirror image of PPE_IN_NEXTHOP_TBL's split.
++ */
++#define PPE_EG_L3_IF_TBL_ADDR			0x02e000
++#define PPE_EG_L3_IF_TBL_ENTRIES		256
++#define PPE_EG_L3_IF_TBL_INC			0x10
++
++/* Word 0 (MAC_ADDR_0) is a single whole-word value, no bitfield mask. */
++
++/* Word 1. */
++#define PPE_EG_L3_IF_TBL_MAC_ADDR_1		GENMASK(15, 0)
++#define PPE_EG_L3_IF_TBL_SESSION_ID		GENMASK(31, 16)
++
++/* Word 2. */
++#define PPE_EG_L3_IF_TBL_PPPOE_EN		BIT(0)
++
+ /* Field layout of an IPv4 5-tuple flow entry (PPE_FLOW_TBL_ENTRY_WORDS
+  * words, written through PPE_IN_FLOW_TBL_OP_DATA / read back through
+  * PPE_IN_FLOW_TBL_OP_RSLT -- see ppe_flow.h/.c). This is the
+--- /dev/null
++++ b/drivers/net/ethernet/qualcomm/ppe/ppe_l3_if.h
+@@ -0,0 +1,68 @@
++/* SPDX-License-Identifier: GPL-2.0-only
++ *
++ * Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.
++ */
++
++#ifndef __PPE_L3_IF_H__
++#define __PPE_L3_IF_H__
++
++#include <linux/if_ether.h>
++#include <linux/types.h>
++
++#include "ppe.h"
++
++/**
++ * struct ppe_l3_if_in_entry - PPE ingress L3 interface table entry.
++ * @mru: Maximum receive unit enforced on this L3 interface, in bytes.
++ * @mtu: Maximum transmit unit enforced on this L3 interface, in bytes.
++ * @ttl_dec_bypass: Whether to skip decrementing TTL / hop limit for
++ * traffic routed through this L3 interface.
++ * @ipv4_uc_route_en: Whether IPv4 unicast routing is enabled.
++ * @ipv6_uc_route_en: Whether IPv6 unicast routing is enabled.
++ * @icmp_trigger_en: Whether to redirect to the CPU packets that need
++ * an ICMP error generated (e.g. TTL exceeded) on this L3 interface.
++ * @ttl_exceed_cmd: Forwarding command applied to packets whose TTL /
++ * hop limit has been exceeded.
++ * @ttl_exceed_de_acce: Whether to de-accelerate (stop hardware
++ * offloading) a flow when its TTL / hop limit is exceeded.
++ * @mac_bitmap: Bitmap of MY-MAC table entries this L3 interface
++ * accepts as a valid destination MAC.
++ * @pppoe_en: Whether this L3 interface expects PPPoE encapsulation on
++ * ingress.
++ */
++struct ppe_l3_if_in_entry {
++	u16 mru;
++	u16 mtu;
++	bool ttl_dec_bypass;
++	bool ipv4_uc_route_en;
++	bool ipv6_uc_route_en;
++	bool icmp_trigger_en;
++	u8 ttl_exceed_cmd;
++	bool ttl_exceed_de_acce;
++	u8 mac_bitmap;
++	bool pppoe_en;
++};
++
++/**
++ * struct ppe_l3_if_eg_entry - PPE egress L3 interface table entry.
++ * @mac_addr: Source MAC address this L3 interface rewrites routed
++ * packets to use on egress.
++ * @session_id: PPPoE session ID applied on egress, when @pppoe_en.
++ * @pppoe_en: Whether to add a PPPoE encapsulation on egress.
++ */
++struct ppe_l3_if_eg_entry {
++	u8 mac_addr[ETH_ALEN];
++	u16 session_id;
++	bool pppoe_en;
++};
++
++int ppe_l3_if_in_entry_set(struct ppe_device *ppe_dev, u32 index,
++			    const struct ppe_l3_if_in_entry *entry);
++int ppe_l3_if_in_entry_get(struct ppe_device *ppe_dev, u32 index,
++			    struct ppe_l3_if_in_entry *entry);
++int ppe_l3_if_eg_entry_set(struct ppe_device *ppe_dev, u32 index,
++			    const struct ppe_l3_if_eg_entry *entry);
++int ppe_l3_if_eg_entry_get(struct ppe_device *ppe_dev, u32 index,
++			    struct ppe_l3_if_eg_entry *entry);
++
++#endif
+--- /dev/null
++++ b/drivers/net/ethernet/qualcomm/ppe/ppe_l3_if.c
+@@ -0,0 +1,179 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/*
++ * Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.
++ */
++
++/* PPE ingress/egress L3 interface tables. Like the nexthop table, both
++ * are addressed directly: one fixed-size entry per index, no indirect
++ * command/data/result sequence.
++ *
++ * These are per-interface resources, not per-flow: the vendor driver
++ * populates one entry per netdevice/VSI/LAG/etc at interface
++ * registration time (ppe_drv_iface_l3_if_set(), called from
++ * ppe_drv_dp.c, ppe_drv_br.c, ppe_drv_lag.c, ppe_drv_vp.c and others),
++ * and a flow/nexthop entry only ever references an already-populated
++ * index. Callers of this file are expected to follow the same pattern
++ * -- set up one entry per interface once, then reference its index
++ * from ppe_flow_ipv4_snat_entry.src_l3_if / ppe_nexthop_entry.post_l3_if.
++ */
++
++#include <linux/bitfield.h>
++#include <linux/etherdevice.h>
++#include <linux/regmap.h>
++
++#include "ppe.h"
++#include "ppe_l3_if.h"
++#include "ppe_regs.h"
++
++/**
++ * ppe_l3_if_in_entry_set() - Write a PPE ingress L3 interface table entry.
++ * @ppe_dev: PPE device.
++ * @index: The entry index to write.
++ * @entry: The ingress L3 interface entry to write.
++ *
++ * Return: 0 on success, a negative error code on failure.
++ */
++int ppe_l3_if_in_entry_set(struct ppe_device *ppe_dev, u32 index,
++			    const struct ppe_l3_if_in_entry *entry)
++{
++	u32 base, val[2] = {};
++	int ret;
++	int i;
++
++	if (index >= PPE_IN_L3_IF_TBL_ENTRIES)
++		return -EINVAL;
++
++	val[0] = FIELD_PREP(PPE_IN_L3_IF_TBL_MRU, entry->mru);
++	val[0] |= FIELD_PREP(PPE_IN_L3_IF_TBL_MTU, entry->mtu);
++	val[0] |= entry->ttl_dec_bypass ? PPE_IN_L3_IF_TBL_TTL_DEC_BYPASS : 0;
++	val[0] |= entry->ipv4_uc_route_en ? PPE_IN_L3_IF_TBL_IPV4_UC_ROUTE_EN : 0;
++	val[0] |= entry->ipv6_uc_route_en ? PPE_IN_L3_IF_TBL_IPV6_UC_ROUTE_EN : 0;
++	val[0] |= entry->icmp_trigger_en ? PPE_IN_L3_IF_TBL_ICMP_TRIGGER_EN : 0;
++
++	val[1] = FIELD_PREP(PPE_IN_L3_IF_TBL_TTL_EXCEED_CMD, entry->ttl_exceed_cmd);
++	val[1] |= entry->ttl_exceed_de_acce ? PPE_IN_L3_IF_TBL_TTL_EXCEED_DE_ACCE : 0;
++	val[1] |= FIELD_PREP(PPE_IN_L3_IF_TBL_MAC_BITMAP, entry->mac_bitmap);
++	val[1] |= entry->pppoe_en ? PPE_IN_L3_IF_TBL_PPPOE_EN : 0;
++
++	base = PPE_IN_L3_IF_TBL_ADDR + index * PPE_IN_L3_IF_TBL_INC;
++	for (i = 0; i < 2; i++) {
++		ret = regmap_write(ppe_dev->regmap, base + i * 4, val[i]);
++		if (ret)
++			return ret;
++	}
++
++	return 0;
++}
++
++/**
++ * ppe_l3_if_in_entry_get() - Read a PPE ingress L3 interface table entry.
++ * @ppe_dev: PPE device.
++ * @index: The entry index to read.
++ * @entry: Where to store the entry read back.
++ *
++ * Return: 0 on success, a negative error code on failure.
++ */
++int ppe_l3_if_in_entry_get(struct ppe_device *ppe_dev, u32 index,
++			    struct ppe_l3_if_in_entry *entry)
++{
++	u32 base, val[2];
++	int ret;
++	int i;
++
++	if (index >= PPE_IN_L3_IF_TBL_ENTRIES)
++		return -EINVAL;
++
++	base = PPE_IN_L3_IF_TBL_ADDR + index * PPE_IN_L3_IF_TBL_INC;
++	for (i = 0; i < 2; i++) {
++		ret = regmap_read(ppe_dev->regmap, base + i * 4, &val[i]);
++		if (ret)
++			return ret;
++	}
++
++	entry->mru = FIELD_GET(PPE_IN_L3_IF_TBL_MRU, val[0]);
++	entry->mtu = FIELD_GET(PPE_IN_L3_IF_TBL_MTU, val[0]);
++	entry->ttl_dec_bypass = !!(val[0] & PPE_IN_L3_IF_TBL_TTL_DEC_BYPASS);
++	entry->ipv4_uc_route_en = !!(val[0] & PPE_IN_L3_IF_TBL_IPV4_UC_ROUTE_EN);
++	entry->ipv6_uc_route_en = !!(val[0] & PPE_IN_L3_IF_TBL_IPV6_UC_ROUTE_EN);
++	entry->icmp_trigger_en = !!(val[0] & PPE_IN_L3_IF_TBL_ICMP_TRIGGER_EN);
++
++	entry->ttl_exceed_cmd = FIELD_GET(PPE_IN_L3_IF_TBL_TTL_EXCEED_CMD, val[1]);
++	entry->ttl_exceed_de_acce = !!(val[1] & PPE_IN_L3_IF_TBL_TTL_EXCEED_DE_ACCE);
++	entry->mac_bitmap = FIELD_GET(PPE_IN_L3_IF_TBL_MAC_BITMAP, val[1]);
++	entry->pppoe_en = !!(val[1] & PPE_IN_L3_IF_TBL_PPPOE_EN);
++
++	return 0;
++}
++
++/**
++ * ppe_l3_if_eg_entry_set() - Write a PPE egress L3 interface table entry.
++ * @ppe_dev: PPE device.
++ * @index: The entry index to write.
++ * @entry: The egress L3 interface entry to write.
++ *
++ * Return: 0 on success, a negative error code on failure.
++ */
++int ppe_l3_if_eg_entry_set(struct ppe_device *ppe_dev, u32 index,
++			    const struct ppe_l3_if_eg_entry *entry)
++{
++	u32 base, val[3] = {};
++	u64 mac;
++	int ret;
++	int i;
++
++	if (index >= PPE_EG_L3_IF_TBL_ENTRIES)
++		return -EINVAL;
++
++	mac = ether_addr_to_u64(entry->mac_addr);
++
++	val[0] = mac & GENMASK(31, 0);
++
++	val[1] = FIELD_PREP(PPE_EG_L3_IF_TBL_MAC_ADDR_1, mac >> 32);
++	val[1] |= FIELD_PREP(PPE_EG_L3_IF_TBL_SESSION_ID, entry->session_id);
++
++	val[2] = entry->pppoe_en ? PPE_EG_L3_IF_TBL_PPPOE_EN : 0;
++
++	base = PPE_EG_L3_IF_TBL_ADDR + index * PPE_EG_L3_IF_TBL_INC;
++	for (i = 0; i < 3; i++) {
++		ret = regmap_write(ppe_dev->regmap, base + i * 4, val[i]);
++		if (ret)
++			return ret;
++	}
++
++	return 0;
++}
++
++/**
++ * ppe_l3_if_eg_entry_get() - Read a PPE egress L3 interface table entry.
++ * @ppe_dev: PPE device.
++ * @index: The entry index to read.
++ * @entry: Where to store the entry read back.
++ *
++ * Return: 0 on success, a negative error code on failure.
++ */
++int ppe_l3_if_eg_entry_get(struct ppe_device *ppe_dev, u32 index,
++			    struct ppe_l3_if_eg_entry *entry)
++{
++	u32 base, val[3];
++	u64 mac;
++	int ret;
++	int i;
++
++	if (index >= PPE_EG_L3_IF_TBL_ENTRIES)
++		return -EINVAL;
++
++	base = PPE_EG_L3_IF_TBL_ADDR + index * PPE_EG_L3_IF_TBL_INC;
++	for (i = 0; i < 3; i++) {
++		ret = regmap_read(ppe_dev->regmap, base + i * 4, &val[i]);
++		if (ret)
++			return ret;
++	}
++
++	mac = (u64)FIELD_GET(PPE_EG_L3_IF_TBL_MAC_ADDR_1, val[1]) << 32 | val[0];
++	u64_to_ether_addr(mac, entry->mac_addr);
++
++	entry->session_id = FIELD_GET(PPE_EG_L3_IF_TBL_SESSION_ID, val[1]);
++	entry->pppoe_en = !!(val[2] & PPE_EG_L3_IF_TBL_PPPOE_EN);
++
++	return 0;
++}
