@@ -1,0 +1,757 @@
+From: Kamil Bienkiewicz <perceivalpercy@gmail.com>
+Subject: [PATCH] net: ethernet: qualcomm: ppe: implement IPv4 SNAT
+ hardware flow offload
+
+Continuation of the PPE hardware flow-offload port -- see
+project_flint3_ppe_hw_offload_research.md for the full architectural
+context. Replaces 0420's "always decline" FLOW_CLS_REPLACE with a real
+implementation: parses a flow_rule's match key and mangle actions,
+resolves them through the host/nexthop/public-IP pools (0418, 0421),
+and programs a real flow table entry via ppe_flow_entry_add().
+FLOW_CLS_DESTROY tears the same entry back down; FLOW_CLS_STATS
+remains unimplemented (see below).
+
+Adds struct ppe_offload_priv (an rhashtable of offloaded flows keyed
+by TC cookie, plus the three pools) as ppe_dev->offload, allocated at
+probe and torn down at remove -- the per-device state this needed and
+0420 deliberately didn't introduce yet.
+
+Scope is deliberately narrow, enforced by declining (-EOPNOTSUPP)
+anything outside it rather than attempting a best-effort translation.
+Full reasoning is in ppe_offload.c's file comment; summary:
+
+- IPv4 TCP/UDP/UDP-Lite only.
+- SNAT (source NAT / masquerade) outbound direction only. The reply
+  direction is a separate flow_cls_offload (its own cookie, dst
+  changes instead of src) and is declined -- this milestone
+  accelerates outbound traffic through a masqueraded connection and
+  leaves inbound on the software path, not full bidirectional offload.
+- Egress device must be one of this driver's own EDMA netdevices
+  (edma_port_is_edma_netdev()). This board's LAN side egresses through
+  DSA (rtl837x)/bridge netdevices, which are out of scope here, so in
+  practice this only accelerates the WAN-side direction. DSA/bridge
+  support (mirroring mtk_flow_get_dsa_port()) is follow-up work, not
+  silently assumed away.
+- The destination MAC for the nexthop comes *only* from the flow's own
+  FLOW_ACTION_MANGLE for the Ethernet header -- deliberately, since the
+  kernel has already resolved it via routing/neighbor tables by the
+  time it offers the flow; this code does no ARP/neighbor resolution
+  of its own. A flow without an Ethernet mangle is declined.
+- A safety check compares the mangled source MAC against the egress
+  netdevice's own dev_addr and declines on mismatch, rather than risk
+  egressing traffic with an unexpected source MAC.
+- FLOW_CLS_STATS is not implemented: hardware keeps packet/byte
+  counters in a table this driver has no primitive for yet, so
+  nftables' flowtable can't use them to keep an offloaded connection's
+  conntrack entry alive against its own idle timeout. A long-lived
+  offloaded flow can therefore be aged out of conntrack while hardware
+  is still forwarding it. Acceptable for this milestone ("flows are
+  accepted and correctly forwarded"), flagged rather than glossed
+  over.
+
+Two things noted in code comments as needing hardware-test-time
+verification, not resolved by static analysis: whether this driver's
+own port_id numbering agrees with the vendor fal_port_t numbering
+PPE_IN_NEXTHOP_TBL_PORT_VSI expects, and whether hardware actually
+consults the flow table for genuinely external ingress traffic --
+ppe_servcode_init() bypasses flow lookup only for service code 1,
+which edma_tx.c applies solely to CPU-originated egress descriptors,
+so external ingress should see an unbypassed default, but this has
+not been confirmed against a live register read.
+
+Compile-tested only (module builds and links cleanly, all new symbols
+present); no hardware testing has been done. Still fully inert in
+practice: NETIF_F_HW_TC remains unset (0420) and this project's
+current nftables config requests no hardware offload, so nothing
+reachable calls FLOW_CLS_REPLACE with a real rule yet.
+
+Signed-off-by: Kamil Bienkiewicz <perceivalpercy@gmail.com>
+---
+--- a/drivers/net/ethernet/qualcomm/ppe/ppe.h
++++ b/drivers/net/ethernet/qualcomm/ppe/ppe.h
+@@ -15,6 +15,7 @@
+ struct dentry;
+ 
+ struct ppe_ports;
++struct ppe_offload_priv;
+ 
+ /**
+  * struct ppe_device - PPE device private data.
+@@ -31,6 +32,9 @@
+  * command/data/result register triplet (see ppe_host.c) against
+  * concurrent add/del calls. Independent of @flow_tbl_lock: the two
+  * tables use entirely separate registers.
++ * @offload: Hardware flow-offload state (see ppe_offload.c) -- flow
++ * table rhashtable, host/nexthop pools, and the mutex serializing
++ * offload add/remove. Allocated at probe.
+  * @num_icc_paths: Number of interconnect paths.
+  * @icc_paths: Interconnect path array.
+  *
+@@ -47,6 +51,7 @@
+ 	struct ppe_ports *ports;
+ 	struct mutex flow_tbl_lock;
+ 	struct mutex host_tbl_lock;
++	struct ppe_offload_priv *offload;
+ 	unsigned int num_icc_paths;
+ 	struct icc_bulk_data icc_paths[] __counted_by(num_icc_paths);
+ };
+--- a/drivers/net/ethernet/qualcomm/ppe/ppe.c
++++ b/drivers/net/ethernet/qualcomm/ppe/ppe.c
+@@ -18,6 +18,7 @@
+ #include "ppe.h"
+ #include "ppe_config.h"
+ #include "ppe_debugfs.h"
++#include "ppe_offload.h"
+ #include "ppe_port.h"
+ 
+ #define PPE_PORT_MAX		8
+@@ -235,21 +236,32 @@
+ 	mutex_init(&ppe_dev->flow_tbl_lock);
+ 	mutex_init(&ppe_dev->host_tbl_lock);
+ 
+-	ret = ppe_clock_init_and_reset(ppe_dev, ppe_icc_data);
++	ret = ppe_offload_init(ppe_dev);
+ 	if (ret)
++		return dev_err_probe(dev, ret, "PPE offload init failed\n");
++
++	ret = ppe_clock_init_and_reset(ppe_dev, ppe_icc_data);
++	if (ret) {
++		ppe_offload_destroy(ppe_dev);
+ 		return dev_err_probe(dev, ret, "PPE clock config failed\n");
++	}
+ 
+ 	ret = ppe_hw_config(ppe_dev);
+-	if (ret)
++	if (ret) {
++		ppe_offload_destroy(ppe_dev);
+ 		return dev_err_probe(dev, ret, "PPE HW config failed\n");
++	}
+ 
+ 	ret = edma_setup(ppe_dev);
+-	if (ret)
++	if (ret) {
++		ppe_offload_destroy(ppe_dev);
+ 		return dev_err_probe(dev, ret, "EDMA setup failed\n");
++	}
+ 
+ 	ret = ppe_port_mac_init(ppe_dev);
+ 	if (ret) {
+ 		edma_destroy(ppe_dev);
++		ppe_offload_destroy(ppe_dev);
+ 		return dev_err_probe(dev, ret,
+ 				     "PPE Port MAC initialization failed\n");
+ 	}
+@@ -268,6 +280,7 @@
+ 	ppe_port_mac_deinit(ppe_dev);
+ 	ppe_debugfs_teardown(ppe_dev);
+ 	edma_destroy(ppe_dev);
++	ppe_offload_destroy(ppe_dev);
+ }
+ 
+ static const struct of_device_id qcom_ppe_of_match[] = {
+--- a/drivers/net/ethernet/qualcomm/ppe/edma_port.h
++++ b/drivers/net/ethernet/qualcomm/ppe/edma_port.h
+@@ -99,4 +99,5 @@
+ 
+ void edma_port_destroy(struct ppe_port *port);
+ int edma_port_setup(struct ppe_port *port);
++bool edma_port_is_edma_netdev(const struct net_device *netdev);
+ #endif
+--- a/drivers/net/ethernet/qualcomm/ppe/edma_port.c
++++ b/drivers/net/ethernet/qualcomm/ppe/edma_port.c
+@@ -365,6 +365,24 @@
+ };
+ 
+ /**
++ * edma_port_is_edma_netdev() - Check whether a netdevice is one of this
++ * driver's own EDMA port netdevices.
++ * @netdev: The netdevice to check.
++ *
++ * Callers that receive a struct net_device * from generic kernel code
++ * (for example a TC/flow-offload action's egress device) must call
++ * this before netdev_priv()-casting it to struct edma_port_priv --
++ * the pointer may belong to a bridge, DSA port, VLAN device, or any
++ * other driver's netdevice entirely.
++ *
++ * Return: true if @netdev is an EDMA port netdevice owned by this driver.
++ */
++bool edma_port_is_edma_netdev(const struct net_device *netdev)
++{
++	return netdev->netdev_ops == &edma_port_netdev_ops;
++}
++
++/**
+  * edma_port_destroy - EDMA port destroy.
+  * @port: PPE port
+  *
+--- a/drivers/net/ethernet/qualcomm/ppe/ppe_offload.h
++++ b/drivers/net/ethernet/qualcomm/ppe/ppe_offload.h
+@@ -6,9 +6,14 @@
+ #ifndef __PPE_OFFLOAD_H__
+ #define __PPE_OFFLOAD_H__
+ 
++#include "ppe.h"
++
+ struct net_device;
+ enum tc_setup_type;
+ 
++int ppe_offload_init(struct ppe_device *ppe_dev);
++void ppe_offload_destroy(struct ppe_device *ppe_dev);
++
+ int ppe_offload_setup_tc(struct net_device *netdev, enum tc_setup_type type,
+ 			  void *type_data);
+ 
+--- a/drivers/net/ethernet/qualcomm/ppe/ppe_offload.c
++++ b/drivers/net/ethernet/qualcomm/ppe/ppe_offload.c
+@@ -7,43 +7,457 @@
+  * this driver's netdevices, modeled on drivers/net/ethernet/mediatek/
+  * mtk_ppe_offload.c.
+  *
+- * This is deliberately the *inert* half only: it registers the TC
+- * block callback so the kernel's flow-offload infrastructure can find
+- * this driver and offer it flows, but ppe_offload_flow_cmd() declines
+- * every FLOW_CLS_REPLACE with -EOPNOTSUPP rather than actually parsing
+- * a flow_rule and programming hardware. That is the next piece, and is
+- * gated on its own review -- unlike this file, it will not be inert.
++ * Scope of what this accepts, deliberately narrow for a first working
++ * cut and enforced by outright declining (-EOPNOTSUPP) anything
++ * outside it, falling back to the kernel's normal software forwarding
++ * path:
+  *
+- * Only one PPE instance exists per SoC, so a single file-scope block
+- * callback list (rather than one embedded in some per-device context
+- * struct) is sufficient here and avoids introducing state this half
+- * doesn't need. The hardware-programming half will need real
+- * per-device state (an rhashtable of offloaded flows, references to
+- * the host/nexthop pools) and is expected to introduce that struct
+- * when it lands.
++ * - IPv4 only.
++ * - TCP, UDP or UDP-Lite only.
++ * - SNAT (source NAT / masquerade) direction only -- the reply/DNAT
++ *   direction of a NAT connection is a separate flow_cls_offload with
++ *   its own cookie and is declined here. A masqueraded connection is
++ *   therefore accelerated outbound but stays on the software path
++ *   inbound, which is a real, known limitation of this milestone, not
++ *   an oversight.
++ * - Egress device must be one of this driver's own EDMA port
++ *   netdevices (edma_port_is_edma_netdev()). Bridge and DSA (rtl837x)
++ *   netdevices are out of scope -- on this board's LAN side, real
++ *   traffic's egress device is typically a DSA/bridge netdevice, not
++ *   an EDMA one, so this milestone in practice only accelerates the
++ *   WAN-side direction of traffic through a plain EDMA netdevice.
++ *   Extending this to DSA/bridge devices (mirroring
++ *   mtk_flow_get_dsa_port()) is follow-up work.
++ * - The flow must carry a FLOW_ACTION_MANGLE for the Ethernet header:
++ *   this is the *only* source this code uses for the nexthop's
++ *   destination MAC, deliberately -- the kernel has already resolved
++ *   the correct next-hop MAC via its own routing/neighbor tables by
++ *   the time it offers the flow, so there's no reason to duplicate
++ *   that resolution here (and every reason not to, since getting it
++ *   wrong would misdirect real traffic).
++ * - FLOW_CLS_STATS is not implemented: this table's per-flow "age"
++ *   field isn't a packet/byte counter, and hardware keeps those
++ *   separately in a table this driver doesn't yet have a primitive
++ *   for. A long-lived offloaded connection can therefore be aged out
++ *   of conntrack independently of whether hardware is still
++ *   forwarding it -- acceptable for this milestone ("flows are
++ *   accepted and correctly forwarded"), not yet "flows survive
++ *   indefinitely once offloaded".
++ *
++ * Hardware itself may also not consult the flow table at all yet for
++ * genuinely external ingress traffic -- ppe_servcode_init() bypasses
++ * flow lookup (PPE_SC_BYPASS_INGRESS_FLOW_LOOKUP) only for service
++ * code 1, which edma_tx.c applies solely to CPU-originated egress
++ * descriptors, not to arriving port traffic, so external ingress
++ * should default to an unbypassed (zeroed) bitmap and see flow lookup
++ * -- but this has not been confirmed against a live register read.
++ * That confirmation, along with everything else in this comment, is a
++ * hardware-testing-time question; nothing here changes it.
+  */
+ 
++#include <linux/errno.h>
++#include <linux/etherdevice.h>
++#include <linux/if_ether.h>
++#include <linux/in.h>
++#include <linux/ip.h>
+ #include <linux/list.h>
++#include <linux/mutex.h>
+ #include <linux/netdevice.h>
++#include <linux/rhashtable.h>
++#include <linux/slab.h>
++#include <linux/tcp.h>
+ #include <net/flow_offload.h>
+ #include <net/pkt_cls.h>
+ 
++#include "edma_port.h"
++#include "ppe.h"
++#include "ppe_flow.h"
++#include "ppe_flow_ipv4.h"
++#include "ppe_host.h"
++#include "ppe_host_ipv4.h"
++#include "ppe_host_pool.h"
++#include "ppe_nexthop.h"
++#include "ppe_nexthop_pool.h"
+ #include "ppe_offload.h"
++#include "ppe_pub_ip_pool.h"
++
++struct ppe_offload_flow_entry {
++	struct rhash_head node;
++	unsigned long cookie;
++	u32 flow_index;
++	u32 host_index;
++	u32 nexthop_index;
++	u32 pub_ip_index;
++};
++
++static const struct rhashtable_params ppe_offload_flow_ht_params = {
++	.head_offset = offsetof(struct ppe_offload_flow_entry, node),
++	.key_offset = offsetof(struct ppe_offload_flow_entry, cookie),
++	.key_len = sizeof(unsigned long),
++	.automatic_shrinking = true,
++};
++
++/**
++ * struct ppe_offload_priv - PPE hardware flow-offload state.
++ * @ppe_dev: PPE device.
++ * @host_pool: Refcounted host table allocator.
++ * @nexthop_pool: Refcounted nexthop table allocator.
++ * @pub_ip_pool: Refcounted public IP address table allocator.
++ * @flow_table: Offloaded flows, keyed by TC flow cookie.
++ * @lock: Serializes the whole replace/destroy sequence -- looking up
++ * @flow_table, allocating from the pools, and programming hardware --
++ * against concurrent calls for different flows, mirroring
++ * mtk_ppe_offload.c's single mtk_flow_offload_mutex.
++ */
++struct ppe_offload_priv {
++	struct ppe_device *ppe_dev;
++	struct ppe_host_pool host_pool;
++	struct ppe_nexthop_pool nexthop_pool;
++	struct ppe_pub_ip_pool pub_ip_pool;
++	struct rhashtable flow_table;
++	struct mutex lock;
++};
+ 
+ static LIST_HEAD(ppe_offload_block_cb_list);
+ 
+-static int ppe_offload_flow_cmd(struct net_device *netdev, struct flow_cls_offload *cls)
++/* Local, zero-seeded accumulator for a FLOW_ACTION_MANGLE targeting
++ * the Ethernet header: the kernel emits up to three 4-byte masked
++ * mangles across the 12-byte dst+src region (at offsets 0, 4 and 8;
++ * the offset-4 word straddles h_dest[4..5] and h_source[0..1]), so a
++ * mangle can't be mapped one-to-one onto either address -- this must
++ * accumulate across all of them before the result means anything.
++ * Zero-seeded, not seeded from the original frame's addresses: a
++ * routed/NAT'd frame's new Ethernet header has no relationship to the
++ * original one, unlike the IPv4/port mangles below which only ever
++ * change one endpoint of an existing tuple.
++ */
++struct ppe_offload_eth_mangle {
++	u8 bytes[ETH_ALEN * 2];
++	bool seen;
++};
++
++static int ppe_offload_apply_eth_mangle(struct ppe_offload_eth_mangle *eth,
++					 const struct flow_action_entry *act)
++{
++	u32 *word;
++
++	if (act->mangle.offset > sizeof(eth->bytes) - sizeof(u32))
++		return -EOPNOTSUPP;
++
++	word = (u32 *)(eth->bytes + act->mangle.offset);
++	*word = (*word & act->mangle.mask) | act->mangle.val;
++	eth->seen = true;
++
++	return 0;
++}
++
++static __be32 ppe_offload_apply_ip4_mangle(__be32 orig, const struct flow_action_entry *act)
++{
++	u32 word = (__force u32)orig;
++
++	word = (word & act->mangle.mask) | act->mangle.val;
++
++	return (__force __be32)word;
++}
++
++/* Local accumulator for a FLOW_ACTION_MANGLE targeting the TCP/UDP
++ * source+dest port pair, both of which live in the first 4 bytes of
++ * either header (struct tcphdr and struct udphdr agree on this
++ * layout) and so can be covered by a single mangle at offset 0.
++ * Seeded from the original match ports, not zero: unlike the Ethernet
++ * header, only one of source/dest is ever actually being rewritten
++ * for the SNAT case this code supports, and the other must be
++ * preserved.
++ */
++struct ppe_offload_l4_ports {
++	__be16 source;
++	__be16 dest;
++};
++
++static int ppe_offload_apply_l4_mangle(struct ppe_offload_l4_ports *ports,
++					const struct flow_action_entry *act)
++{
++	u32 word;
++
++	if (act->mangle.offset != 0)
++		return -EOPNOTSUPP;
++
++	word = (__force u32)ports->source << 16 | (__force u32)ports->dest;
++	word = (word & act->mangle.mask) | act->mangle.val;
++	ports->source = (__force __be16)(word >> 16);
++	ports->dest = (__force __be16)(word & 0xffff);
++
++	return 0;
++}
++
++static int ppe_offload_flow_replace(struct net_device *netdev,
++				     struct ppe_offload_priv *priv,
++				     struct flow_cls_offload *cls)
++{
++	struct ppe_offload_l4_ports l4 = {};
++	struct ppe_offload_eth_mangle eth = {};
++	struct flow_rule *rule = flow_cls_offload_flow_rule(cls);
++	struct ppe_offload_flow_entry *entry;
++	struct ppe_host_ipv4_entry host_ipv4;
++	struct ppe_flow_ipv4_snat_entry flow_ipv4;
++	struct ppe_nexthop_entry nexthop;
++	struct edma_port_priv *port_priv;
++	struct net_device *odev = NULL;
++	__be32 match_src, match_dst;
++	__be32 new_src, new_dst;
++	__be16 match_sport, match_dport;
++	u32 flow_words[PPE_FLOW_TBL_ENTRY_WORDS];
++	u32 host_words[PPE_HOST_TBL_IPV4_ENTRY_WORDS];
++	u32 host_index, nexthop_index, pub_ip_index, flow_index;
++	const struct flow_action_entry *act;
++	u8 ip_proto;
++	int action;
++	int ret;
++
++	if (!flow_rule_match_key(rule, FLOW_DISSECTOR_KEY_CONTROL) ||
++	    !flow_rule_match_key(rule, FLOW_DISSECTOR_KEY_BASIC) ||
++	    !flow_rule_match_key(rule, FLOW_DISSECTOR_KEY_IPV4_ADDRS) ||
++	    !flow_rule_match_key(rule, FLOW_DISSECTOR_KEY_PORTS))
++		return -EOPNOTSUPP;
++
++	{
++		struct flow_match_control ctrl;
++		struct flow_match_basic basic;
++		struct flow_match_ipv4_addrs ip4;
++		struct flow_match_ports ports;
++
++		flow_rule_match_control(rule, &ctrl);
++		if (ctrl.key->addr_type != FLOW_DISSECTOR_KEY_IPV4_ADDRS)
++			return -EOPNOTSUPP;
++
++		flow_rule_match_basic(rule, &basic);
++		switch (basic.key->ip_proto) {
++		case IPPROTO_TCP:
++			ip_proto = PPE_FLOW_PROTO_TCP;
++			break;
++		case IPPROTO_UDP:
++			ip_proto = PPE_FLOW_PROTO_UDP;
++			break;
++		case IPPROTO_UDPLITE:
++			ip_proto = PPE_FLOW_PROTO_UDPLITE;
++			break;
++		default:
++			return -EOPNOTSUPP;
++		}
++
++		flow_rule_match_ipv4_addrs(rule, &ip4);
++		match_src = ip4.key->src;
++		match_dst = ip4.key->dst;
++
++		flow_rule_match_ports(rule, &ports);
++		match_sport = ports.key->src;
++		match_dport = ports.key->dst;
++	}
++
++	new_src = match_src;
++	new_dst = match_dst;
++	l4.source = match_sport;
++	l4.dest = match_dport;
++
++	flow_action_for_each(action, act, &rule->action) {
++		switch (act->id) {
++		case FLOW_ACTION_MANGLE:
++			switch (act->mangle.htype) {
++			case FLOW_ACT_MANGLE_HDR_TYPE_ETH:
++				ret = ppe_offload_apply_eth_mangle(&eth, act);
++				if (ret)
++					return ret;
++				break;
++			case FLOW_ACT_MANGLE_HDR_TYPE_IP4:
++				if (act->mangle.offset == offsetof(struct iphdr, saddr))
++					new_src = ppe_offload_apply_ip4_mangle(new_src, act);
++				else if (act->mangle.offset == offsetof(struct iphdr, daddr))
++					new_dst = ppe_offload_apply_ip4_mangle(new_dst, act);
++				else
++					return -EOPNOTSUPP;
++				break;
++			case FLOW_ACT_MANGLE_HDR_TYPE_TCP:
++			case FLOW_ACT_MANGLE_HDR_TYPE_UDP:
++				ret = ppe_offload_apply_l4_mangle(&l4, act);
++				if (ret)
++					return ret;
++				break;
++			default:
++				return -EOPNOTSUPP;
++			}
++			break;
++		case FLOW_ACTION_REDIRECT:
++			odev = act->dev;
++			break;
++		case FLOW_ACTION_CSUM:
++			/* Hardware recomputes checksums on rewrite. */
++			break;
++		default:
++			return -EOPNOTSUPP;
++		}
++	}
++
++	if (!odev || !eth.seen)
++		return -EOPNOTSUPP;
++
++	if (!edma_port_is_edma_netdev(odev))
++		return -EOPNOTSUPP;
++
++	/* SNAT only: source changed, destination didn't. Declines the
++	 * DNAT/reply direction and anything that changes both or
++	 * neither -- see the file comment.
++	 */
++	if (new_src == match_src || new_dst != match_dst)
++		return -EOPNOTSUPP;
++
++	/* eth.bytes is {h_dest[6], h_source[6]}. The new source half
++	 * must be this egress port's own MAC -- if it isn't, either
++	 * this isn't the flow we think it is or the port's L3_IF entry
++	 * (edma_port_l3_if_update()) is out of sync, and egressing
++	 * with the wrong source MAC either way is worse than declining.
++	 */
++	if (!ether_addr_equal(eth.bytes + ETH_ALEN, odev->dev_addr))
++		return -EOPNOTSUPP;
++
++	port_priv = netdev_priv(odev);
++
++	mutex_lock(&priv->lock);
++
++	if (rhashtable_lookup_fast(&priv->flow_table, &cls->cookie, ppe_offload_flow_ht_params)) {
++		ret = -EEXIST;
++		goto unlock;
++	}
++
++	/* Public IP entry for the translated (post-SNAT) source address. */
++	ret = ppe_pub_ip_pool_get_and_ref(priv->ppe_dev, &priv->pub_ip_pool, new_src,
++					   &pub_ip_index);
++	if (ret)
++		goto unlock;
++
++	/* Nexthop: egress port + resolved next-hop MAC + the public IP
++	 * entry just obtained.
++	 */
++	memset(&nexthop, 0, sizeof(nexthop));
++	nexthop.port_valid = true;
++	/* Assumes this driver's own port_id numbering matches the
++	 * vendor fal_port_t numbering PPE_IN_NEXTHOP_TBL_PORT_VSI
++	 * expects (both apparently 1-based with 0 reserved) -- not
++	 * independently confirmed against vendor source, flagged for
++	 * hardware-test-time verification.
++	 */
++	nexthop.port = port_priv->ppe_port->port_id;
++	nexthop.post_l3_if = port_priv->l3_if_index;
++	nexthop.pub_addr_index = pub_ip_index;
++	memcpy(nexthop.dmac, eth.bytes, ETH_ALEN);
++
++	ret = ppe_nexthop_pool_get_and_ref(priv->ppe_dev, &priv->nexthop_pool, &nexthop,
++					    &nexthop_index);
++	if (ret)
++		goto deref_pub_ip;
++
++	/* Host entry for the original (pre-NAT) source address -- the
++	 * LAN client, shared across every flow through it.
++	 */
++	memset(&host_ipv4, 0, sizeof(host_ipv4));
++	host_ipv4.valid = true;
++	host_ipv4.wan = false;
++	host_ipv4.ip_addr = match_src;
++	ppe_host_ipv4_entry_encode(&host_ipv4, host_words);
++
++	ret = ppe_host_pool_get_and_ref(priv->ppe_dev, &priv->host_pool, PPE_FLOW_OP_MODE_HASH,
++					 host_words, PPE_HOST_TBL_IPV4_ENTRY_WORDS, &host_index);
++	if (ret)
++		goto deref_nexthop;
++
++	memset(&flow_ipv4, 0, sizeof(flow_ipv4));
++	flow_ipv4.valid = true;
++	flow_ipv4.host_addr_is_dst = false;
++	flow_ipv4.host_addr_index = host_index;
++	flow_ipv4.protocol = ip_proto;
++	flow_ipv4.snat_nexthop = nexthop_index;
++	flow_ipv4.snat_src_port = be16_to_cpu(l4.source);
++	flow_ipv4.match_ip = match_dst;
++	flow_ipv4.match_sport = be16_to_cpu(match_sport);
++	flow_ipv4.match_dport = be16_to_cpu(match_dport);
++	ppe_flow_ipv4_snat_entry_encode(&flow_ipv4, flow_words);
++
++	flow_index = 0;
++	ret = ppe_flow_entry_add(priv->ppe_dev, PPE_FLOW_OP_MODE_HASH, flow_words, &flow_index);
++	if (ret)
++		goto deref_host;
++
++	entry = kzalloc(sizeof(*entry), GFP_KERNEL);
++	if (!entry) {
++		ret = -ENOMEM;
++		goto del_flow;
++	}
++
++	entry->cookie = cls->cookie;
++	entry->flow_index = flow_index;
++	entry->host_index = host_index;
++	entry->nexthop_index = nexthop_index;
++	entry->pub_ip_index = pub_ip_index;
++
++	ret = rhashtable_insert_fast(&priv->flow_table, &entry->node, ppe_offload_flow_ht_params);
++	if (ret)
++		goto free_entry;
++
++	mutex_unlock(&priv->lock);
++
++	return 0;
++
++free_entry:
++	kfree(entry);
++del_flow:
++	ppe_flow_entry_del(priv->ppe_dev, flow_index);
++deref_host:
++	ppe_host_pool_deref(priv->ppe_dev, &priv->host_pool, host_index);
++deref_nexthop:
++	ppe_nexthop_pool_deref(priv->ppe_dev, &priv->nexthop_pool, nexthop_index);
++deref_pub_ip:
++	ppe_pub_ip_pool_deref(priv->ppe_dev, &priv->pub_ip_pool, pub_ip_index);
++unlock:
++	mutex_unlock(&priv->lock);
++
++	return ret;
++}
++
++static int ppe_offload_flow_destroy(struct ppe_offload_priv *priv, struct flow_cls_offload *cls)
++{
++	struct ppe_offload_flow_entry *entry;
++
++	mutex_lock(&priv->lock);
++
++	entry = rhashtable_lookup_fast(&priv->flow_table, &cls->cookie, ppe_offload_flow_ht_params);
++	if (!entry) {
++		mutex_unlock(&priv->lock);
++		return -ENOENT;
++	}
++
++	rhashtable_remove_fast(&priv->flow_table, &entry->node, ppe_offload_flow_ht_params);
++
++	ppe_flow_entry_del(priv->ppe_dev, entry->flow_index);
++	ppe_host_pool_deref(priv->ppe_dev, &priv->host_pool, entry->host_index);
++	ppe_nexthop_pool_deref(priv->ppe_dev, &priv->nexthop_pool, entry->nexthop_index);
++	ppe_pub_ip_pool_deref(priv->ppe_dev, &priv->pub_ip_pool, entry->pub_ip_index);
++
++	mutex_unlock(&priv->lock);
++
++	kfree(entry);
++
++	return 0;
++}
++
++static int ppe_offload_flow_cmd(struct net_device *netdev, struct ppe_offload_priv *priv,
++				 struct flow_cls_offload *cls)
+ {
+ 	switch (cls->command) {
+ 	case FLOW_CLS_REPLACE:
+-		/* Hardware programming not yet implemented. */
+-		return -EOPNOTSUPP;
++		return ppe_offload_flow_replace(netdev, priv, cls);
+ 	case FLOW_CLS_DESTROY:
++		return ppe_offload_flow_destroy(priv, cls);
+ 	case FLOW_CLS_STATS:
+-		/* Nothing is ever successfully offloaded yet, so the
+-		 * kernel never has a reason to call these for a flow
+-		 * this driver produced.
+-		 */
++		/* Not implemented -- see the file comment. */
+ 		return -EOPNOTSUPP;
+ 	default:
+ 		return -EOPNOTSUPP;
+@@ -54,13 +468,20 @@
+ 					  void *cb_priv)
+ {
+ 	struct net_device *netdev = cb_priv;
++	struct edma_port_priv *port_priv;
+ 
+ 	if (!tc_can_offload(netdev))
+ 		return -EOPNOTSUPP;
+ 
++	if (!edma_port_is_edma_netdev(netdev))
++		return -EOPNOTSUPP;
++
++	port_priv = netdev_priv(netdev);
++
+ 	switch (type) {
+ 	case TC_SETUP_CLSFLOWER:
+-		return ppe_offload_flow_cmd(netdev, type_data);
++		return ppe_offload_flow_cmd(netdev, port_priv->ppe_port->ppe_dev->offload,
++					     type_data);
+ 	default:
+ 		return -EOPNOTSUPP;
+ 	}
+@@ -126,3 +547,51 @@
+ 		return -EOPNOTSUPP;
+ 	}
+ }
++
++/**
++ * ppe_offload_init() - Initialize PPE hardware flow-offload state.
++ * @ppe_dev: PPE device.
++ *
++ * Return: 0 on success, a negative error code on failure.
++ */
++int ppe_offload_init(struct ppe_device *ppe_dev)
++{
++	struct ppe_offload_priv *priv;
++	int ret;
++
++	priv = devm_kzalloc(ppe_dev->dev, sizeof(*priv), GFP_KERNEL);
++	if (!priv)
++		return -ENOMEM;
++
++	priv->ppe_dev = ppe_dev;
++	ppe_host_pool_init(&priv->host_pool);
++	ppe_nexthop_pool_init(&priv->nexthop_pool);
++	ppe_pub_ip_pool_init(&priv->pub_ip_pool);
++	mutex_init(&priv->lock);
++
++	ret = rhashtable_init(&priv->flow_table, &ppe_offload_flow_ht_params);
++	if (ret)
++		return ret;
++
++	ppe_dev->offload = priv;
++
++	return 0;
++}
++
++/**
++ * ppe_offload_destroy() - Tear down PPE hardware flow-offload state.
++ * @ppe_dev: PPE device.
++ */
++void ppe_offload_destroy(struct ppe_device *ppe_dev)
++{
++	struct ppe_offload_priv *priv = ppe_dev->offload;
++
++	if (!priv)
++		return;
++
++	rhashtable_destroy(&priv->flow_table);
++	ppe_pub_ip_pool_destroy(ppe_dev, &priv->pub_ip_pool);
++	ppe_nexthop_pool_destroy(ppe_dev, &priv->nexthop_pool);
++	ppe_host_pool_destroy(ppe_dev, &priv->host_pool);
++	ppe_dev->offload = NULL;
++}
