@@ -1,0 +1,74 @@
+--- a/drv/ppe_drv/ppe_drv.c
++++ b/drv/ppe_drv/ppe_drv.c
+@@ -1030,7 +1030,7 @@
+  * ppe_drv_remove()
+  *	remove the ppe driver
+  */
+-static int ppe_drv_remove(struct platform_device *pdev)
++static void ppe_drv_remove(struct platform_device *pdev)
+ {
+ 	struct ppe_drv *p = platform_get_drvdata(pdev);
+ 	int i = 0;
+@@ -1165,8 +1165,6 @@
+ 
+ 	ppe_drv_flow_dump_exit();
+ 	ppe_drv_if_map_exit();
+-
+-	return 0;
+ }
+ 
+ /*
+@@ -1317,7 +1315,7 @@
+  * ppe_drv_if_bm_to_offload_handler()
+  *	API to configure the interface bitmask where the offload is enabled
+  */
+-static int ppe_drv_if_bm_to_offload_handler(struct ctl_table *table, int write,
++static int ppe_drv_if_bm_to_offload_handler(const struct ctl_table *table, int write,
+ 		void __user *buffer, size_t *lenp, loff_t *ppos)
+ {
+ 	int ret;
+@@ -1351,7 +1349,7 @@
+  * ppe_drv_disable_port_mtu_check_handler()
+  * 	Set disable port mtu config
+  */
+-static int ppe_drv_disable_port_mtu_check_handler(struct ctl_table *table,
++static int ppe_drv_disable_port_mtu_check_handler(const struct ctl_table *table,
+ 						int write, void __user *buffer,
+ 						size_t *lenp, loff_t *ppos)
+ {
+@@ -1374,7 +1372,7 @@
+  * ppe_drv_eth2eth_offload_if_bitmap_handler()
+  * 	Set eth to eth offload with if bitmap config
+  */
+-static int ppe_drv_eth2eth_offload_if_bitmap_handler(struct ctl_table *table,
++static int ppe_drv_eth2eth_offload_if_bitmap_handler(const struct ctl_table *table,
+ 						int write, void __user *buffer,
+ 						size_t *lenp, loff_t *ppos)
+ {
+@@ -1397,7 +1395,7 @@
+  * ppe_drv_static_dbg_level_handler()
+  *	Set static debug level for ppe-driver.
+  */
+-static int ppe_drv_static_dbg_level_handler(struct ctl_table *table,
++static int ppe_drv_static_dbg_level_handler(const struct ctl_table *table,
+ 					int write, void __user *buffer,
+ 					size_t *lenp, loff_t *ppos)
+ {
+@@ -1442,7 +1440,7 @@
+  * ppe_drv_upstream_dev_handler()
+  *      Set upstream device.
+  */
+-static int ppe_drv_upstream_dev_handler(struct ctl_table *table,
++static int ppe_drv_upstream_dev_handler(const struct ctl_table *table,
+ 		int write, void __user *buffer,
+ 		size_t *lenp, loff_t *ppos)
+ {
+@@ -1530,7 +1528,7 @@
+  * ppe_drv_src2uni_handler()
+  *      Set Source Profile to UNI port mapping.
+  */
+-static int ppe_drv_src2uni_handler(struct ctl_table *table,
++static int ppe_drv_src2uni_handler(const struct ctl_table *table,
+ 		int write, void __user *buffer,
+ 		size_t *lenp, loff_t *ppos)
+ {

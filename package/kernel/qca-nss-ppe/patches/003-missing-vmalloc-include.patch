@@ -1,0 +1,10 @@
+--- a/drv/ppe_drv/ppe_drv.h
++++ b/drv/ppe_drv/ppe_drv.h
+@@ -15,6 +15,7 @@
+  */
+ 
+ #include <linux/module.h>
++#include <linux/vmalloc.h>
+ #include <ppe_drv_public.h>
+ #include <ppe_drv_tun_cmn_ctx.h>
+ #include <ppe_drv_tun_public.h>

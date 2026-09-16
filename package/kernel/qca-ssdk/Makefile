@@ -22,6 +22,19 @@ PKG_LICENSE:=ISC
 
 hal_arch:=ipq53xx
 
+# This package's own build system (MODULE_TYPE=KSLIB) runs its real Kbuild
+# M=... invocation inside a nested temp/ subdirectory, not at PKG_BUILD_DIR
+# top level -- that's where the real modules.order and Module.symvers land.
+# OpenWrt's generic collect_module_symvers hook (include/kernel.mk) defaults
+# PKG_EXTMOD_SUBDIRS to "." and stitches together
+# $(PKG_BUILD_DIR)/$$subdir/Module.symvers; left at the default, it finds
+# nothing there, silently produces an EMPTY qca-ssdk.symvers (0 bytes) even
+# though qca-ssdk.ko itself exports 661 symbols correctly (confirmed via
+# nm) -- so any other kmod depending on kmod-qca-ssdk (qca-nss-ppe) fails
+# at modpost with "undefined!" for every FAL symbol it references, despite
+# them genuinely existing in the built .ko. Point this at temp/ instead.
+PKG_EXTMOD_SUBDIRS:=temp
+
 include $(INCLUDE_DIR)/package.mk
 
 define KernelPackage/qca-ssdk

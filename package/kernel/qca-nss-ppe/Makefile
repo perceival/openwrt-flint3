@@ -49,15 +49,36 @@ define Build/InstallDev
 	$(CP) $(PKG_BUILD_DIR)/drv/exports/* $(1)/usr/include/qca-nss-ppe/
 endef
 
+# EXTRA_CFLAGS is a no-op on this kernel: current Kbuild
+# (scripts/Makefile.build in linux-6.18.39 here) doesn't reference that
+# variable at all (grep finds zero hits) -- it was superseded by
+# ccflags-y (per-Makefile) and KCFLAGS (command-line, still wired in).
+# Same issue and fix as qca-ssdk's Build/Compile. Confirmed: passing
+# these -I paths via EXTRA_CFLAGS= produced "fatal error: fal/fal_rss_hash.h:
+# No such file" even though that header exists in staging_dir; switching
+# to KCFLAGS= fixed it.
 EXTRA_CFLAGS:= \
 	-I$(STAGING_DIR)/usr/include/qca-ssdk \
 	-I$(STAGING_DIR)/usr/include/qca-ssdk/fal \
 	-I$(STAGING_DIR)/usr/include/qca-ssdk/init
 
+# The vendor tree's drv/Makefile only adds ppe_drv/ to obj-m when the
+# ppe-drv make variable is set (drv/Makefile: "ifneq ($(ppe-drv),) obj-m
+# += ppe_drv/"); everything else under drv/ and clients/ is similarly
+# opt-in per feature (ppe-qdisc, ppe-vp, bridge-mgr, vlan-mgr, etc.) and
+# stays off since we don't set those flags. Without ppe-drv=y this builds
+# nothing at all (confirmed: an M=... modules build with it unset produces
+# an empty modules.order). Matches GL.iNet's own MAKE_OPTS+=ppe-drv=y.
+MAKE_OPTS:=ppe-drv=y
+
+# Same missing-prototype vendor code quality issue as qca-ssdk (dozens of
+# non-static functions with no prior declaration, harmless under normal
+# kernels but fatal here since CONFIG_KERNEL_WERROR=y). Suppressed the
+# same way rather than hand-writing prototypes for vendor internals.
 define Build/Compile
-	$(KERNEL_MAKE) \
+	$(KERNEL_MAKE) $(strip $(MAKE_OPTS)) \
 		M="$(PKG_BUILD_DIR)" \
-		EXTRA_CFLAGS="$(EXTRA_CFLAGS)" \
+		KCFLAGS="$(EXTRA_CFLAGS) -Wno-error=missing-prototypes -Wno-error=missing-declarations" \
 		SoC="ipq53xx" \
 		modules
 endef
