@@ -1,0 +1,100 @@
+From: Kamil Bienkiewicz <perceivalpercy@gmail.com>
+Subject: [PATCH] net: ethernet: qualcomm: Fix out-of-bounds frag access
+ in Tx completion
+
+Root-caused two live kernel panics hit tonight under sustained router
+load (both "Unable to handle kernel paging request" with a
+garbage-looking fault address, one during __netdev_alloc_skb() in the
+RX NAPI path, one directly in edma_tx_complete() during the TX NAPI
+path -- captured via pstore, symbolized precisely against this exact
+build with scripts/faddr2line, not guessed at). Both point to the
+same root cause, unrelated to the PPE hardware offload work landing
+alongside this patch: edma_tx_complete()'s scatter-gather unmap path.
+
+frag_index is derived from EDMA_TXCOMP_POOL_ID_GET(txcmpl) -- a value
+read back from the hardware's own Tx completion descriptor -- and used
+directly to index skb_shinfo(skb)->frags[] with no check that it
+actually falls within that skb's own nr_frags at completion time.
+There's a WARN_ON_ONCE(nr_frags > MAX_SKB_FRAGS) elsewhere in this
+file, but that only validates the skb's own nr_frags at *submission*
+time; nothing validates the hardware-reported value against it at
+*completion* time. If a completion descriptor is ever stale or
+mismatched with the skb it's paired with -- plausible under the kind
+of sustained multi-stream load this was found under -- this reads an
+out-of-bounds skb_frag_t and hands its garbage contents to
+virt_to_phys() and dma_unmap_page() as if it were a real mapped page,
+corrupting or directly crashing on whatever that garbage "physical
+address" happens to be.
+
+Add the missing bounds check: on mismatch, count it (new
+invalid_frag_index stat, matching this function's existing
+invalid_buffer/errors/desc_with_more_bit counters) and log it
+ratelimited, but skip the unsafe dma_unmap_page() call rather than
+follow a pointer we can't trust. The skb is still freed either way
+(dev_kfree_skb() a few lines below, unconditionally) -- this only
+skips the one unsafe unmap, accepting a rare leaked DMA mapping on the
+anomaly path in exchange for not crashing on it.
+
+Boot-tested and load-tested on ap2 (repeated single-stream and up to
+8-way parallel iperf3 at ~1.8-1.9 Gbit/s) prior to this fix, where it
+reproduced twice; verification that this specific fix prevents
+recurrence has not yet been completed as of this commit.
+
+Signed-off-by: Kamil Bienkiewicz <perceivalpercy@gmail.com>
+---
+--- a/drivers/net/ethernet/qualcomm/ppe/edma_tx.h
++++ b/drivers/net/ethernet/qualcomm/ppe/edma_tx.h
+@@ -158,6 +158,8 @@
+  * @errors: Other Tx complete descriptor errors indicated by the hardware.
+  * @desc_with_more_bit: Packet's segment transmit count.
+  * @no_pending_desc: No descriptor is pending for processing.
++ * @invalid_frag_index: Hardware-reported fragment pool ID didn't fit within
++ * the skb's own nr_frags at completion time.
+  * @syncp: Synchronization pointer.
+  */
+ struct edma_txcmpl_stats {
+@@ -165,6 +167,7 @@
+ 	u64 errors;
+ 	u64 desc_with_more_bit;
+ 	u64 no_pending_desc;
++	u64 invalid_frag_index;
+ 	struct u64_stats_sync syncp;
+ };
+ 
+--- a/drivers/net/ethernet/qualcomm/ppe/edma_tx.c
++++ b/drivers/net/ethernet/qualcomm/ppe/edma_tx.c
+@@ -173,10 +173,31 @@
+ 						 skb_headlen(skb), DMA_TO_DEVICE);
+ 			} else {
+ 				u8 frag_index = (EDMA_TXCOMP_POOL_ID_GET(txcmpl) - 1);
+-				skb_frag_t *frag = &skb_shinfo(skb)->frags[frag_index];
+ 
+-				dma_unmap_page(dev, virt_to_phys(frag),
+-					       PAGE_SIZE, DMA_TO_DEVICE);
++				/* frag_index comes from the hardware's own
++				 * completion descriptor, not from the skb's
++				 * software state -- if a completion is ever
++				 * stale or mismatched with its skb, indexing
++				 * frags[] without this check reads an
++				 * out-of-bounds skb_frag_t and hands its
++				 * garbage contents to virt_to_phys() and
++				 * dma_unmap_page() as if it were a real page.
++				 */
++				if (unlikely(frag_index >= skb_shinfo(skb)->nr_frags)) {
++					if (net_ratelimit())
++						dev_warn(dev, "Invalid frag_index:%u nr_frags:%u cons_idx:%u prod_idx:%u\n",
++							 frag_index, skb_shinfo(skb)->nr_frags,
++							 cons_idx, prod_idx);
++
++					u64_stats_update_begin(&txcmpl_stats->syncp);
++					++txcmpl_stats->invalid_frag_index;
++					u64_stats_update_end(&txcmpl_stats->syncp);
++				} else {
++					skb_frag_t *frag = &skb_shinfo(skb)->frags[frag_index];
++
++					dma_unmap_page(dev, virt_to_phys(frag),
++						       PAGE_SIZE, DMA_TO_DEVICE);
++				}
+ 			}
+ 
+ 			dev_dbg(dev, "TXCMPL: skb:%pK, skb->len %d, skb->data_len %d, cons_idx:%d prod_idx:%d word2:0x%x word3:0x%x\n",
