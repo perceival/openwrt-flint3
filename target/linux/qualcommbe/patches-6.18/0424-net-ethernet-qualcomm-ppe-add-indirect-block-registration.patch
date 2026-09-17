@@ -1,0 +1,371 @@
+From: Kamil Bienkiewicz <perceivalpercy@gmail.com>
+Subject: [PATCH] net: ethernet: qualcomm: ppe: add indirect TC block
+ registration
+
+Continuation of the PPE hardware flow-offload port -- see
+project_flint3_ppe_hw_offload_research.md for the full architectural
+context. Live-hardware debugging of 0422's SNAT-outbound path (with
+0423's NETIF_F_HW_TC enabled) found that the direct block on "wan"
+never actually receives the outbound direction of a masqueraded
+connection at all -- nftables evaluates flow-offload eligibility at
+whichever device a flow *ingresses* on, not where it's redirected to.
+Outbound LAN->WAN traffic ingresses on the LAN bridge (br-lan), which
+has no .ndo_setup_tc of its own (same as VLAN devices), so it was
+never being offered to us; only the reply direction (ingressing on
+"wan", redirecting to "br-lan") ever reached ppe_offload_flow_replace(),
+which correctly declines it as DNAT. Confirmed via temporary
+diagnostic logging on live hardware before writing this fix, not
+guessed at.
+
+Adds indirect block registration (flow_indr_dev_register(), the same
+mechanism used by bnxt_tc.c/ice_main.c/mlx5's rep/tc/nfp's flower/
+sfc's tc for devices with no native .ndo_setup_tc -- no consumer
+router driver uses it, MTK's reference template included, so this has
+no existing template to adapt, only the datacenter/SR-IOV drivers'
+shape to follow) for bridge masters and VLAN devices. Deliberately
+does not duplicate any flow-parsing logic: the existing
+ppe_offload_flow_replace() already decides purely from the flow's own
+FLOW_ACTION_REDIRECT target via edma_port_is_edma_netdev(), never from
+which device offered the block, so the indirect path reuses
+ppe_offload_flow_cmd() unchanged -- it's purely a second way to reach
+the same dispatch.
+
+Also includes temporary diagnostic logging (pr_info_ratelimited at
+every decline point and on success) added earlier in the same
+debugging session, used to find the ingress-side gap above and not
+yet stripped back out -- noted here rather than silently left in;
+follow-up work should split it into its own removal once the
+indirect-block path is validated on hardware.
+
+Compile-tested; boots cleanly on ap2 and survived repeated heavy
+iperf3 load (single-stream and up to 8-way parallel, ~1.8-1.9 Gbit/s
+sustained) with no crash. Whether flows via br-lan's new indirect
+block are now actually accepted and programmed into hardware is
+still being validated as of this commit -- see memory for the
+in-progress state.
+
+Signed-off-by: Kamil Bienkiewicz <perceivalpercy@gmail.com>
+---
+--- a/drivers/net/ethernet/qualcomm/ppe/ppe_offload.c
++++ b/drivers/net/ethernet/qualcomm/ppe/ppe_offload.c
+@@ -58,6 +58,7 @@
+ #include <linux/errno.h>
+ #include <linux/etherdevice.h>
+ #include <linux/if_ether.h>
++#include <linux/if_vlan.h>
+ #include <linux/in.h>
+ #include <linux/ip.h>
+ #include <linux/list.h>
+@@ -190,6 +191,13 @@
+ 	return 0;
+ }
+ 
++/* Temporary diagnostic instrumentation: logs exactly which check declined a
++ * real flow, ratelimited. Not intended to stay -- see
++ * project_flint3_ppe_hw_offload_research.md, "silent decline" debugging.
++ */
++#define ppe_offload_decline(fmt, ...) \
++	({ pr_info_ratelimited("ppe_offload: declined - " fmt "\n", ##__VA_ARGS__); -EOPNOTSUPP; })
++
+ static int ppe_offload_flow_replace(struct net_device *netdev,
+ 				     struct ppe_offload_priv *priv,
+ 				     struct flow_cls_offload *cls)
+@@ -218,7 +226,11 @@
+ 	    !flow_rule_match_key(rule, FLOW_DISSECTOR_KEY_BASIC) ||
+ 	    !flow_rule_match_key(rule, FLOW_DISSECTOR_KEY_IPV4_ADDRS) ||
+ 	    !flow_rule_match_key(rule, FLOW_DISSECTOR_KEY_PORTS))
+-		return -EOPNOTSUPP;
++		return ppe_offload_decline("missing dissector key (control=%d basic=%d ipv4=%d ports=%d)",
++					    flow_rule_match_key(rule, FLOW_DISSECTOR_KEY_CONTROL),
++					    flow_rule_match_key(rule, FLOW_DISSECTOR_KEY_BASIC),
++					    flow_rule_match_key(rule, FLOW_DISSECTOR_KEY_IPV4_ADDRS),
++					    flow_rule_match_key(rule, FLOW_DISSECTOR_KEY_PORTS));
+ 
+ 	{
+ 		struct flow_match_control ctrl;
+@@ -228,7 +240,7 @@
+ 
+ 		flow_rule_match_control(rule, &ctrl);
+ 		if (ctrl.key->addr_type != FLOW_DISSECTOR_KEY_IPV4_ADDRS)
+-			return -EOPNOTSUPP;
++			return ppe_offload_decline("addr_type=%d not ipv4", ctrl.key->addr_type);
+ 
+ 		flow_rule_match_basic(rule, &basic);
+ 		switch (basic.key->ip_proto) {
+@@ -242,7 +254,7 @@
+ 			ip_proto = PPE_FLOW_PROTO_UDPLITE;
+ 			break;
+ 		default:
+-			return -EOPNOTSUPP;
++			return ppe_offload_decline("ip_proto=%d unsupported", basic.key->ip_proto);
+ 		}
+ 
+ 		flow_rule_match_ipv4_addrs(rule, &ip4);
+@@ -274,16 +286,19 @@
+ 				else if (act->mangle.offset == offsetof(struct iphdr, daddr))
+ 					new_dst = ppe_offload_apply_ip4_mangle(new_dst, act);
+ 				else
+-					return -EOPNOTSUPP;
++					return ppe_offload_decline("ip4 mangle offset=%u unsupported",
++								    act->mangle.offset);
+ 				break;
+ 			case FLOW_ACT_MANGLE_HDR_TYPE_TCP:
+ 			case FLOW_ACT_MANGLE_HDR_TYPE_UDP:
+ 				ret = ppe_offload_apply_l4_mangle(&l4, act);
+ 				if (ret)
+-					return ret;
++					return ppe_offload_decline("l4 mangle offset=%u unsupported",
++								    act->mangle.offset);
+ 				break;
+ 			default:
+-				return -EOPNOTSUPP;
++				return ppe_offload_decline("mangle htype=%d unsupported",
++							    act->mangle.htype);
+ 			}
+ 			break;
+ 		case FLOW_ACTION_REDIRECT:
+@@ -293,22 +308,23 @@
+ 			/* Hardware recomputes checksums on rewrite. */
+ 			break;
+ 		default:
+-			return -EOPNOTSUPP;
++			return ppe_offload_decline("action id=%d unsupported", act->id);
+ 		}
+ 	}
+ 
+ 	if (!odev || !eth.seen)
+-		return -EOPNOTSUPP;
++		return ppe_offload_decline("odev=%d eth.seen=%d", !!odev, eth.seen);
+ 
+ 	if (!edma_port_is_edma_netdev(odev))
+-		return -EOPNOTSUPP;
++		return ppe_offload_decline("odev=%s not an edma netdev", netdev_name(odev));
+ 
+ 	/* SNAT only: source changed, destination didn't. Declines the
+ 	 * DNAT/reply direction and anything that changes both or
+ 	 * neither -- see the file comment.
+ 	 */
+ 	if (new_src == match_src || new_dst != match_dst)
+-		return -EOPNOTSUPP;
++		return ppe_offload_decline("not snat-outbound (src %pI4->%pI4, dst %pI4->%pI4)",
++					    &match_src, &new_src, &match_dst, &new_dst);
+ 
+ 	/* eth.bytes is {h_dest[6], h_source[6]}. The new source half
+ 	 * must be this egress port's own MAC -- if it isn't, either
+@@ -317,7 +333,8 @@
+ 	 * with the wrong source MAC either way is worse than declining.
+ 	 */
+ 	if (!ether_addr_equal(eth.bytes + ETH_ALEN, odev->dev_addr))
+-		return -EOPNOTSUPP;
++		return ppe_offload_decline("eth mangle src %pM != odev mac %pM",
++					    eth.bytes + ETH_ALEN, odev->dev_addr);
+ 
+ 	port_priv = netdev_priv(odev);
+ 
+@@ -404,6 +421,10 @@
+ 
+ 	mutex_unlock(&priv->lock);
+ 
++	pr_info_ratelimited("ppe_offload: accepted flow_index=%u host_index=%u nexthop_index=%u pub_ip_index=%u src=%pI4->%pI4 odev=%s\n",
++			     flow_index, host_index, nexthop_index, pub_ip_index,
++			     &match_src, &new_src, netdev_name(odev));
++
+ 	return 0;
+ 
+ free_entry:
+@@ -451,6 +472,9 @@
+ static int ppe_offload_flow_cmd(struct net_device *netdev, struct ppe_offload_priv *priv,
+ 				 struct flow_cls_offload *cls)
+ {
++	pr_info_ratelimited("ppe_offload: flow_cmd netdev=%s command=%d cookie=%lx\n",
++			     netdev_name(netdev), cls->command, cls->cookie);
++
+ 	switch (cls->command) {
+ 	case FLOW_CLS_REPLACE:
+ 		return ppe_offload_flow_replace(netdev, priv, cls);
+@@ -492,6 +516,9 @@
+ {
+ 	struct flow_block_cb *block_cb;
+ 
++	pr_info_ratelimited("ppe_offload: setup_tc_block netdev=%s binder_type=%d command=%d\n",
++			     netdev_name(netdev), f->binder_type, f->command);
++
+ 	if (f->binder_type != FLOW_BLOCK_BINDER_TYPE_CLSACT_INGRESS)
+ 		return -EOPNOTSUPP;
+ 
+@@ -506,12 +533,16 @@
+ 
+ 		block_cb = flow_block_cb_alloc(ppe_offload_setup_tc_block_cb, netdev,
+ 						netdev, NULL);
+-		if (IS_ERR(block_cb))
++		if (IS_ERR(block_cb)) {
++			pr_info_ratelimited("ppe_offload: flow_block_cb_alloc failed: %ld\n",
++					    PTR_ERR(block_cb));
+ 			return PTR_ERR(block_cb);
++		}
+ 
+ 		flow_block_cb_incref(block_cb);
+ 		flow_block_cb_add(block_cb, f);
+ 		list_add_tail(&block_cb->driver_list, &ppe_offload_block_cb_list);
++		pr_info_ratelimited("ppe_offload: block bound on %s\n", netdev_name(netdev));
+ 		return 0;
+ 	case FLOW_BLOCK_UNBIND:
+ 		block_cb = flow_block_cb_lookup(f->block, ppe_offload_setup_tc_block_cb,
+@@ -548,6 +579,135 @@
+ 	}
+ }
+ 
++/* Indirect block registration -- for devices with no .ndo_setup_tc of their
++ * own (bridges, VLANs) that sit between an EDMA netdevice and the flows we
++ * actually want to offload. See the file comment's note on ingress-side
++ * evaluation: a flow is offered to whichever device's block it *ingresses*
++ * on, not where it's redirected to, so a LAN-side flow whose ingress device
++ * is a bridge (e.g. br-lan) is never seen by the direct block above at all
++ * -- only this indirect path can ever surface it. ppe_offload_flow_replace()
++ * itself is already indirect-block-agnostic: it decides purely from the
++ * flow's own FLOW_ACTION_REDIRECT target, not from which device offered the
++ * block, so no new flow-parsing logic is needed here, only a second way to
++ * reach it.
++ *
++ * Filtered to bridge masters and VLAN devices only, rather than accepting
++ * every device system-wide with no native .ndo_setup_tc (tunnels, veth,
++ * wireguard, etc.) -- those can never have one of our own EDMA netdevices
++ * as a lower device, so there's no reason to bind blocks on them.
++ */
++
++struct ppe_offload_indr_priv {
++	struct list_head list;
++	struct net_device *netdev;
++	struct ppe_offload_priv *priv;
++};
++
++static LIST_HEAD(ppe_offload_indr_priv_list);
++
++static struct ppe_offload_indr_priv *ppe_offload_indr_priv_lookup(struct net_device *netdev)
++{
++	struct ppe_offload_indr_priv *indr_priv;
++
++	list_for_each_entry(indr_priv, &ppe_offload_indr_priv_list, list)
++		if (indr_priv->netdev == netdev)
++			return indr_priv;
++
++	return NULL;
++}
++
++static int ppe_offload_indr_setup_block_cb(enum tc_setup_type type, void *type_data,
++					    void *cb_priv)
++{
++	struct ppe_offload_indr_priv *indr_priv = cb_priv;
++
++	switch (type) {
++	case TC_SETUP_CLSFLOWER:
++		return ppe_offload_flow_cmd(indr_priv->netdev, indr_priv->priv, type_data);
++	default:
++		return -EOPNOTSUPP;
++	}
++}
++
++static void ppe_offload_indr_block_unbind(void *cb_priv)
++{
++	struct ppe_offload_indr_priv *indr_priv = cb_priv;
++
++	list_del(&indr_priv->list);
++	kfree(indr_priv);
++}
++
++static int ppe_offload_indr_setup_tc_block(struct net_device *netdev, struct Qdisc *sch,
++					    struct ppe_offload_priv *priv,
++					    struct flow_block_offload *f, void *data,
++					    void (*cleanup)(struct flow_block_cb *block_cb))
++{
++	struct ppe_offload_indr_priv *indr_priv;
++	struct flow_block_cb *block_cb;
++
++	if (!netif_is_bridge_master(netdev) && !is_vlan_dev(netdev))
++		return -EOPNOTSUPP;
++
++	if (f->binder_type != FLOW_BLOCK_BINDER_TYPE_CLSACT_INGRESS)
++		return -EOPNOTSUPP;
++
++	switch (f->command) {
++	case FLOW_BLOCK_BIND:
++		if (ppe_offload_indr_priv_lookup(netdev))
++			return -EEXIST;
++
++		indr_priv = kzalloc(sizeof(*indr_priv), GFP_KERNEL);
++		if (!indr_priv)
++			return -ENOMEM;
++
++		indr_priv->netdev = netdev;
++		indr_priv->priv = priv;
++		list_add(&indr_priv->list, &ppe_offload_indr_priv_list);
++
++		block_cb = flow_indr_block_cb_alloc(ppe_offload_indr_setup_block_cb, indr_priv,
++						     indr_priv, ppe_offload_indr_block_unbind,
++						     f, netdev, sch, data, priv, cleanup);
++		if (IS_ERR(block_cb)) {
++			list_del(&indr_priv->list);
++			kfree(indr_priv);
++			return PTR_ERR(block_cb);
++		}
++
++		flow_block_cb_add(block_cb, f);
++		list_add_tail(&block_cb->driver_list, &ppe_offload_block_cb_list);
++		return 0;
++	case FLOW_BLOCK_UNBIND:
++		indr_priv = ppe_offload_indr_priv_lookup(netdev);
++		if (!indr_priv)
++			return -ENOENT;
++
++		block_cb = flow_block_cb_lookup(f->block, ppe_offload_indr_setup_block_cb,
++						 indr_priv);
++		if (!block_cb)
++			return -ENOENT;
++
++		flow_indr_block_cb_remove(block_cb, f);
++		list_del(&block_cb->driver_list);
++		return 0;
++	default:
++		return -EOPNOTSUPP;
++	}
++}
++
++static int ppe_offload_indr_setup_tc_cb(struct net_device *netdev, struct Qdisc *sch,
++					 void *cb_priv, enum tc_setup_type type,
++					 void *type_data, void *data,
++					 void (*cleanup)(struct flow_block_cb *block_cb))
++{
++	switch (type) {
++	case TC_SETUP_BLOCK:
++		return ppe_offload_indr_setup_tc_block(netdev, sch, cb_priv, type_data,
++							data, cleanup);
++	default:
++		return -EOPNOTSUPP;
++	}
++}
++
+ /**
+  * ppe_offload_init() - Initialize PPE hardware flow-offload state.
+  * @ppe_dev: PPE device.
+@@ -573,6 +733,12 @@
+ 	if (ret)
+ 		return ret;
+ 
++	ret = flow_indr_dev_register(ppe_offload_indr_setup_tc_cb, priv);
++	if (ret) {
++		rhashtable_destroy(&priv->flow_table);
++		return ret;
++	}
++
+ 	ppe_dev->offload = priv;
+ 
+ 	return 0;
+@@ -589,6 +755,8 @@
+ 	if (!priv)
+ 		return;
+ 
++	flow_indr_dev_unregister(ppe_offload_indr_setup_tc_cb, priv,
++				  ppe_offload_indr_block_unbind);
+ 	rhashtable_destroy(&priv->flow_table);
+ 	ppe_pub_ip_pool_destroy(ppe_dev, &priv->pub_ip_pool);
+ 	ppe_nexthop_pool_destroy(ppe_dev, &priv->nexthop_pool);
