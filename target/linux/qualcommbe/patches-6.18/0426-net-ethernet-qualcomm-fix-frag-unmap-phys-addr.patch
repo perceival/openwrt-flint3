@@ -1,0 +1,91 @@
+From: Kamil Bienkiewicz <perceivalpercy@gmail.com>
+Subject: [PATCH] net: ethernet: qualcomm: Fix wrong physical address in
+ Tx frag unmap
+
+The three places in this file that unmap a Tx fragment's DMA mapping
+all compute the address to unmap as virt_to_phys(frag), where frag is
+a pointer to the skb_frag_t descriptor inside skb_shinfo(skb)->frags[]
+-- kernel metadata describing the fragment, not the fragment's actual
+page. The page was mapped at submission time with
+skb_frag_dma_map(dev, frag, ...), which maps skb_frag_page(frag) (plus
+its offset), an entirely different piece of memory than the
+skb_frag_t struct itself. dma_unmap_page() has therefore always been
+called with the wrong physical address for every scatter-gather
+(TSO/GSO) Tx completion and every Tx DMA-mapping-failure cleanup path,
+not just on the out-of-bounds frag_index values the previous patch
+guards against.
+
+This is not inert on this hardware. The qcom,ipq5332-ppe /
+ethernet-dma devicetree node has no "dma-coherent" property, so the
+kernel treats this device as non-coherent DMA. On the generic
+dma-direct path, dma_unmap_page() on a non-coherent device calls
+arch_sync_dma_for_cpu() regardless of direction, which performs a real
+cache-maintenance operation (inval/clean) over [addr, addr+size) of
+whatever physical address it's given. With the wrong address, that's a
+PAGE_SIZE-aligned window of unrelated live memory -- exactly the kind
+of load-dependent, garbage-fault-address corruption behind tonight's
+two panics. The previous patch's bounds check (frag_index vs
+nr_frags) is still correct and worth keeping, but it only prevents an
+out-of-bounds *array read*; every in-bounds, perfectly normal
+multi-fragment Tx completion was already hitting this same wrong-
+address unmap before that patch and still does after it.
+
+Fix all three sites to unmap virt_to_phys(skb_frag_address(frag))
+instead of virt_to_phys(frag) -- skb_frag_address() resolves to the
+fragment's actual page + offset, mirroring the existing
+virt_to_phys(skb->data) pattern already used correctly elsewhere in
+this file for the non-fragment (head) buffer. Also fix the unmap
+length at each site from a hardcoded PAGE_SIZE to the fragment's own
+skb_frag_size(frag)/buf_len, matching what was actually mapped;
+unmapping a full page when only part of it was the DMA buffer risked
+invalidating cached, not-yet-flushed CPU writes to whatever else
+shared that page.
+
+Compile-tested (clean module build). Not yet re-verified under load on
+hardware as of this commit.
+
+Signed-off-by: Kamil Bienkiewicz <perceivalpercy@gmail.com>
+---
+--- a/drivers/net/ethernet/qualcomm/ppe/edma_tx.c
++++ b/drivers/net/ethernet/qualcomm/ppe/edma_tx.c
+@@ -195,8 +195,18 @@
+ 				} else {
+ 					skb_frag_t *frag = &skb_shinfo(skb)->frags[frag_index];
+ 
+-					dma_unmap_page(dev, virt_to_phys(frag),
+-						       PAGE_SIZE, DMA_TO_DEVICE);
++					/* virt_to_phys(frag) is the address of the
++					 * skb_frag_t descriptor itself (skb_shinfo
++					 * metadata), not of the page it describes --
++					 * that page was mapped via skb_frag_dma_map()
++					 * at submission time. Unmapping the wrong
++					 * address triggers cache maintenance on
++					 * unrelated memory on this non-dma-coherent
++					 * device, corrupting whatever happens to sit
++					 * in that PAGE_SIZE window.
++					 */
++					dma_unmap_page(dev, virt_to_phys(skb_frag_address(frag)),
++						       skb_frag_size(frag), DMA_TO_DEVICE);
+ 				}
+ 			}
+ 
+@@ -342,7 +352,7 @@
+ 		if (unlikely(buf_len == 0))
+ 			continue;
+ 
+-		dma_unmap_page(dev, virt_to_phys(frag), PAGE_SIZE,
++		dma_unmap_page(dev, virt_to_phys(skb_frag_address(frag)), buf_len,
+ 			       DMA_TO_DEVICE);
+ 	}
+ }
+@@ -531,8 +541,8 @@
+ 			if (unlikely(skb_frag_size(frag) == 0))
+ 				continue;
+ 
+-			dma_unmap_page(dev, virt_to_phys(frag),
+-				       PAGE_SIZE, DMA_TO_DEVICE);
++			dma_unmap_page(dev, virt_to_phys(skb_frag_address(frag)),
++				       skb_frag_size(frag), DMA_TO_DEVICE);
+ 			cnt_sg_frag_list += 1;
+ 			if (cnt_sg_frag_list == num_sg_frag_list)
+ 				return;
