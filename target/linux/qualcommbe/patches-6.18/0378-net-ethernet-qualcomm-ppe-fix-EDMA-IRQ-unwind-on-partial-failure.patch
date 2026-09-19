@@ -1,0 +1,121 @@
+From: Francois Guerraz <kubrick@fgv6.net>
+Subject: [PATCH] net: ethernet: qualcomm: ppe: fix EDMA IRQ unwind on partial
+ failure
+
+When request_irq() fails for a Tx completion ring or an Rx descriptor
+ring other than the first, the unwind frees the names of the rings
+requested so far but leaves their interrupts registered, with handlers
+whose dev_id points into edma_ctx and whose names are freed memory. A
+failure to allocate an Rx ring name also skips freeing the names and
+interrupts of the earlier Rx rings. The probe then fails and edma_ctx is
+freed, so a later interrupt on one of those lines is a use after free.
+
+Count the interrupts requested for each ring type and free exactly those
+on failure, then the names, which kzalloc'd arrays make safe to free
+unconditionally.
+
+Signed-off-by: Francois Guerraz <kubrick@fgv6.net>
+---
+--- a/drivers/net/ethernet/qualcomm/ppe/edma.c
++++ b/drivers/net/ethernet/qualcomm/ppe/edma.c
+@@ -407,8 +407,8 @@
+ 	struct ppe_device *ppe_dev = edma_ctx->ppe_dev;
+ 	struct edma_ring_info *rx = hw_info->rx;
+ 	struct device *dev = ppe_dev->dev;
++	u32 i, txcmpl_irqs = 0, rx_irqs = 0;
+ 	int ret;
+-	u32 i;
+ 
+ 	/* Request IRQ for TXCMPL rings. */
+ 	edma_txcmpl_irq_name = kzalloc((sizeof(char *) * txcmpl->num_rings), GFP_KERNEL);
+@@ -420,7 +420,7 @@
+ 						  GFP_KERNEL);
+ 		if (!edma_txcmpl_irq_name[i]) {
+ 			ret = -ENOMEM;
+-			goto txcmpl_ring_irq_name_alloc_fail;
++			goto txcmpl_irq_fail;
+ 		}
+ 
+ 		snprintf(edma_txcmpl_irq_name[i], EDMA_IRQ_NAME_SIZE, "txcmpl_%d",
+@@ -435,8 +435,9 @@
+ 		if (ret) {
+ 			pr_err("TXCMPL ring IRQ:%d request %d failed\n",
+ 			       edma_ctx->intr_info.intr_txcmpl[i], i);
+-			goto txcmpl_ring_intr_req_fail;
++			goto txcmpl_irq_fail;
+ 		}
++		txcmpl_irqs++;
+ 
+ 		pr_debug("TXCMPL ring: %d IRQ:%d request success: %s\n",
+ 			 txcmpl->ring_start + i,
+@@ -449,7 +450,7 @@
+ 				       GFP_KERNEL);
+ 	if (!edma_rxdesc_irq_name) {
+ 		ret = -ENOMEM;
+-		goto rxdesc_irq_name_alloc_fail;
++		goto txcmpl_irq_fail;
+ 	}
+ 
+ 	for (i = 0; i < rx->num_rings; i++) {
+@@ -457,7 +458,7 @@
+ 						  GFP_KERNEL);
+ 		if (!edma_rxdesc_irq_name[i]) {
+ 			ret = -ENOMEM;
+-			goto rxdesc_ring_irq_name_alloc_fail;
++			goto rx_irq_fail;
+ 		}
+ 
+ 		snprintf(edma_rxdesc_irq_name[i], 20, "rxdesc_%d",
+@@ -472,8 +473,9 @@
+ 		if (ret) {
+ 			pr_err("RXDESC ring IRQ:%d request failed\n",
+ 			       edma_ctx->intr_info.intr_rx[i]);
+-			goto rx_desc_ring_intr_req_fail;
++			goto rx_irq_fail;
+ 		}
++		rx_irqs++;
+ 
+ 		pr_debug("RXDESC ring: %d IRQ:%d request success: %s\n",
+ 			 rx->ring_start + i,
+@@ -488,33 +490,31 @@
+ 	if (ret) {
+ 		pr_err("MISC IRQ:%d request failed\n",
+ 		       edma_ctx->intr_info.intr_misc);
+-		goto misc_intr_req_fail;
++		goto rx_irq_fail;
+ 	}
+ 
+ 	return 0;
+ 
+-misc_intr_req_fail:
+-	/* Free IRQ for RXDESC rings */
+-	for (i = 0; i < rx->num_rings; i++) {
++rx_irq_fail:
++	/* Free the IRQs of the RXDESC rings requested so far, then all the
++	 * names (kfree() ignores the NULL ones).
++	 */
++	for (i = 0; i < rx_irqs; i++) {
+ 		synchronize_irq(edma_ctx->intr_info.intr_rx[i]);
+ 		free_irq(edma_ctx->intr_info.intr_rx[i],
+ 			 (void *)&edma_ctx->rx_rings[i]);
+ 	}
+-rx_desc_ring_intr_req_fail:
+ 	for (i = 0; i < rx->num_rings; i++)
+ 		kfree(edma_rxdesc_irq_name[i]);
+-rxdesc_ring_irq_name_alloc_fail:
+ 	kfree(edma_rxdesc_irq_name);
+-rxdesc_irq_name_alloc_fail:
+-	for (i = 0; i < txcmpl->num_rings; i++) {
++txcmpl_irq_fail:
++	for (i = 0; i < txcmpl_irqs; i++) {
+ 		synchronize_irq(edma_ctx->intr_info.intr_txcmpl[i]);
+ 		free_irq(edma_ctx->intr_info.intr_txcmpl[i],
+ 			 (void *)&edma_ctx->txcmpl_rings[i]);
+ 	}
+-txcmpl_ring_intr_req_fail:
+ 	for (i = 0; i < txcmpl->num_rings; i++)
+ 		kfree(edma_txcmpl_irq_name[i]);
+-txcmpl_ring_irq_name_alloc_fail:
+ 	kfree(edma_txcmpl_irq_name);
+ 
+ 	return ret;

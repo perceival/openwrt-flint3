@@ -1,0 +1,166 @@
+From: Francois Guerraz <kubrick@fgv6.net>
+Subject: [PATCH] net: ethernet: qualcomm: ppe: use IPQ5332 scheduler tables
+
+The PPE driver programs the BM (TDM) and QM scheduler tables of the
+IPQ9574 on every SoC. The IPQ5332 has three PPE ports, not eight, and
+with the IPQ9574 table its port 2 (the 2.5G WAN on the GL-BE9300) gets
+only 2 of the 100 TDM slots, 2 of the 50 ingress slots.
+
+On a GL-BE9300 this shows as ingress drops on PPE port 2 that are counted
+one-for-one as XGMAC rx_fifo_overflow, with the BM and QM drop counters at
+zero and the CPUs idle: a router-local download over the 2.5G WAN reached
+124 Mbit/s with about a fifth of the frames lost, and forwarding topped
+out near 1.9 Gbit/s with the same counter climbing. The XGMAC has a 1 KB
+RX FIFO in cut-through mode, so it depends on the PPE draining it without
+gaps. The stock firmware, which uses the vendor MPPE tables, shows zero
+overflows at 2.2 Gbit/s on the same unit. A share of 2 slots in 100 is
+consistent with an ingress ceiling around 2 Gbit/s if a slot moves 64
+bytes per PPE clock at 200 MHz; that model is an estimate, the drop
+location and the vendor table are what is established.
+
+Install the vendor SSDK MPPE tables (ppe_port_tdm0_tbl, depth 32, and
+ppe_port_scheduler0_tbl, depth 10) when the PPE is an IPQ5332. The
+values are copied from the public qca-ssdk source, src/init/ssdk_appe.c,
+and match the tables in the shipped GL.iNet 4.10.0 qca-ssdk.ko entry for
+entry. Add a small helper to detect the IPQ5332 PPE for the following
+changes.
+
+Signed-off-by: Francois Guerraz <kubrick@fgv6.net>
+---
+--- a/drivers/net/ethernet/qualcomm/ppe/ppe.h
++++ b/drivers/net/ethernet/qualcomm/ppe/ppe.h
+@@ -7,7 +7,9 @@
+ #define __PPE_H__
+ 
+ #include <linux/compiler.h>
++#include <linux/device.h>
+ #include <linux/interconnect.h>
++#include <linux/of.h>
+ 
+ struct device;
+ struct regmap;
+@@ -40,4 +42,13 @@
+ 	unsigned int num_icc_paths;
+ 	struct icc_bulk_data icc_paths[] __counted_by(num_icc_paths);
+ };
++
++/* The IPQ5332 PPE has three ports (CPU, port 1 and port 2) and a smaller
++ * buffer budget than the IPQ9574; several configuration tables depend on it.
++ */
++static inline bool ppe_is_ipq5332(const struct ppe_device *ppe_dev)
++{
++	return of_device_is_compatible(ppe_dev->dev->of_node,
++				       "qcom,ipq5332-ppe");
++}
+ #endif
+--- a/drivers/net/ethernet/qualcomm/ppe/ppe_config.c
++++ b/drivers/net/ethernet/qualcomm/ppe/ppe_config.c
+@@ -372,6 +372,49 @@
+ 	{true, PPE_SCH_EGRESS,  7, false, 0},
+ };
+ 
++/* BM scheduler (TDM) slots for the IPQ5332 PPE, which has three ports:
++ * 0 (CPU/EDMA), 1 and 2 (10G to the switch and 2.5G WAN on the GL-BE9300).
++ * Copied verbatim from the vendor SSDK MPPE table ppe_port_tdm0_tbl,
++ * depth 32 including the trailing invalid entry. With the IPQ9574 table
++ * above, port 2 receives only 2 of the 100 TDM slots (2 of the 50 ingress
++ * slots); on a GL-BE9300 that correlates with PPE port 2 ingress drops
++ * counted as XGMAC rx_fifo_overflow, from a few hundred Mbit/s up.
++ */
++static const struct ppe_scheduler_bm_config ipq5332_ppe_sch_bm_config[] = {
++	{true, PPE_SCH_INGRESS, 2, false, 0},
++	{true, PPE_SCH_EGRESS,  0, false, 0},
++	{true, PPE_SCH_INGRESS, 1, false, 0},
++	{true, PPE_SCH_EGRESS,  1, false, 0},
++	{true, PPE_SCH_INGRESS, 2, false, 0},
++	{true, PPE_SCH_EGRESS,  2, false, 0},
++	{true, PPE_SCH_INGRESS, 0, false, 0},
++	{true, PPE_SCH_EGRESS,  0, false, 0},
++	{true, PPE_SCH_INGRESS, 2, false, 0},
++	{true, PPE_SCH_EGRESS,  1, false, 0},
++	{true, PPE_SCH_INGRESS, 1, false, 0},
++	{true, PPE_SCH_EGRESS,  2, false, 0},
++	{true, PPE_SCH_INGRESS, 0, false, 0},
++	{true, PPE_SCH_EGRESS,  0, false, 0},
++	{true, PPE_SCH_INGRESS, 1, false, 0},
++	{true, PPE_SCH_EGRESS,  1, false, 0},
++	{true, PPE_SCH_INGRESS, 2, false, 0},
++	{true, PPE_SCH_EGRESS,  2, false, 0},
++	{true, PPE_SCH_INGRESS, 1, false, 0},
++	{true, PPE_SCH_EGRESS,  0, false, 0},
++	{true, PPE_SCH_INGRESS, 2, false, 0},
++	{true, PPE_SCH_EGRESS,  1, false, 0},
++	{true, PPE_SCH_INGRESS, 0, false, 0},
++	{true, PPE_SCH_EGRESS,  2, false, 0},
++	{true, PPE_SCH_INGRESS, 2, false, 0},
++	{true, PPE_SCH_EGRESS,  0, false, 0},
++	{true, PPE_SCH_INGRESS, 1, false, 0},
++	{true, PPE_SCH_EGRESS,  1, false, 0},
++	{true, PPE_SCH_INGRESS, 0, false, 0},
++	{true, PPE_SCH_EGRESS,  2, false, 0},
++	{true, PPE_SCH_INGRESS, 1, false, 0},
++	{false, PPE_SCH_INGRESS, 0, false, 0},
++};
++
+ /* PPE scheduler configuration for QM includes multiple entries. Each entry
+  * contains ports to be dispatched for enqueueing and dequeueing. The backup
+  * port for dequeueing is supported to be used when the primary port for
+@@ -439,6 +482,22 @@
+ 	{0x98, 6, 5, true, 2},
+ };
+ 
++/* QM scheduler slots for the IPQ5332 PPE, from the vendor SSDK MPPE table
++ * ppe_port_scheduler0_tbl (depth 10).
++ */
++static const struct ppe_scheduler_qm_config ipq5332_ppe_sch_qm_config[] = {
++	{0x0, 2, 0, false, 0},
++	{0x0, 1, 2, false, 0},
++	{0x0, 0, 1, false, 0},
++	{0x0, 0, 2, false, 0},
++	{0x0, 1, 0, false, 0},
++	{0x0, 2, 1, false, 0},
++	{0x0, 0, 2, false, 0},
++	{0x0, 0, 1, false, 0},
++	{0x0, 0, 2, false, 0},
++	{0x0, 0, 1, false, 0},
++};
++
+ static const struct ppe_scheduler_port_config ppe_port_sch_config[] = {
+ 	{
+ 		.port		= 0,
+@@ -1743,11 +1802,17 @@
+ 	const struct ppe_scheduler_port_config *port_cfg;
+ 	const struct ppe_scheduler_qm_config *qm_cfg;
+ 	const struct ppe_scheduler_bm_config *bm_cfg;
++	bool is_ipq5332 = ppe_is_ipq5332(ppe_dev);
+ 	int ret, i, count;
+ 	u32 val, reg;
+ 
+-	count = ARRAY_SIZE(ipq9574_ppe_sch_bm_config);
+-	bm_cfg = ipq9574_ppe_sch_bm_config;
++	if (is_ipq5332) {
++		count = ARRAY_SIZE(ipq5332_ppe_sch_bm_config);
++		bm_cfg = ipq5332_ppe_sch_bm_config;
++	} else {
++		count = ARRAY_SIZE(ipq9574_ppe_sch_bm_config);
++		bm_cfg = ipq9574_ppe_sch_bm_config;
++	}
+ 
+ 	/* Configure the depth of BM scheduler entries. */
+ 	val = FIELD_PREP(PPE_BM_SCH_CTRL_SCH_DEPTH, count);
+@@ -1777,8 +1842,13 @@
+ 			goto sch_config_fail;
+ 	}
+ 
+-	count = ARRAY_SIZE(ipq9574_ppe_sch_qm_config);
+-	qm_cfg = ipq9574_ppe_sch_qm_config;
++	if (is_ipq5332) {
++		count = ARRAY_SIZE(ipq5332_ppe_sch_qm_config);
++		qm_cfg = ipq5332_ppe_sch_qm_config;
++	} else {
++		count = ARRAY_SIZE(ipq9574_ppe_sch_qm_config);
++		qm_cfg = ipq9574_ppe_sch_qm_config;
++	}
+ 
+ 	/* Configure the depth of QM scheduler entries. */
+ 	val = FIELD_PREP(PPE_PSCH_SCH_DEPTH_CFG_SCH_DEPTH, count);

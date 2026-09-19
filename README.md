@@ -11,6 +11,14 @@ switch and a **RTL8221B** 2.5G WAN PHY.
 
 Target: **`qualcommbe/ipq53xx`**, kernel **6.18**.
 
+> [!WARNING]
+> **Unofficial, community-maintained port — not affiliated with, endorsed by, or supported
+> by GL.iNet or the OpenWrt project.** Provided **as-is, with no warranty of any kind**.
+> Flashing third-party firmware carries real risk, including bricking the device, and may
+> void your hardware warranty. **Back up your eMMC first** — the ART partition holds your
+> unit's unique radio calibration data and MAC addresses and cannot be recovered from
+> anywhere else. If this router matters to you, test on a spare unit before relying on it.
+
 ## Hardware
 
 | Block | Detail |
@@ -46,7 +54,7 @@ Throughput measured between two units over a 2.5G trunk: **~1.8–1.9 Gbit/s**.
 - **PPE WAN RX FIFO overruns.** Roughly 0.07–0.09 % of packets at ~1.9 Gbit/s.
   No longer the hard ~600 Mbit/s cap earlier builds had, but not zero.
 - **802.11r is incompatible with MLO.** hostapd's FT code has no MLD
-  awareness — do not enable 11r on an MLD SSID. 11k/11v are fine.
+  awareness — do not enable 11r on an MLO SSID. 11k/11v are fine.
 
 ## Building
 
@@ -62,6 +70,21 @@ make -j"$(nproc)"
 ```
 
 Images land in `bin/targets/qualcommbe/ipq53xx/`.
+
+### Don't want to build from source?
+
+Pre-built reference images are published periodically on the
+**[Releases page](https://github.com/perceival/openwrt-flint3/releases)**, in three flavours:
+
+- **`vanilla`** — the exact, unmodified default this tree produces with zero customization
+  (no LuCI, `wpad-basic-mbedtls`) — what you'd get building it yourself with no changes
+- **`ap`** — full config (LuCI, tri-band MLO) plus the FT-over-MLO roaming series; what the
+  maintainer's own household runs
+- **`router`** — gateway role: LuCI, software nftables flowtable offload (not silicon-level
+  hardware NAT acceleration — see [issue #1](https://github.com/perceival/openwrt-flint3/issues/1)),
+  WireGuard, unbound, chrony, mDNS reflection
+
+See the disclaimer above before flashing any of them.
 
 ## Installing
 

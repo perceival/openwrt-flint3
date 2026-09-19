@@ -1,0 +1,43 @@
+From: Francois Guerraz <kubrick@fgv6.net>
+Subject: [PATCH] net: ethernet: qualcomm: ppe: fix multicast queue AC table
+ access
+
+The multicast admission-control table has one 16-byte entry per
+multicast queue (44 entries at 0x84a000), indexed from the first
+multicast queue, as the vendor SSDK does with obj_id - UCAST_QUEUE_ID_MAX
+and as its shipped qca-ssdk.ko does with a subtraction of 256. The driver
+indexes it with the absolute queue ID (256 to 299), which lands 0x1000
+past the table, so the multicast thresholds were never written. It also
+transfers five words per entry while the entry holds three and the
+stride is four, so each write spilled into the next entry.
+
+Index the table relative to the first multicast queue and transfer the
+three words the entry has. The driver only touches words 0 and 2.
+
+Signed-off-by: Francois Guerraz <kubrick@fgv6.net>
+---
+--- a/drivers/net/ethernet/qualcomm/ppe/ppe_config.c
++++ b/drivers/net/ethernet/qualcomm/ppe/ppe_config.c
+@@ -1716,7 +1716,7 @@
+ {
+ 	const struct ppe_qm_queue_config *queue_cfg;
+ 	int ret, i, queue_id, queue_cfg_count;
+-	u32 reg, multicast_queue_cfg[5];
++	u32 reg, multicast_queue_cfg[3];
+ 	u32 unicast_queue_cfg[4];
+ 	u32 group_cfg[3];
+ 	int group_limit;
+@@ -1781,8 +1781,12 @@
+ 				if (ret)
+ 					goto qm_config_fail;
+ 			} else {
++				/* The multicast table is indexed relative to the
++				 * first multicast queue.
++				 */
+ 				reg = PPE_AC_MULTICAST_QUEUE_CFG_TBL_ADDR +
+-				      PPE_AC_MULTICAST_QUEUE_CFG_TBL_INC * queue_id;
++				      PPE_AC_MULTICAST_QUEUE_CFG_TBL_INC *
++				      (queue_id - PPE_AC_UNICAST_QUEUE_CFG_TBL_ENTRIES);
+ 
+ 				ret = regmap_bulk_read(ppe_dev->regmap, reg,
+ 						       multicast_queue_cfg,

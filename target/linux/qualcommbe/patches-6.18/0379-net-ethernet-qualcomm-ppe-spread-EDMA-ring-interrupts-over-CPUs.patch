@@ -1,0 +1,129 @@
+From: Francois Guerraz <kubrick@fgv6.net>
+Subject: [PATCH] net: ethernet: qualcomm: ppe: spread EDMA ring interrupts
+ over the CPUs
+
+The EDMA interrupts are requested without an affinity, so with the
+kernel's default placement every Rx descriptor ring and Tx completion
+ring is serviced by CPU0 on the tested boards, and the EDMA interrupt
+and NAPI work of the whole datapath runs on one core. The driver itself
+expects otherwise: edma_cfg_rx_rps_hash_map() spreads the RSS hash over
+the Rx rings and notes that the rings "are assigned to different cores
+using IRQ affinity configuration", which nothing does. On the Tx side,
+Tx completion ring i is paired with the Tx queue of CPU
+i % num_possible_cpus() (edma_tx_complete(), and the ring layout in
+edma_cfg_tx.c), so the natural owner of ring i is that CPU. The stock
+GL.iNet firmware applies the same round-robin placement to the vendor
+driver's rings from its qca-nss-dp init script.
+
+Set the affinity and the affinity hint of each ring interrupt right after
+it is requested, falling back to an online CPU without changing the ring
+to queue pairing, and clear the hint before the interrupt is freed.
+cpumask_of() gives the persistent mask the hint API keeps a pointer to.
+The affinity is set with irq_set_affinity() and the hint recorded
+separately, because irq_set_affinity_and_hint() discards the result of
+the affinity change and a failure would otherwise be silent.
+
+This relies on the Tx queue wake fixes that pair the completion ring
+with its queue rather than with the running CPU (the "fix permanently
+stopped Tx queues" and "close the Tx queue stop/wake race" patches);
+without them a ring serviced on the fallback CPU would wake the wrong
+queue.
+
+Signed-off-by: Francois Guerraz <kubrick@fgv6.net>
+---
+--- a/drivers/net/ethernet/qualcomm/ppe/edma.c
++++ b/drivers/net/ethernet/qualcomm/ppe/edma.c
+@@ -7,7 +7,9 @@
+   */
+ 
+ #include <linux/clk.h>
++#include <linux/cpumask.h>
+ #include <linux/delay.h>
++#include <linux/interrupt.h>
+ #include <linux/kernel.h>
+ #include <linux/module.h>
+ #include <linux/netdevice.h>
+@@ -400,6 +402,35 @@
+ 	return IRQ_HANDLED;
+ }
+ 
++/* Service each ring from its own CPU. The PPE hashes the received flows
++ * over the Rx descriptor rings, and every Tx completion ring is paired with
++ * the Tx queue of one CPU (see edma_tx_complete()), so ring i belongs to
++ * CPU i % num_possible_cpus(). Without this the interrupts keep the kernel
++ * default placement, all on CPU0 on the tested boards, and the driver's
++ * edma_cfg_rx_rps_hash_map() already expects the rings to be spread over
++ * the cores through the IRQ affinity. cpumask_of() is persistent, as the
++ * affinity hint requires.
++ */
++static void edma_irq_set_affinity(unsigned int irq, unsigned int ring_idx)
++{
++	unsigned int cpu = ring_idx % num_possible_cpus();
++	int ret;
++
++	if (!cpu_online(cpu))
++		cpu = cpumask_first(cpu_online_mask);
++
++	/* irq_set_affinity_and_hint() discards the result of the affinity
++	 * change itself, so set the affinity first to be able to report a
++	 * failure, then record the hint.
++	 */
++	ret = irq_set_affinity(irq, cpumask_of(cpu));
++	if (ret)
++		pr_warn("IRQ %u: failed to set affinity to CPU %u: %d\n",
++			irq, cpu, ret);
++
++	irq_update_affinity_hint(irq, cpumask_of(cpu));
++}
++
+ static int edma_irq_register(void)
+ {
+ 	struct edma_hw_info *hw_info = edma_ctx->hw_info;
+@@ -438,6 +469,7 @@
+ 			goto txcmpl_irq_fail;
+ 		}
+ 		txcmpl_irqs++;
++		edma_irq_set_affinity(edma_ctx->intr_info.intr_txcmpl[i], i);
+ 
+ 		pr_debug("TXCMPL ring: %d IRQ:%d request success: %s\n",
+ 			 txcmpl->ring_start + i,
+@@ -476,6 +508,7 @@
+ 			goto rx_irq_fail;
+ 		}
+ 		rx_irqs++;
++		edma_irq_set_affinity(edma_ctx->intr_info.intr_rx[i], i);
+ 
+ 		pr_debug("RXDESC ring: %d IRQ:%d request success: %s\n",
+ 			 rx->ring_start + i,
+@@ -501,6 +534,7 @@
+ 	 */
+ 	for (i = 0; i < rx_irqs; i++) {
+ 		synchronize_irq(edma_ctx->intr_info.intr_rx[i]);
++		irq_update_affinity_hint(edma_ctx->intr_info.intr_rx[i], NULL);
+ 		free_irq(edma_ctx->intr_info.intr_rx[i],
+ 			 (void *)&edma_ctx->rx_rings[i]);
+ 	}
+@@ -510,6 +544,7 @@
+ txcmpl_irq_fail:
+ 	for (i = 0; i < txcmpl_irqs; i++) {
+ 		synchronize_irq(edma_ctx->intr_info.intr_txcmpl[i]);
++		irq_update_affinity_hint(edma_ctx->intr_info.intr_txcmpl[i], NULL);
+ 		free_irq(edma_ctx->intr_info.intr_txcmpl[i],
+ 			 (void *)&edma_ctx->txcmpl_rings[i]);
+ 	}
+@@ -829,6 +864,7 @@
+ 	for (i = 0; i < txcmpl->num_rings; i++) {
+ 		synchronize_irq(edma_ctx->intr_info.intr_txcmpl[i]);
+ 
++		irq_update_affinity_hint(edma_ctx->intr_info.intr_txcmpl[i], NULL);
+ 		free_irq(edma_ctx->intr_info.intr_txcmpl[i],
+ 			 (void *)&edma_ctx->txcmpl_rings[i]);
+ 		kfree(edma_txcmpl_irq_name[i]);
+@@ -838,6 +874,7 @@
+ 	/* Free IRQ for Rx DESC rings */
+ 	for (i = 0; i < rx->num_rings; i++) {
+ 		synchronize_irq(edma_ctx->intr_info.intr_rx[i]);
++		irq_update_affinity_hint(edma_ctx->intr_info.intr_rx[i], NULL);
+ 		free_irq(edma_ctx->intr_info.intr_rx[i],
+ 			 (void *)&edma_ctx->rx_rings[i]);
+ 		kfree(edma_rxdesc_irq_name[i]);
