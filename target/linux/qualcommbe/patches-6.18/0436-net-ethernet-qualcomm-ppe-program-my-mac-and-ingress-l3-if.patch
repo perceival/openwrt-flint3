@@ -1,0 +1,547 @@
+From: Kamil Bienkiewicz <perceivalpercy@gmail.com>
+Subject: [PATCH] net: ethernet: qualcomm: ppe: program MY_MAC and the ingress
+ L3 interface
+
+With the APPE register map fixed, the driver programs host, flow,
+nexthop and public-IP entries that hardware accepts -- and then drops
+every packet of an offloaded flow instead of forwarding it. Measured on
+an IPQ5332 (GL.iNet BE9300): the WAN port's TX counter moved 13 packets
+during a 15s transfer while its RX counter moved 403 (the peer's
+retransmissions), and the same transfer completes with
+flow_offloading_hw=0.
+
+Hardware only routes a frame whose destination MAC it recognises as its
+own, on an ingress interface with unicast routing enabled. Neither was
+configured. Read back live from the device:
+
+  MY_MAC_TBL (0x200000)     all 8 entries zero
+  IN_L3_IF_TBL MAC_BITMAP   0
+  IN_L3_IF_TBL IPV4_UC_ROUTE_EN  0
+  IN_L3_IF_TBL MRU/MTU      1500/1500 (already set)
+
+so no frame could be routed regardless of what the flow table said. The
+vendor driver programs all of it (ppe_drv_l3_if.c: MY_MAC add/release
+plus the ingress MTU/MRU), while this driver only ever programmed the
+egress L3 interface entry.
+
+Add the two missing primitives -- a MY_MAC table entry, and the port to
+ingress-L3-interface binding in L3_VP_PORT_TBL (read-modify-write, as
+the rest of that entry is unrelated source-guard configuration) -- and
+program them per EDMA port alongside the existing egress entry, with
+the MRU/MTU and routing enable the ingress entry needs. The ingress
+entry now also follows an MTU change, which hardware enforces.
+
+This is scoped to the ports this driver owns. It does not attempt the
+VSI/bridge ingress path, which resolves its L3 interface through
+L3_VSI instead.
+
+Enabling ingress routing also makes the flow table's ingress qualifier
+load-bearing, so set it. A flow entry matches on its 5-tuple alone
+unless it names an ingress L3 interface, which would let an offloaded
+flow be forwarded no matter which port a matching frame arrived on,
+ignoring the interface-scoped policy (firewall zones, the WAN/LAN
+split) the kernel applies in software -- an on-segment host could
+inject another client's 5-tuple and have it hardware-NAT'd out. The
+vendor driver qualifies every flow the same way (ppe_drv_flow.c sets
+src_intf_valid unconditionally). The ingress device comes from the
+rule's own FLOW_DISSECTOR_KEY_META ingress_ifindex, resolved through a
+VLAN upper or DSA user port to the EDMA netdevice that receives the
+frame; a flow whose ingress cannot be resolved is declined rather than
+offloaded unqualified. Note this board's DSA user ports share one
+conduit and therefore one ingress L3 interface, so hardware can
+distinguish LAN from WAN but not one LAN port from another.
+
+The ingress entry's TTL-exceed action is set to redirect to the CPU:
+hardware decrements the TTL for a routed frame, and the zeroed default
+(FAL_MAC_FRWRD) would forward an expired one instead of letting the
+CPU answer it.
+
+Enabling ingress routing is safe against a lookup miss: L3_ROUTE_CTRL
+and L3_ROUTE_CTRL_EXT are left at their power-on values, where every
+failure action (MRU, MTU, PMTU, route mismatch, no-Ethernet) is
+RDT_TO_CPU, so anything hardware cannot resolve falls back to the
+software path rather than being dropped. Verified by reading both
+registers on the live device (0x0dbc36db / 0x00031b23).
+
+Not yet hardware-tested: whether this is sufficient to make an
+offloaded flow actually forward.
+
+Signed-off-by: Kamil Bienkiewicz <perceivalpercy@gmail.com>
+---
+--- a/drivers/net/ethernet/qualcomm/ppe/ppe_regs.h
++++ b/drivers/net/ethernet/qualcomm/ppe/ppe_regs.h
+@@ -1215,6 +1215,40 @@
+  * whole-word value, so need no bitfield mask.
+  */
+ 
++/* MY_MAC table: the MAC addresses the PPE treats as its own. Hardware
++ * only routes a frame whose destination MAC matches an entry here that
++ * the ingress L3 interface selects through its MAC_BITMAP -- an
++ * unmatched frame is never routed, so a flow entry alone is not enough.
++ * Addressed directly, two words per entry, at IPE_L3_BASE_ADDR + 0x0
++ * (vendor MY_MAC_TBL, struct my_mac_tbl). The MAC is split the same
++ * way as PPE_EG_L3_IF_TBL's: low 32 bits in word 0, high 16 bits in
++ * word 1 -- confirmed against the vendor's own MY_MAC programming
++ * (adpt_hppe_ip.c), which copies both halves straight from the egress
++ * L3 interface entry it just built.
++ */
++#define PPE_MY_MAC_TBL_ADDR			0x200000
++#define PPE_MY_MAC_TBL_ENTRIES			8
++#define PPE_MY_MAC_TBL_INC			0x8
++
++/* Word 0 (MAC_DA_0) is a single whole-word value, no bitfield mask. */
++
++/* Word 1. */
++#define PPE_MY_MAC_TBL_MAC_DA_1			GENMASK(15, 0)
++#define PPE_MY_MAC_TBL_VALID			BIT(16)
++
++/* L3 virtual-port table: binds an ingress port to the L3 interface
++ * entry consulted for frames arriving on it. Only the L3 interface
++ * binding is touched here; the rest of the entry holds unrelated
++ * source-guard configuration, so it is updated read-modify-write.
++ */
++#define PPE_L3_VP_PORT_TBL_ADDR			0x204000
++#define PPE_L3_VP_PORT_TBL_ENTRIES		256
++#define PPE_L3_VP_PORT_TBL_INC			0x10
++
++/* Word 0. */
++#define PPE_L3_VP_PORT_TBL_L3_IF_VALID		BIT(0)
++#define PPE_L3_VP_PORT_TBL_L3_IF_INDEX		GENMASK(8, 1)
++
+ /* Ingress L3 interface table: per-L3-interface MTU/MRU/route-enable
+  * config, referenced by a flow entry's SRC_L3_IF and consulted on
+  * ingress. Addressed directly, three words per entry on APPE (the
+--- a/drivers/net/ethernet/qualcomm/ppe/ppe_l3_if.h
++++ b/drivers/net/ethernet/qualcomm/ppe/ppe_l3_if.h
+@@ -12,6 +12,20 @@
+ #include "ppe.h"
+ 
+ /**
++ * enum ppe_l3_if_action - What hardware does with a frame that fails a check.
++ * @PPE_L3_IF_ACTION_FORWARD: Forward it anyway.
++ * @PPE_L3_IF_ACTION_DROP: Drop it.
++ * @PPE_L3_IF_ACTION_COPY_TO_CPU: Forward it and copy it to the CPU.
++ * @PPE_L3_IF_ACTION_REDIRECT_TO_CPU: Send it to the CPU instead.
++ */
++enum ppe_l3_if_action {
++	PPE_L3_IF_ACTION_FORWARD = 0,
++	PPE_L3_IF_ACTION_DROP,
++	PPE_L3_IF_ACTION_COPY_TO_CPU,
++	PPE_L3_IF_ACTION_REDIRECT_TO_CPU,
++};
++
++/**
+  * struct ppe_l3_if_in_entry - PPE ingress L3 interface table entry.
+  * @mru: Maximum receive unit enforced on this L3 interface, in bytes.
+  * @mtu: Maximum transmit unit enforced on this L3 interface, in bytes.
+@@ -60,6 +74,10 @@
+ 	bool pppoe_en;
+ };
+ 
++int ppe_my_mac_entry_set(struct ppe_device *ppe_dev, u32 index,
++			  const u8 *mac_addr, bool valid);
++int ppe_l3_if_port_bind(struct ppe_device *ppe_dev, u32 port_id,
++			 u32 l3_if_index, bool valid);
+ int ppe_l3_if_in_entry_set(struct ppe_device *ppe_dev, u32 index,
+ 			    const struct ppe_l3_if_in_entry *entry);
+ int ppe_l3_if_in_entry_get(struct ppe_device *ppe_dev, u32 index,
+--- a/drivers/net/ethernet/qualcomm/ppe/ppe_l3_if.c
++++ b/drivers/net/ethernet/qualcomm/ppe/ppe_l3_if.c
+@@ -43,6 +43,13 @@
+ 	if (index >= PPE_IN_L3_IF_TBL_ENTRIES)
+ 		return -EINVAL;
+ 
++	/* FIELD_PREP() would silently truncate these to the field width. */
++	if (entry->mru > FIELD_MAX(PPE_IN_L3_IF_TBL_MRU) ||
++	    entry->mtu > FIELD_MAX(PPE_IN_L3_IF_TBL_MTU) ||
++	    entry->mru_ipv6 > FIELD_MAX(PPE_IN_L3_IF_TBL_MRU_IPV6) ||
++	    entry->mtu_ipv6 > FIELD_MAX(PPE_IN_L3_IF_TBL_MTU_IPV6))
++		return -EINVAL;
++
+ 	val[0] = FIELD_PREP(PPE_IN_L3_IF_TBL_MRU, entry->mru);
+ 	val[0] |= FIELD_PREP(PPE_IN_L3_IF_TBL_MTU, entry->mtu);
+ 	val[0] |= entry->ttl_dec_bypass ? PPE_IN_L3_IF_TBL_TTL_DEC_BYPASS : 0;
+@@ -182,3 +189,77 @@
+ 
+ 	return 0;
+ }
++
++/**
++ * ppe_my_mac_entry_set() - Write a PPE MY_MAC table entry.
++ * @ppe_dev: PPE device.
++ * @index: The entry index to write.
++ * @mac_addr: The MAC address hardware should treat as its own.
++ * @valid: Whether the entry is active. When false, @mac_addr is
++ * ignored and the entry is cleared.
++ *
++ * An ingress L3 interface selects the entries that apply to it through
++ * its MAC_BITMAP, so an entry written here only takes effect once some
++ * interface names it.
++ *
++ * Return: 0 on success, a negative error code on failure.
++ */
++int ppe_my_mac_entry_set(struct ppe_device *ppe_dev, u32 index,
++			  const u8 *mac_addr, bool valid)
++{
++	u32 base, val[2] = {};
++	u64 mac;
++	int ret;
++	int i;
++
++	if (index >= PPE_MY_MAC_TBL_ENTRIES)
++		return -EINVAL;
++
++	if (valid) {
++		mac = ether_addr_to_u64(mac_addr);
++		val[0] = mac & GENMASK(31, 0);
++		val[1] = FIELD_PREP(PPE_MY_MAC_TBL_MAC_DA_1, mac >> 32);
++		val[1] |= PPE_MY_MAC_TBL_VALID;
++	}
++
++	base = PPE_MY_MAC_TBL_ADDR + index * PPE_MY_MAC_TBL_INC;
++	for (i = 0; i < 2; i++) {
++		ret = regmap_write(ppe_dev->regmap, base + i * 4, val[i]);
++		if (ret)
++			return ret;
++	}
++
++	return 0;
++}
++
++/**
++ * ppe_l3_if_port_bind() - Bind a port to an ingress L3 interface entry.
++ * @ppe_dev: PPE device.
++ * @port_id: The port whose arriving frames the binding applies to.
++ * @l3_if_index: The ingress L3 interface table index to consult.
++ * @valid: Whether the binding is active.
++ *
++ * The rest of this table entry holds unrelated source-guard
++ * configuration, so only the two L3 interface fields are updated.
++ *
++ * Return: 0 on success, a negative error code on failure.
++ */
++int ppe_l3_if_port_bind(struct ppe_device *ppe_dev, u32 port_id,
++			 u32 l3_if_index, bool valid)
++{
++	u32 addr, val = 0;
++
++	if (port_id >= PPE_L3_VP_PORT_TBL_ENTRIES ||
++	    l3_if_index >= PPE_IN_L3_IF_TBL_ENTRIES)
++		return -EINVAL;
++
++	if (valid)
++		val = PPE_L3_VP_PORT_TBL_L3_IF_VALID |
++		      FIELD_PREP(PPE_L3_VP_PORT_TBL_L3_IF_INDEX, l3_if_index);
++
++	addr = PPE_L3_VP_PORT_TBL_ADDR + port_id * PPE_L3_VP_PORT_TBL_INC;
++
++	return regmap_update_bits(ppe_dev->regmap, addr,
++				   PPE_L3_VP_PORT_TBL_L3_IF_VALID |
++				   PPE_L3_VP_PORT_TBL_L3_IF_INDEX, val);
++}
+--- a/drivers/net/ethernet/qualcomm/ppe/ppe_offload.c
++++ b/drivers/net/ethernet/qualcomm/ppe/ppe_offload.c
+@@ -73,6 +73,7 @@
+ #include <linux/list.h>
+ #include <linux/mutex.h>
+ #include <linux/netdevice.h>
++#include <net/dsa.h>
+ #include <linux/rhashtable.h>
+ #include <linux/slab.h>
+ #include <linux/tcp.h>
+@@ -92,6 +93,9 @@
+ #include "ppe_pub_ip_pool.h"
+ #include "ppe_regs.h"
+ 
++/* No EDMA port owns this L3 interface index. */
++#define PPE_OFFLOAD_L3_IF_NONE U32_MAX
++
+ /* Total number of hardware-addressable flow-table slots, derived from
+  * the width of the index field hardware reports a HASH-mode add's
+  * result in -- used to size priv->flow_owner (see struct
+@@ -234,6 +238,47 @@
+ #define ppe_offload_decline(fmt, ...) \
+ 	({ pr_info_ratelimited("ppe_offload: declined - " fmt "\n", ##__VA_ARGS__); -EOPNOTSUPP; })
+ 
++/* Resolve the device a flow's packets arrive on down to the EDMA port
++ * whose ingress L3 interface hardware will match against, mirroring
++ * the redirect-target resolution done for egress. A VLAN upper or a
++ * DSA user port both sit on top of the EDMA netdevice that actually
++ * receives the frame.
++ *
++ * Note all of this board's DSA user ports share one conduit, so they
++ * share one ingress L3 interface: hardware can qualify a flow to the
++ * LAN side or the WAN side, but not to an individual LAN port.
++ *
++ * Must be called under RCU: the device is not held, and neither is
++ * anything this walks through to reach it.
++ *
++ * Return: the EDMA netdevice, or NULL if it isn't one.
++ */
++static struct net_device *ppe_offload_ingress_edma_dev(struct net_device *dev)
++{
++#if IS_ENABLED(CONFIG_NET_DSA)
++	struct dsa_port *dp;
++#endif
++
++	if (is_vlan_dev(dev))
++		dev = vlan_dev_real_dev(dev);
++
++#if IS_ENABLED(CONFIG_NET_DSA)
++	/* A DSA user port resolves to the conduit that receives its
++	 * frames; anything else (including the conduit itself) fails
++	 * this lookup and is used as-is, mirroring
++	 * mtk_flow_get_dsa_port().
++	 */
++	dp = dsa_port_from_netdev(dev);
++	if (!IS_ERR(dp))
++		dev = dsa_port_to_conduit(dp);
++#endif
++
++	if (!dev || !edma_port_is_edma_netdev(dev))
++		return NULL;
++
++	return dev;
++}
++
+ static int ppe_offload_flow_replace(struct net_device *netdev,
+ 				     struct ppe_offload_priv *priv,
+ 				     struct flow_cls_offload *cls)
+@@ -247,6 +292,9 @@
+ 	struct ppe_nexthop_entry nexthop;
+ 	struct edma_port_priv *port_priv;
+ 	struct net_device *odev = NULL;
++	struct net_device *idev;
++	struct flow_match_meta meta;
++	u32 ingress_l3_if = PPE_OFFLOAD_L3_IF_NONE;
+ 	__be32 match_src, match_dst;
+ 	__be32 new_src, new_dst;
+ 	__be16 match_sport, match_dport;
+@@ -306,6 +354,39 @@
+ 		match_dport = ports.key->dst;
+ 	}
+ 
++	/* Hardware matches a flow on its 5-tuple alone unless the entry
++	 * names an ingress L3 interface, so without this an offloaded
++	 * flow would be forwarded no matter which port a matching frame
++	 * arrived on -- ignoring the interface-scoped policy (firewall
++	 * zones, WAN/LAN split) the kernel applies in software. The
++	 * vendor driver qualifies every flow the same way.
++	 */
++	if (!flow_rule_match_key(rule, FLOW_DISSECTOR_KEY_META))
++		return ppe_offload_decline("no ingress interface in rule");
++
++	flow_rule_match_meta(rule, &meta);
++	if (!meta.key->ingress_ifindex || meta.mask->ingress_ifindex != ~0u)
++		return ppe_offload_decline("ingress ifindex %d not an exact match",
++					    meta.key->ingress_ifindex);
++
++	/* The device is only used to resolve the index it maps to, so
++	 * take it under RCU rather than holding a reference.
++	 */
++	rcu_read_lock();
++	idev = dev_get_by_index_rcu(dev_net(netdev), meta.key->ingress_ifindex);
++	if (idev)
++		idev = ppe_offload_ingress_edma_dev(idev);
++	if (idev)
++		ingress_l3_if = ((struct edma_port_priv *)netdev_priv(idev))->l3_if_index;
++	rcu_read_unlock();
++
++	if (ingress_l3_if == PPE_OFFLOAD_L3_IF_NONE)
++		return ppe_offload_decline("ingress ifindex %d not on an edma netdev",
++					    meta.key->ingress_ifindex);
++
++	if (ingress_l3_if > FIELD_MAX(PPE_FLOW_TBL_SRC_L3_IF))
++		return ppe_offload_decline("ingress l3_if %u out of range", ingress_l3_if);
++
+ 	new_src = match_src;
+ 	new_dst = match_dst;
+ 	l4.source = match_sport;
+@@ -485,6 +566,8 @@
+ 	flow_ipv4.match_ip = match_dst;
+ 	flow_ipv4.match_sport = be16_to_cpu(match_sport);
+ 	flow_ipv4.match_dport = be16_to_cpu(match_dport);
++	flow_ipv4.src_l3_if_valid = true;
++	flow_ipv4.src_l3_if = ingress_l3_if;
+ 	flow_ipv4.pmtu = pmtu;
+ 	flow_ipv4.pmtu_check_l3 = true;
+ 	ppe_flow_ipv4_snat_entry_encode(&flow_ipv4, flow_words);
+--- a/drivers/net/ethernet/qualcomm/ppe/edma_port.h
++++ b/drivers/net/ethernet/qualcomm/ppe/edma_port.h
+@@ -84,10 +84,12 @@
+  * @pcpu_stats: Per CPU netdev statistics
+  * @txr_map: Tx ring per-core mapping
+  * @flags: Feature flags
+- * @l3_if_index: This port's egress L3 interface table index (see
+- * ppe_l3_if.h). Set once at port setup and kept in sync with the
+- * netdevice's own MAC address; referenced by a nexthop entry's
+- * post_l3_if when routing/NAT-ing a packet out through this port.
++ * @l3_if_index: This port's L3 interface table index, used for both
++ * the egress and the ingress entry (see ppe_l3_if.h). Set once at port
++ * setup and kept in sync with the netdevice's own MAC address;
++ * referenced by a nexthop entry's post_l3_if when routing/NAT-ing a
++ * packet out through this port, and by a flow entry's src_l3_if when
++ * the packet arrives on it.
+  */
+ struct edma_port_priv {
+ 	struct ppe_port *ppe_port;
+--- a/drivers/net/ethernet/qualcomm/ppe/edma_port.c
++++ b/drivers/net/ethernet/qualcomm/ppe/edma_port.c
+@@ -167,16 +167,28 @@
+ 	return ret;
+ }
+ 
++static void edma_port_l3_if_update(struct net_device *netdev);
++
+ static int edma_port_change_mtu(struct net_device *netdev, int mtu)
+ {
+ 	struct edma_port_priv *port_priv = (struct edma_port_priv *)netdev_priv(netdev);
++	int ret;
+ 
+ 	if (!port_priv)
+ 		return -EINVAL;
+ 
+ 	netdev->mtu = mtu;
+ 
+-	return ppe_port_set_maxframe(port_priv->ppe_port, mtu);
++	ret = ppe_port_set_maxframe(port_priv->ppe_port, mtu);
++	if (ret)
++		return ret;
++
++	/* Hardware checks arriving frames against the ingress L3
++	 * interface entry's MRU/MTU, so it has to follow the netdevice.
++	 */
++	edma_port_l3_if_update(netdev);
++
++	return 0;
+ }
+ 
+ static netdev_features_t edma_port_feature_check(__maybe_unused struct sk_buff *skb,
+@@ -301,24 +313,85 @@
+ 	ppe_port_get_stats64(port_priv->ppe_port, stats);
+ }
+ 
+-/* Program this port's egress L3 interface table entry (own MAC address)
+- * to match the netdevice's current MAC. Failure is logged, not
+- * propagated: this table isn't consulted by anything on the packet
+- * path yet, so it must never block ordinary MAC-address changes or
+- * port bring-up from working.
++/* Program this port's L3 interface state to match the netdevice: its
++ * own MAC address (egress entry and MY_MAC), the MTU/MRU hardware
++ * enforces, and the ingress entry's routing enable. Hardware only
++ * routes a frame whose destination MAC matches a MY_MAC entry that the
++ * ingress L3 interface selects, so without all of this a matching flow
++ * entry still cannot be forwarded.
++ *
++ * Each port gets its own MY_MAC entry, indexed from 0 while port ids
++ * (and so L3 interface indices) start at 1, so the 8-entry table holds
++ * one per port.
++ *
++ * Failure is logged, not propagated: it must never block ordinary
++ * MAC-address or MTU changes, or port bring-up. On a lookup miss or a
++ * failed MTU/MRU check hardware redirects to the CPU rather than
++ * dropping (L3_ROUTE_CTRL/_EXT are left at their RDT_TO_CPU defaults),
++ * so traffic falls back to the software path.
+  */
+ static void edma_port_l3_if_update(struct net_device *netdev)
+ {
+ 	struct edma_port_priv *port_priv = netdev_priv(netdev);
+ 	struct ppe_l3_if_eg_entry entry = {};
++	struct ppe_l3_if_in_entry in = {};
++	u16 l3_if = port_priv->l3_if_index;
++	u32 my_mac, mtu;
+ 	int ret;
+ 
++	/* Port ids, and so L3 interface indices, start at 1; the MY_MAC
++	 * table has one entry per port starting at 0.
++	 */
++	my_mac = l3_if - 1;
++	if (my_mac >= PPE_MY_MAC_TBL_ENTRIES) {
++		netdev_warn(netdev, "no MY_MAC entry for L3 interface %u\n", l3_if);
++		return;
++	}
++
+ 	memcpy(entry.mac_addr, netdev->dev_addr, ETH_ALEN);
+ 
+-	ret = ppe_l3_if_eg_entry_set(edma_ctx->ppe_dev, port_priv->l3_if_index, &entry);
+-	if (ret)
++	ret = ppe_l3_if_eg_entry_set(edma_ctx->ppe_dev, l3_if, &entry);
++	if (ret) {
+ 		netdev_warn(netdev, "failed to update egress L3 interface entry %u: %d\n",
+-			    port_priv->l3_if_index, ret);
++			    l3_if, ret);
++		return;
++	}
++
++	ret = ppe_my_mac_entry_set(edma_ctx->ppe_dev, my_mac, netdev->dev_addr, true);
++	if (ret) {
++		netdev_warn(netdev, "failed to update MY_MAC entry %u: %d\n", my_mac, ret);
++		return;
++	}
++
++	/* A larger MTU than hardware can express just means hardware
++	 * enforces a smaller one and redirects the rest to the CPU.
++	 */
++	mtu = min_t(u32, netdev->mtu, FIELD_MAX(PPE_IN_L3_IF_TBL_MTU));
++
++	in.mru = mtu;
++	in.mtu = mtu;
++	in.mru_ipv6 = mtu;
++	in.mtu_ipv6 = mtu;
++	in.mac_bitmap = BIT(my_mac);
++	in.ipv4_uc_route_en = true;
++	/* Hardware decrements the TTL, so an expired one must come back
++	 * to the CPU (which answers it) rather than being forwarded.
++	 */
++	in.ttl_exceed_cmd = PPE_L3_IF_ACTION_REDIRECT_TO_CPU;
++	in.ttl_exceed_de_acce = true;
++
++	ret = ppe_l3_if_in_entry_set(edma_ctx->ppe_dev, l3_if, &in);
++	if (ret) {
++		netdev_warn(netdev, "failed to update ingress L3 interface entry %u: %d\n",
++			    l3_if, ret);
++		return;
++	}
++
++	ret = ppe_l3_if_port_bind(edma_ctx->ppe_dev, port_priv->ppe_port->port_id,
++				   l3_if, true);
++	if (ret)
++		netdev_warn(netdev, "failed to bind port to L3 interface entry %u: %d\n",
++			    l3_if, ret);
+ }
+ 
+ static int edma_port_set_mac_address(struct net_device *netdev, void *macaddr)
+@@ -394,7 +467,11 @@
+ 	struct net_device *netdev = edma_ctx->netdev_arr[port_id - 1];
+ 	struct edma_port_priv *port_priv = netdev_priv(netdev);
+ 	struct ppe_l3_if_eg_entry zero = {};
++	struct ppe_l3_if_in_entry in_zero = {};
+ 
++	ppe_l3_if_port_bind(edma_ctx->ppe_dev, port_id, port_priv->l3_if_index, false);
++	ppe_l3_if_in_entry_set(edma_ctx->ppe_dev, port_priv->l3_if_index, &in_zero);
++	ppe_my_mac_entry_set(edma_ctx->ppe_dev, port_priv->l3_if_index - 1, NULL, false);
+ 	ppe_l3_if_eg_entry_set(edma_ctx->ppe_dev, port_priv->l3_if_index, &zero);
+ 
+ 	edma_port_deconfigure(netdev);
+@@ -473,8 +550,6 @@
+ 			    port_id, netdev->dev_addr);
+ 	}
+ 
+-	edma_port_l3_if_update(netdev);
+-
+ 	ret = edma_port_stats_alloc(netdev);
+ 	if (ret) {
+ 		netdev_dbg(netdev, "EDMA port stats alloc failed\n");
+@@ -503,6 +578,12 @@
+ 		goto register_netdev_fail;
+ 	}
+ 
++	/* Last: everything below this point succeeded, so the hardware
++	 * L3 interface state this programs has a netdevice behind it and
++	 * edma_port_destroy() to undo it.
++	 */
++	edma_port_l3_if_update(netdev);
++
+ 	netdev_dbg(netdev, "Setup EDMA port%d done\n", port_id);
+ 	return ret;
+ 
