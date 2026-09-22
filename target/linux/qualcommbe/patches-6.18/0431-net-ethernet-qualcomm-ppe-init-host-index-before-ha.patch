@@ -1,0 +1,42 @@
+From: Kamil Bienkiewicz <perceivalpercy@gmail.com>
+Subject: [PATCH] net: ethernet: qualcomm: ppe: init host index before
+ hash-mode add
+
+ppe_host_pool_get_and_ref() declares `u32 idx;` uninitialized and
+passes &idx straight into ppe_host_entry_add(), which for
+PPE_FLOW_OP_MODE_HASH ends up FIELD_PREP()'d into the OP command
+register's ENTRY_INDEX bits (ppe_host_tbl_op_wait()) even though the
+function's own doc comment says hardware ignores that field on input
+in HASH mode and only sets it on output. Relying on that being true
+regardless of whatever garbage is on the stack is reading from
+uninitialized memory to build a hardware command word -- undefined
+behavior in C regardless of whether this specific field happens to be
+truly don't-care on this silicon, and worth fixing on its own merits.
+
+ppe_flow_entry_add()'s caller (ppe_offload_flow_replace()) already
+does the equivalent (`flow_index = 0;`) before its own HASH-mode add;
+this brings the host-table path in line with that existing convention.
+
+Found while instrumenting a live host-table ADD timeout
+(project_flint3_ppe_hw_offload_research.md) -- in the specific runs
+observed, the resulting ENTRY_INDEX bits in the readback OP register
+were already zero, so this was not the cause of that particular
+timeout, but it's a real defect independent of that investigation and
+is fixed here regardless of its outcome.
+
+Compile-tested (clean module build, drivers/net/ethernet/qualcomm/ppe
+rebuilt standalone against the existing kernel build tree).
+
+Signed-off-by: Kamil Bienkiewicz <perceivalpercy@gmail.com>
+---
+--- a/drivers/net/ethernet/qualcomm/ppe/ppe_host_pool.c
++++ b/drivers/net/ethernet/qualcomm/ppe/ppe_host_pool.c
+@@ -78,7 +78,7 @@
+ 			       unsigned int num_words, u32 *index)
+ {
+ 	struct ppe_host_pool_entry *e;
+-	u32 idx;
++	u32 idx = 0;
+ 	int ret;
+
+ 	ret = ppe_host_entry_add(ppe_dev, mode, entry, num_words, &idx);

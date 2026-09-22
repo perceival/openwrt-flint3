@@ -1,0 +1,225 @@
+From: Kamil Bienkiewicz <perceivalpercy@gmail.com>
+Subject: [PATCH] net: ethernet: qualcomm: ppe: fix stale flow-index delete
+ clobbering a live entry
+
+ppe_offload_flow_replace() programs every flow with
+PPE_FLOW_OP_MODE_HASH, under which hardware places (or, per
+ppe_flow_entry_add()'s own doc comment, *overwrites*) an entry purely
+by hashing its match key -- independent of insertion order. The same
+5-tuple always lands on the same hardware index. ppe_offload_flow_destroy()
+then deletes by a flow_index captured once, at add time, into the
+per-cookie struct ppe_offload_flow_entry, with nothing checking that
+the hardware slot at that index still belongs to this cookie by the
+time the delete actually runs.
+
+nf_flow_table_offload.c dispatches ADD and DEL work items to two
+separate workqueues (nf_flow_offload_add_wq / nf_flow_offload_del_wq)
+with no ordering guarantee between them. That makes the following
+sequence possible whenever a connection's teardown is still in flight
+when an identical-tuple reconnect shows up (e.g. an old, expiring
+keep-alive to some destination:port, superseded by a fresh connection
+to the exact same destination:port from the exact same LAN-side
+address:port):
+
+  1. Flow A (5-tuple T) is added, hardware assigns index N. Our
+     driver's cookie_A entry stores flow_index=N.
+  2. A's FLOW_CLS_DESTROY is queued but hasn't run yet.
+  3. Flow B, with the *same* 5-tuple T (a same-tuple reconnect), is
+     added before A's destroy runs. Hashing T again yields the same
+     index N, so hardware silently overwrites A's hardware entry with
+     B's. Our driver's cookie_B entry also stores flow_index=N.
+  4. A's delayed destroy finally runs, looks up cookie_A (still
+     present -- nothing removed it), and unconditionally deletes
+     index N -- which now holds B's live, active hardware entry, not
+     A's.
+
+The result is a currently-healthy, unrelated-in-software-terms
+connection (B) silently losing its hardware flow-table entry, with no
+error visible anywhere: conntrack, ping, DNS and every other flow stay
+completely unaffected, matching this driver's observed live-testing
+symptom of one specific connection breaking under real traffic while
+everything else stays healthy.
+
+Track, in priv->flow_owner[], which struct ppe_offload_flow_entry
+currently owns each hardware flow-table index. When an add lands on an
+index another tracked entry still claims, mark that other entry
+superseded (flow_valid = false) instead of leaving it pointing at a
+slot it no longer owns. A superseded entry's later destroy then skips
+ppe_flow_entry_del() entirely -- by the time it runs, that index names
+a different, live flow's hardware entry, not this one's -- while still
+correctly dereffing its own host/nexthop/pub-IP pool entries, which are
+separate, independently refcounted resources unaffected by the flow-
+table collision.
+
+This does not resolve the separate, still-open question (see
+project_flint3_ppe_hw_offload_research.md) of why some earlier clean
+tests observed zero flows being offered to hardware in the outbound
+direction at all -- if that observation holds in general, this bug
+requires flows to reach the add path to begin with, which needs
+reconciling with it directly rather than assumed.
+
+flow_owner[]'s clear in ppe_offload_flow_destroy() is keyed on pointer
+identity (flow_owner[index] == entry), not on this entry's own
+flow_valid flag: if this entry's own add later failed (kzalloc or
+rhashtable_insert_fast) after it had already superseded some earlier
+owner, flow_owner[] can still point at *this* entry even though its
+own flow_valid was never set true, and gating the clear on flow_valid
+instead of identity would leave that pointer dangling once this entry
+is kfree()'d -- a real, if OOM-only, use-after-free. The identity check
+makes "flow_owner never points at a freed entry" hold unconditionally.
+
+Also logs the supersede event itself (pr_info_ratelimited, matching
+this file's existing temporary instrumentation) -- without it, whether
+this path is ever actually exercised on live hardware can only be
+inferred from duplicate flow_index values surviving ratelimiting in
+the existing accept log, which is easy to miss.
+
+Compile-tested (clean module build, drivers/net/ethernet/qualcomm/ppe
+rebuilt standalone against the existing kernel build tree). Not yet
+tested against live hardware or under real reconnect-churn traffic --
+this needs a targeted test that forces a same-5-tuple reconnect while
+the original connection's teardown is still in flight, not just
+generic throughput load.
+
+Signed-off-by: Kamil Bienkiewicz <perceivalpercy@gmail.com>
+---
+--- a/drivers/net/ethernet/qualcomm/ppe/ppe_offload.c
++++ b/drivers/net/ethernet/qualcomm/ppe/ppe_offload.c
+@@ -63,6 +63,7 @@
+  * hardware-testing-time question; nothing here changes it.
+  */
+ 
++#include <linux/bitfield.h>
+ #include <linux/errno.h>
+ #include <linux/etherdevice.h>
+ #include <linux/if_ether.h>
+@@ -89,7 +90,25 @@
+ #include "ppe_nexthop_pool.h"
+ #include "ppe_offload.h"
+ #include "ppe_pub_ip_pool.h"
++#include "ppe_regs.h"
+ 
++/* Total number of hardware-addressable flow-table slots, derived from
++ * the width of the index field hardware reports a HASH-mode add's
++ * result in -- used to size priv->flow_owner (see struct
++ * ppe_offload_priv) below.
++ */
++#define PPE_OFFLOAD_FLOW_TBL_ENTRIES (FIELD_MAX(PPE_IN_FLOW_TBL_OP_ENTRY_INDEX) + 1)
++
++/* @flow_valid: Whether @flow_index still names a hardware flow-table
++ * slot this struct owns. PPE_FLOW_OP_MODE_HASH places (or overwrites)
++ * an entry purely by hashing its match key, independent of insertion
++ * order, so a same-5-tuple reconnect can land a new flow on the exact
++ * slot an older, not-yet-destroyed flow still thinks it owns. When
++ * that happens the add path clears this on the superseded entry (see
++ * struct ppe_offload_priv::flow_owner), and its later destroy must
++ * then skip deleting @flow_index, since by then it names a different,
++ * live flow's hardware entry, not this one's.
++ */
+ struct ppe_offload_flow_entry {
+ 	struct rhash_head node;
+ 	unsigned long cookie;
+@@ -97,6 +116,7 @@
+ 	u32 host_index;
+ 	u32 nexthop_index;
+ 	u32 pub_ip_index;
++	bool flow_valid;
+ };
+ 
+ static const struct rhashtable_params ppe_offload_flow_ht_params = {
+@@ -113,6 +133,13 @@
+  * @nexthop_pool: Refcounted nexthop table allocator.
+  * @pub_ip_pool: Refcounted public IP address table allocator.
+  * @flow_table: Offloaded flows, keyed by TC flow cookie.
++ * @flow_owner: One entry per hardware flow-table index, naming which
++ * (if any) &struct ppe_offload_flow_entry currently owns it in
++ * hardware. Only needed because of PPE_FLOW_OP_MODE_HASH's
++ * add-or-overwrite semantics -- see ppe_offload_flow_entry::flow_valid
++ * and ppe_offload_flow_replace()/_destroy() for how it's used to stop
++ * a superseded entry's later destroy from deleting a different, live
++ * flow's hardware entry.
+  * @lock: Serializes the whole replace/destroy sequence -- looking up
+  * @flow_table, allocating from the pools, and programming hardware --
+  * against concurrent calls for different flows, mirroring
+@@ -124,6 +151,7 @@
+ 	struct ppe_nexthop_pool nexthop_pool;
+ 	struct ppe_pub_ip_pool pub_ip_pool;
+ 	struct rhashtable flow_table;
++	struct ppe_offload_flow_entry **flow_owner;
+ 	struct mutex lock;
+ };
+ 
+@@ -443,6 +471,20 @@
+ 	if (ret)
+ 		goto deref_host;
+ 
++	/* HASH mode places this entry purely by hashing its match key, so
++	 * an identical key (e.g. a same-5-tuple reconnect) always lands on
++	 * the same index regardless of which flow got there first -- if
++	 * another tracked flow already owned this index, hardware has just
++	 * silently overwritten its entry with ours. Mark it superseded so
++	 * its own destroy, whenever it runs, doesn't delete what is now
++	 * our hardware entry.
++	 */
++	if (priv->flow_owner[flow_index]) {
++		pr_info_ratelimited("ppe_offload: superseded cookie=%lu at flow_index=%u (new cookie=%lu)\n",
++				     priv->flow_owner[flow_index]->cookie, flow_index, cls->cookie);
++		priv->flow_owner[flow_index]->flow_valid = false;
++	}
++
+ 	entry = kzalloc(sizeof(*entry), GFP_KERNEL);
+ 	if (!entry) {
+ 		ret = -ENOMEM;
+@@ -454,11 +496,14 @@
+ 	entry->host_index = host_index;
+ 	entry->nexthop_index = nexthop_index;
+ 	entry->pub_ip_index = pub_ip_index;
++	entry->flow_valid = true;
+ 
+ 	ret = rhashtable_insert_fast(&priv->flow_table, &entry->node, ppe_offload_flow_ht_params);
+ 	if (ret)
+ 		goto free_entry;
+ 
++	priv->flow_owner[flow_index] = entry;
++
+ 	mutex_unlock(&priv->lock);
+ 
+ 	pr_info_ratelimited("ppe_offload: accepted flow_index=%u host_index=%u nexthop_index=%u pub_ip_index=%u src=%pI4->%pI4 odev=%s\n",
+@@ -497,7 +542,24 @@
+ 
+ 	rhashtable_remove_fast(&priv->flow_table, &entry->node, ppe_offload_flow_ht_params);
+ 
+-	ppe_flow_entry_del(priv->ppe_dev, entry->flow_index);
++	/* Clear flow_owner[] by pointer identity, unconditionally on
++	 * flow_valid: if this entry's own add later failed after already
++	 * superseding some earlier owner (see ppe_offload_flow_replace()),
++	 * flow_owner[] can still point at *this* entry even though
++	 * flow_valid was never set true, and leaving it there would dangle
++	 * once this entry is kfree()'d below. Gating the clear on
++	 * flow_valid instead of identity would miss exactly that case.
++	 *
++	 * If a later add for a different flow already overwrote this
++	 * entry's hardware slot, flow_owner[] now points at that other,
++	 * still-live entry instead -- the identity check leaves it alone,
++	 * and flow_valid being false skips deleting hardware out from
++	 * under it.
++	 */
++	if (priv->flow_owner[entry->flow_index] == entry)
++		priv->flow_owner[entry->flow_index] = NULL;
++	if (entry->flow_valid)
++		ppe_flow_entry_del(priv->ppe_dev, entry->flow_index);
+ 	ppe_host_pool_deref(priv->ppe_dev, &priv->host_pool, entry->host_index);
+ 	ppe_nexthop_pool_deref(priv->ppe_dev, &priv->nexthop_pool, entry->nexthop_index);
+ 	ppe_pub_ip_pool_deref(priv->ppe_dev, &priv->pub_ip_pool, entry->pub_ip_index);
+@@ -769,6 +831,11 @@
+ 	ppe_pub_ip_pool_init(&priv->pub_ip_pool);
+ 	mutex_init(&priv->lock);
+ 
++	priv->flow_owner = devm_kcalloc(ppe_dev->dev, PPE_OFFLOAD_FLOW_TBL_ENTRIES,
++					 sizeof(*priv->flow_owner), GFP_KERNEL);
++	if (!priv->flow_owner)
++		return -ENOMEM;
++
+ 	ret = rhashtable_init(&priv->flow_table, &ppe_offload_flow_ht_params);
+ 	if (ret)
+ 		return ret;
