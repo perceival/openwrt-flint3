@@ -1,0 +1,136 @@
+From: Kamil Bienkiewicz <perceivalpercy@gmail.com>
+Subject: [PATCH] net: ethernet: qualcomm: ppe: add VLAN push support to
+ hardware flow offload
+
+ppe_offload_flow_replace() declined every flow whose egress redirect
+target required a FLOW_ACTION_VLAN_PUSH -- which is unconditionally
+the case whenever the router's WAN interface is a tagged VLAN
+subinterface (e.g. wan.10), a completely ordinary configuration once
+the physical uplink is an 802.1Q trunk rather than an access port.
+Every such flow fell to the action loop's default decline branch
+before nexthop construction was ever reached.
+
+This isn't a hardware limitation: the nexthop table's C-VLAN
+tag-insert fields (ctag_fmt/cvid, in struct ppe_nexthop_entry) were
+already fully wired to their real PPE_IN_NEXTHOP_TBL_CTAG_FMT/CVID
+register fields by ppe_nexthop.c -- they were simply never populated
+by this file, and the action loop never handled
+FLOW_ACTION_VLAN_PUSH in the first place. Confirmed the same
+hardware-level mechanism against the vendor ppe_drv reference
+(nss-ppe/drv/ppe_drv/ppe_drv_nexthop.c), which drives VLAN tag
+insertion through the same nexthop-level fields via a heavier
+VSI-per-vlan-combination abstraction not needed for this single-tag
+case.
+
+Add a FLOW_ACTION_VLAN_PUSH case to the action loop, declining
+anything not expressible as a single 802.1Q push (a second push, or
+any other VLAN TPID) to keep with this file's existing "decline what
+isn't explicitly supported" style. After the action loop, if the
+redirect target is a VLAN netdevice, require it to be paired with a
+matching push (a VLAN redirect with no corresponding push, or a
+mismatched VLAN id, makes no sense and is declined) and resolve it to
+its real underlying device via vlan_dev_real_dev() before the
+existing edma_port_is_edma_netdev()/dev_addr/port_priv checks -- none
+of those are meaningful against the VLAN netdevice itself, only
+against the real EDMA device it's stacked on. Set the nexthop's
+ctag_fmt/cvid from the captured push when building it.
+
+Compile-tested (clean module build). Not yet tested against live
+hardware -- this needs a genuinely clean re-test of the LAN-side
+SNAT-offload path first, given the severe, still-unresolved live
+incidents from tonight's testing (see
+project_flint3_ppe_hw_offload_research.md); this patch is submitted
+as a code-complete, reviewed building block for that follow-up, not
+as a claim that the feature works end-to-end.
+
+Signed-off-by: Kamil Bienkiewicz <perceivalpercy@gmail.com>
+---
+--- a/drivers/net/ethernet/qualcomm/ppe/ppe_offload.c	2026-09-19 12:01:31.317872855 +0200
++++ b/drivers/net/ethernet/qualcomm/ppe/ppe_offload.c	2026-09-19 12:01:31.318787305 +0200
+@@ -21,12 +21,20 @@
+  *   inbound, which is a real, known limitation of this milestone, not
+  *   an oversight.
+  * - Egress device must be one of this driver's own EDMA port
+- *   netdevices (edma_port_is_edma_netdev()). Bridge and DSA (rtl837x)
+- *   netdevices are out of scope -- on this board's LAN side, real
+- *   traffic's egress device is typically a DSA/bridge netdevice, not
+- *   an EDMA one, so this milestone in practice only accelerates the
+- *   WAN-side direction of traffic through a plain EDMA netdevice.
+- *   Extending this to DSA/bridge devices (mirroring
++ *   netdevices (edma_port_is_edma_netdev()), or a VLAN netdevice
++ *   stacked directly on one (e.g. wan.10) paired with a matching
++ *   FLOW_ACTION_VLAN_PUSH -- the VLAN case resolves down to the real
++ *   EDMA device via vlan_dev_real_dev() for the hardware programming,
++ *   and the nexthop's C-VLAN tag-insert fields carry the push. A
++ *   second/S-tag push, or any other VLAN proto than 802.1Q, is
++ *   declined -- untested, and this hardware's nexthop entry only has
++ *   a single C-VLAN + single S-VLAN insert field to begin with. Bridge
++ *   and DSA (rtl837x) netdevices themselves are still out of scope --
++ *   on this board's LAN side, real traffic's egress device is
++ *   typically a DSA/bridge netdevice, not an EDMA one (or a VLAN on
++ *   top of one), so this milestone in practice only accelerates the
++ *   WAN-side direction of traffic through a plain (or VLAN-tagged)
++ *   EDMA netdevice. Extending this to DSA/bridge devices (mirroring
+  *   mtk_flow_get_dsa_port()) is follow-up work.
+  * - The flow must carry a FLOW_ACTION_MANGLE for the Ethernet header:
+  *   this is the *only* source this code uses for the nexthop's
+@@ -218,6 +226,8 @@
+ 	u32 host_words[PPE_HOST_TBL_IPV4_ENTRY_WORDS];
+ 	u32 host_index, nexthop_index, pub_ip_index, flow_index;
+ 	const struct flow_action_entry *act;
++	bool vlan_push_seen = false;
++	u16 vlan_push_vid = 0;
+ 	u8 ip_proto;
+ 	int action;
+ 	int ret;
+@@ -307,6 +317,15 @@
+ 		case FLOW_ACTION_CSUM:
+ 			/* Hardware recomputes checksums on rewrite. */
+ 			break;
++		case FLOW_ACTION_VLAN_PUSH:
++			if (vlan_push_seen)
++				return ppe_offload_decline("second vlan push unsupported");
++			if (act->vlan.proto != htons(ETH_P_8021Q))
++				return ppe_offload_decline("vlan push proto=0x%04x unsupported",
++							    ntohs(act->vlan.proto));
++			vlan_push_seen = true;
++			vlan_push_vid = act->vlan.vid;
++			break;
+ 		default:
+ 			return ppe_offload_decline("action id=%d unsupported", act->id);
+ 		}
+@@ -315,6 +334,23 @@
+ 	if (!odev || !eth.seen)
+ 		return ppe_offload_decline("odev=%d eth.seen=%d", !!odev, eth.seen);
+ 
++	/* A redirect to a VLAN netdevice (e.g. a tagged wan.10) needs a
++	 * matching FLOW_ACTION_VLAN_PUSH for the tag this driver is expected
++	 * to insert on egress, and the actual EDMA hardware programming
++	 * below (edma_port_is_edma_netdev(), the dev_addr/MAC check, and
++	 * port_priv) has to target the VLAN device's *real* underlying
++	 * device -- odev itself is never an EDMA netdevice in this case.
++	 */
++	if (is_vlan_dev(odev)) {
++		if (!vlan_push_seen || vlan_dev_vlan_id(odev) != vlan_push_vid)
++			return ppe_offload_decline("odev=%s vlan id mismatch (push vid=%u)",
++						    netdev_name(odev), vlan_push_vid);
++		odev = vlan_dev_real_dev(odev);
++	} else if (vlan_push_seen) {
++		return ppe_offload_decline("vlan push to non-vlan odev=%s unsupported",
++					    netdev_name(odev));
++	}
++
+ 	if (!edma_port_is_edma_netdev(odev))
+ 		return ppe_offload_decline("odev=%s not an edma netdev", netdev_name(odev));
+ 
+@@ -366,6 +402,10 @@
+ 	nexthop.post_l3_if = port_priv->l3_if_index;
+ 	nexthop.pub_addr_index = pub_ip_index;
+ 	memcpy(nexthop.dmac, eth.bytes, ETH_ALEN);
++	if (vlan_push_seen) {
++		nexthop.ctag_fmt = true;
++		nexthop.cvid = vlan_push_vid;
++	}
+ 
+ 	ret = ppe_nexthop_pool_get_and_ref(priv->ppe_dev, &priv->nexthop_pool, &nexthop,
+ 					    &nexthop_index);

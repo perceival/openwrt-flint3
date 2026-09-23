@@ -298,7 +298,7 @@ Signed-off-by: JiaY-shi <shi05275@163.com>
  			mlo_idx++;
  
  			break;
-@@ -2735,12 +2840,24 @@
+@@ -2735,11 +2840,23 @@
  
  static int ath12k_qmi_assign_target_mem_chunk(struct ath12k_base *ab)
  {
@@ -306,7 +306,6 @@ Signed-off-by: JiaY-shi <shi05275@163.com>
 +	struct ath12k_hw_group *ag = ab->ag;
  	struct reserved_mem *rmem;
  	size_t avail_rmem_size;
- 	u32 bdf_addr_offset;
 -	int i, idx, ret;
 +	int i, idx, mlo_idx, ret;
 +	int mlo_size = 0;

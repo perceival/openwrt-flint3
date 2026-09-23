@@ -1,0 +1,23 @@
+--- a/src/init/ssdk_init.c
++++ b/src/init/ssdk_init.c
+@@ -58,6 +58,20 @@
+ #else
+ #include <net/switch.h>
+ #endif
++
++/*
++ * SWITCH_TYPE_EXT is a QCA/QSDK vendor extension to enum switch_val_type
++ * that was never merged into the upstream swconfig uapi header (only
++ * UNSPEC/INT/STRING/PORTS/LINK/NOVAL exist there). The enum carries no
++ * MAX sentinel and no consumer indexes an array by it, so appending one
++ * more value here cannot collide with anything: swconfig core's generic
++ * get/set dispatch (drivers/net/phy/swconfig.c) simply falls through to
++ * its "default: -EINVAL" case for this one vendor debug attribute
++ * ("switch_ext"), which is unrelated to VLAN/port/PPE switch config.
++ */
++#ifndef SWITCH_TYPE_EXT
++#define SWITCH_TYPE_EXT 6
++#endif
+ #endif
+ 
+ #if defined(ISIS) ||defined(ISISC) ||defined(GARUDA)

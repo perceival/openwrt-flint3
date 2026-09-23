@@ -1,0 +1,10 @@
+--- a/src/init/ssdk_dts.c
++++ b/src/init/ssdk_dts.c
+@@ -38,6 +38,7 @@
+ #include <linux/of.h>
+ #include <linux/of_mdio.h>
+ #include <linux/of_platform.h>
++#include <linux/platform_device.h>
+ 
+ static ssdk_dt_global_t ssdk_dt_global = {0};
+ #ifdef HPPE

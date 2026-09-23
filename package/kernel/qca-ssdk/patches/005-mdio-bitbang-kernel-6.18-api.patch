@@ -1,0 +1,76 @@
+--- a/src/init/ssdk_plat.c
++++ b/src/init/ssdk_plat.c
+@@ -290,58 +290,34 @@
+ }
+ 
+ #if IS_ENABLED(CONFIG_MDIO_BITBANG)
++/*
++ * These are an opportunistic fast path: qca_mii_raw_{read,write,update}()
++ * below only take the result when it's SW_OK, and already have a working
++ * fallback for every other case (including our board's real MDIO
++ * controller, which never has bus->id == "gpio" and always fell through
++ * to that fallback anyway). Current kernels moved struct mdiobb_ctrl from
++ * raw sw_read/sw_write function pointers to an ops-vtable
++ * (include/linux/mdio-bitbang.h), so that direct-call shortcut can no
++ * longer be expressed here; rather than guess at wiring through the new
++ * ops API for a path this board never takes, just disable the fast path
++ * and always fall through to the existing slow path.
++ */
+ sw_error_t qca_bitbang_mii_raw_read_try(struct mii_bus *bus,
+ 				     a_uint32_t reg, a_uint32_t *val)
+ {
+-	struct mdiobb_ctrl *gpio_priv = bus->priv;
+-
+-	if (strncmp(bus->id, "gpio", strlen("gpio")))
+-		return SW_NOT_FOUND;
+-
+-	if (gpio_priv && gpio_priv->sw_read) {
+-		*val = gpio_priv->sw_read(bus, reg);
+-		return SW_OK;
+-	}
+-
+-	return SW_FAIL;
++	return SW_NOT_FOUND;
+ }
+ 
+ sw_error_t qca_bitbang_mii_raw_write_try(struct mii_bus *bus,
+ 				      a_uint32_t reg, a_uint32_t val)
+ {
+-	struct mdiobb_ctrl *gpio_priv = bus->priv;
+-
+-	if (strncmp(bus->id, "gpio", strlen("gpio")))
+-		return SW_NOT_FOUND;
+-
+-	if (gpio_priv && gpio_priv->sw_write) {
+-		gpio_priv->sw_write(bus, reg, val);
+-		return SW_OK;
+-	}
+-
+-	return SW_FAIL;
++	return SW_NOT_FOUND;
+ }
+ 
+ sw_error_t qca_bitbang_mii_raw_update_try(struct mii_bus *bus, a_uint32_t reg,
+ 					  a_uint32_t clear, a_uint32_t set)
+ {
+-	struct mdiobb_ctrl *gpio_priv = bus->priv;
+-
+-	if (strncmp(bus->id, "gpio", strlen("gpio")))
+-		return SW_NOT_FOUND;
+-
+-	if (gpio_priv && gpio_priv->sw_read && gpio_priv->sw_write) {
+-		a_uint32_t val;
+-
+-		val = gpio_priv->sw_read(bus, reg);
+-		val &= ~clear;
+-		val |= set;
+-		gpio_priv->sw_write(bus, reg, val);
+-
+-		return SW_OK;
+-	}
+-
+-	return SW_FAIL;
++	return SW_NOT_FOUND;
+ }
+ #endif
+ 

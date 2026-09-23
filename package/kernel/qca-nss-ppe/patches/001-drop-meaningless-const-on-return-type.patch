@@ -1,0 +1,31 @@
+--- a/drv/ppe_drv/ppe_drv_exception.h
++++ b/drv/ppe_drv/ppe_drv_exception.h
+@@ -69,6 +69,6 @@
+  */
+ extern struct ppe_drv_exception ppe_drv_exception_list[];
+ 
+-const uint8_t ppe_drv_exception_max(void);
+-const uint8_t ppe_drv_exception_tcpflag_max(void);
++uint8_t ppe_drv_exception_max(void);
++uint8_t ppe_drv_exception_tcpflag_max(void);
+ void ppe_drv_exception_init(void);
+--- a/drv/ppe_drv/ppe_drv_exception.c
++++ b/drv/ppe_drv/ppe_drv_exception.c
+@@ -232,7 +232,7 @@
+  * ppe_drv_exception_max()
+  *	Returns number of exception enabled in hardware.
+  */
+-const uint8_t ppe_drv_exception_max()
++uint8_t ppe_drv_exception_max()
+ {
+ 	return sizeof(ppe_drv_exception_list) / sizeof(struct ppe_drv_exception);
+ }
+@@ -241,7 +241,7 @@
+  * ppe_drv_exception_tcpflag_max()
+  *	Returns number of tcp flag exception enabled in hardware.
+  */
+-const uint8_t ppe_drv_exception_tcpflag_max()
++uint8_t ppe_drv_exception_tcpflag_max()
+ {
+ 	return sizeof(ppe_drv_exception_tcpflag_list) / sizeof(struct ppe_drv_exception_tcpflag);
+ }

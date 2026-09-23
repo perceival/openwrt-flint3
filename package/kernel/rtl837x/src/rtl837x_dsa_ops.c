@@ -1016,12 +1016,23 @@ static int rtl837x_tag_8021q_vlan_add(struct dsa_switch *ds, int port, u16 vid,
 
 static int rtl837x_tag_8021q_vlan_del(struct dsa_switch *ds, int port, u16 vid)
 {
+	struct dsa_port *dp = dsa_to_port(ds, port);
 	struct rtk_gsw *gsw = ds->priv;
 	typeof(gsw->vlan_table[0]) old_vlan;
 	int ret;
 
 	if (!rtl837x_valid_port(gsw, port) || !vid || vid > RTK_VID_MAX)
 		return -EINVAL;
+
+	/* Joining a bridge drops the port's standalone VLAN in favour of
+	 * the bridge's. Keep it in hardware anyway: the tagger still
+	 * addresses this port by its standalone VID for link-local frames
+	 * (STP, LLDP, PTP), which have to reach one specific link. Nothing
+	 * else uses the VID -- the port's PVID is the bridge VLAN, so
+	 * ingress and isolation are unaffected.
+	 */
+	if (dsa_port_bridge_dev_get(dp) && vid == dsa_tag_8021q_standalone_vid(dp))
+		return 0;
 
 	if (!gsw->vlan_table[vid].valid)
 		return 0;

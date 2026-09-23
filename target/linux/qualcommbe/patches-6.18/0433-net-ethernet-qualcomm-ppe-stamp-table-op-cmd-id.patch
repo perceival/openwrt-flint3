@@ -1,0 +1,65 @@
+From: Kamil Bienkiewicz <perceivalpercy@gmail.com>
+Subject: [PATCH] net: ethernet: qualcomm: ppe: stamp CMD_ID on host/flow
+ table ops
+
+The vendor SDK tags every host and flow table operation with a
+per-table rolling counter in the OP word's CMD_ID field
+(hppe_ip.c host_cmd_id, hppe_flow.c flow_cmd_id). This driver always
+left it at 0. Match the vendor sequence.
+
+This was split out of a throwaway debug patch (host CMD_ID + INDEX-mode
+probe) that has been dropped from the series.
+
+Signed-off-by: Kamil Bienkiewicz <perceivalpercy@gmail.com>
+---
+diff --color -ruN base/drivers/net/ethernet/qualcomm/ppe/ppe_flow.c w1/drivers/net/ethernet/qualcomm/ppe/ppe_flow.c
+--- a/drivers/net/ethernet/qualcomm/ppe/ppe_flow.c
++++ b/drivers/net/ethernet/qualcomm/ppe/ppe_flow.c
+@@ -27,6 +27,11 @@
+ 	PPE_FLOW_TBL_OP_FLUSH,
+ };
+ 
++/* Per-table command tag, mirroring the vendor SDK's hppe_flow.c
++ * flow_cmd_id -- see ppe_host_cmd_id in ppe_host.c.
++ */
++static u32 ppe_flow_cmd_id;
++
+ /* Trigger the given flow table operation and wait for hardware to
+  * complete it. *index is the entry index to operate on for
+  * PPE_FLOW_OP_MODE_INDEX (input); for PPE_FLOW_OP_MODE_HASH it is
+@@ -39,7 +44,8 @@
+ 	u32 val, rslt;
+ 	int ret;
+ 
+-	val = FIELD_PREP(PPE_IN_FLOW_TBL_OP_OP_TYPE, op_type);
++	val = FIELD_PREP(PPE_IN_FLOW_TBL_OP_CMD_ID, ppe_flow_cmd_id++);
++	val |= FIELD_PREP(PPE_IN_FLOW_TBL_OP_OP_TYPE, op_type);
+ 	val |= FIELD_PREP(PPE_IN_FLOW_TBL_OP_HASH_BLOCK_BITMAP, 3);
+ 	val |= FIELD_PREP(PPE_IN_FLOW_TBL_OP_OP_MODE, mode);
+ 	val |= FIELD_PREP(PPE_IN_FLOW_TBL_OP_ENTRY_INDEX, *index);
+diff --color -ruN base/drivers/net/ethernet/qualcomm/ppe/ppe_host.c w1/drivers/net/ethernet/qualcomm/ppe/ppe_host.c
+--- a/drivers/net/ethernet/qualcomm/ppe/ppe_host.c
++++ b/drivers/net/ethernet/qualcomm/ppe/ppe_host.c
+@@ -26,6 +26,12 @@
+ 	PPE_HOST_TBL_OP_FLUSH,
+ };
+ 
++/* Per-table command tag, mirroring the vendor SDK's hppe_ip.c
++ * host_cmd_id: incremented on every operation and stamped into the OP
++ * command word's CMD_ID field.
++ */
++static u32 ppe_host_cmd_id;
++
+ /* Trigger the given host table operation and wait for hardware to
+  * complete it. *index is the entry index to operate on for
+  * PPE_FLOW_OP_MODE_INDEX (input); for PPE_FLOW_OP_MODE_HASH it is
+@@ -38,7 +44,8 @@
+ 	u32 val, rslt;
+ 	int ret;
+ 
+-	val = FIELD_PREP(PPE_HOST_TBL_OP_OP_TYPE, op_type);
++	val = FIELD_PREP(PPE_HOST_TBL_OP_CMD_ID, ppe_host_cmd_id++);
++	val |= FIELD_PREP(PPE_HOST_TBL_OP_OP_TYPE, op_type);
+ 	val |= FIELD_PREP(PPE_HOST_TBL_OP_HASH_BLOCK_BITMAP, 3);
+ 	val |= FIELD_PREP(PPE_HOST_TBL_OP_OP_MODE, mode);
+ 	val |= FIELD_PREP(PPE_HOST_TBL_OP_ENTRY_INDEX, *index);

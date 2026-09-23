@@ -1,0 +1,493 @@
+From: Kamil Bienkiewicz <perceivalpercy@gmail.com>
+Subject: [PATCH] net: ethernet: qualcomm: ppe: use the APPE IPE_L3 register
+ map
+
+IPQ5332 is an APPE/MPPE part. The vendor SDK builds it with -DAPPE
+-DHPPE -DMPPE (CHIP_TYPE=MPPE expands to SUPPORT_CHIP="HPPE APPE MPPE"),
+so every "#if defined(APPE)" branch in hppe_ip_reg.h/hppe_flow_reg.h
+applies. Patches 0411-0421 took the IPQ807x "#else" branch instead,
+so every IPE_L3 table this driver touches was at the wrong address:
+
+  table              was        APPE
+  HOST_TBL_OP        0x2004bc   0x200724
+  HOST_TBL_OP_DATA   0x2004c0   0x200738
+  HOST_TBL_OP_RSLT   0x2004e8   0x200770
+  IN_FLOW_TBL_OP     0x2003b8   0x200528
+  IN_FLOW_TBL_DATA   0x2003c0   0x200550 (11 words, was 9)
+  IN_FLOW_TBL_RSLT   0x20040c   0x2005c4
+  IN_PUB_IP_ADDR_TBL 0x200378   0x2004d8
+  IN_L3_IF_TBL       0x202000   0x206000, stride 0x10 (was 0x8)
+  EG_L3_IF_TBL       0x02e000   0x023000
+  IN_NEXTHOP_TBL     0x260000   same base, stride 0x20 (was 0x10)
+
+On APPE, 0x2004bc is FLOW_CTRL1[0]: an ordinary read/write config
+register (three entries, all resetting to 0x00020000). That explains
+why the host "op" never completed and why the "op register" kept
+whatever was written to it. Every host ADD timed out with -ETIMEDOUT,
+so no flow was ever offloaded. The DATA writes landed on
+FLOW_CTRL1[1..2] and on the real public-IP table.
+
+Some entry layouts differ as well. This was checked by preprocessing
+the vendor headers with and without -DAPPE and diffing the computed
+bitfield layouts:
+
+- IPv4 5-tuple flow entry: 6 words, not 5. Word 4 bits 12+ and word
+  5 carry VPN_ID, PMTU_CHECK_TYPE and an 11+3-bit PMTU. The vendor
+  stack always sets PMTU to the transmit interface's MTU with an L3
+  length check (ppe_drv_flow.c). PMTU 0 would redirect every packet
+  to the CPU even with a valid entry, so the offload shim now fills it
+  from the redirect target's MTU.
+- Nexthop VSI-type entries: VSI is 6 bits (port-type stays 8).
+- IN_L3_IF: 3 words, adding DMAC_CHECK_DIS/VPN_ID/MRU_IPV6 in word 1
+  and MTU_IPV6/UDP_CSM0_CMD in word 2.
+- EG_L3_IF: word 2 gains tunnel fields; left zero.
+
+The op/result, host entry, public-IP and port-type nexthop layouts
+are identical in both branches and are unchanged.
+
+MPPE tables are also smaller (2048 flow, 768 host entries) than the
+12-/13-bit index fields. flow_owner[] stays sized by the field width,
+so any index hardware returns is safe to track and delete; a flow
+index beyond the real table size is reported once instead of failing
+an op that has already taken effect.
+
+The flow encoder was cross-checked by compiling it against the vendor's
+own APPE union in_flow_tbl_u. 200000 random entries matched word for
+word and round-tripped through decode.
+
+Signed-off-by: Kamil Bienkiewicz <perceivalpercy@gmail.com>
+---
+diff --color -ruN w1/drivers/net/ethernet/qualcomm/ppe/ppe_flow.c w2/drivers/net/ethernet/qualcomm/ppe/ppe_flow.c
+--- a/drivers/net/ethernet/qualcomm/ppe/ppe_flow.c
++++ b/drivers/net/ethernet/qualcomm/ppe/ppe_flow.c
+@@ -65,6 +65,15 @@
+ 
+ 	*index = FIELD_GET(PPE_IN_FLOW_TBL_OP_RSLT_ENTRY_INDEX, rslt);
+ 
++	/* The result field is 12 bits wide but the MPPE table only has
++	 * PPE_IN_FLOW_TBL_ENTRIES slots. Report it rather than fail: the
++	 * op has already taken effect, and callers size their per-index
++	 * state by the field width, so the index stays usable.
++	 */
++	if (*index >= PPE_IN_FLOW_TBL_ENTRIES)
++		dev_warn_once(ppe_dev->dev, "flow table op returned index %u beyond table size %u\n",
++			      *index, PPE_IN_FLOW_TBL_ENTRIES);
++
+ 	return 0;
+ }
+ 
+diff --color -ruN w1/drivers/net/ethernet/qualcomm/ppe/ppe_flow.h w2/drivers/net/ethernet/qualcomm/ppe/ppe_flow.h
+--- a/drivers/net/ethernet/qualcomm/ppe/ppe_flow.h
++++ b/drivers/net/ethernet/qualcomm/ppe/ppe_flow.h
+@@ -11,14 +11,14 @@
+ #include "ppe.h"
+ 
+ /* Number of 32-bit words that make up one IPv4 5-tuple flow entry.
+- * This is the entry's own size (union in_flow_tbl_u's val[5] in the
+- * vendor SDK for our non-APPE chip), not the wider 9-word capacity of
+- * PPE_IN_FLOW_TBL_OP_DATA -- that register block is sized for the
+- * largest entry type sharing this trigger mechanism (an IPv6 5-tuple
+- * entry needs all 9 words for its wider addresses); a plain IPv4
+- * 5-tuple entry only occupies the first 5.
++ * This is the entry's own size (union in_flow_tbl_u's val[6] in the
++ * vendor SDK for this APPE chip, see ppe_regs.h), not the wider 11-word
++ * capacity of PPE_IN_FLOW_TBL_OP_DATA -- that register block is sized
++ * for the largest entry type sharing this trigger mechanism (an IPv6
++ * 5-tuple entry needs more words for its wider addresses). Word 5 holds
++ * the top bits of the path MTU the hardware checks each packet against.
+  */
+-#define PPE_FLOW_TBL_ENTRY_WORDS		5
++#define PPE_FLOW_TBL_ENTRY_WORDS		6
+ 
+ /**
+  * enum ppe_flow_op_mode - PPE flow table addressing mode.
+diff --color -ruN w1/drivers/net/ethernet/qualcomm/ppe/ppe_flow_ipv4.c w2/drivers/net/ethernet/qualcomm/ppe/ppe_flow_ipv4.c
+--- a/drivers/net/ethernet/qualcomm/ppe/ppe_flow_ipv4.c
++++ b/drivers/net/ethernet/qualcomm/ppe/ppe_flow_ipv4.c
+@@ -10,7 +10,8 @@
+  * read-back path is eventually built expects. Field layout is cross-word:
+  * PRI_PROFILE splits 1+4 bits across words 1/2, the 32-bit IP address
+  * splits 20+12 bits across words 2/3, and L4_DPORT splits 4+12 bits
+- * across words 3/4 -- all confirmed against the vendor SDK's own packed
++ * across words 3/4, and the APPE-only PMTU splits 11+3 bits across
++ * words 4/5 -- all confirmed against the vendor SDK's own packed
+  * bitfield struct (struct in_flow_tbl_0, include/hsl/hppe/hppe_flow_reg.h)
+  * and its actual field-assignment code (adpt_hppe_flow_entry_add(),
+  * src/adpt/hppe/adpt_hppe_flow.c), not derived from the field-offset
+@@ -65,6 +66,9 @@
+ 	words[3] |= FIELD_PREP(PPE_FLOW_TBL_L4_DPORT_0, entry->match_dport);
+ 
+ 	words[4] = FIELD_PREP(PPE_FLOW_TBL_L4_DPORT_1, entry->match_dport >> 4);
++	words[4] |= entry->pmtu_check_l3 ? PPE_FLOW_TBL_PMTU_CHECK_TYPE : 0;
++	words[4] |= FIELD_PREP(PPE_FLOW_TBL_PMTU_0, entry->pmtu);
++	words[5] = FIELD_PREP(PPE_FLOW_TBL_PMTU_1, entry->pmtu >> 11);
+ }
+ 
+ /**
+@@ -106,4 +110,7 @@
+ 	entry->match_sport = FIELD_GET(PPE_FLOW_TBL_L4_SPORT, words[3]);
+ 	entry->match_dport = FIELD_GET(PPE_FLOW_TBL_L4_DPORT_0, words[3]) |
+ 			      (FIELD_GET(PPE_FLOW_TBL_L4_DPORT_1, words[4]) << 4);
++	entry->pmtu_check_l3 = !!(words[4] & PPE_FLOW_TBL_PMTU_CHECK_TYPE);
++	entry->pmtu = FIELD_GET(PPE_FLOW_TBL_PMTU_0, words[4]) |
++		      (FIELD_GET(PPE_FLOW_TBL_PMTU_1, words[5]) << 11);
+ }
+diff --color -ruN w1/drivers/net/ethernet/qualcomm/ppe/ppe_flow_ipv4.h w2/drivers/net/ethernet/qualcomm/ppe/ppe_flow_ipv4.h
+--- a/drivers/net/ethernet/qualcomm/ppe/ppe_flow_ipv4.h
++++ b/drivers/net/ethernet/qualcomm/ppe/ppe_flow_ipv4.h
+@@ -63,6 +63,11 @@
+  * by @host_addr_index (network byte order).
+  * @match_sport: Source port to match.
+  * @match_dport: Destination port to match.
++ * @pmtu: Path MTU matched packets are checked against before being
++ * forwarded; a packet exceeding it is redirected to the CPU. Must be
++ * set -- 0 would fail every packet.
++ * @pmtu_check_l3: Compare @pmtu against the L3 packet length (true) or
++ * the length including the L2 header (false).
+  */
+ struct ppe_flow_ipv4_snat_entry {
+ 	bool valid;
+@@ -82,6 +87,8 @@
+ 	__be32 match_ip;
+ 	u16 match_sport;
+ 	u16 match_dport;
++	u16 pmtu;
++	bool pmtu_check_l3;
+ };
+ 
+ void ppe_flow_ipv4_snat_entry_encode(const struct ppe_flow_ipv4_snat_entry *entry,
+diff --color -ruN w1/drivers/net/ethernet/qualcomm/ppe/ppe_l3_if.c w2/drivers/net/ethernet/qualcomm/ppe/ppe_l3_if.c
+--- a/drivers/net/ethernet/qualcomm/ppe/ppe_l3_if.c
++++ b/drivers/net/ethernet/qualcomm/ppe/ppe_l3_if.c
+@@ -36,7 +36,7 @@
+ int ppe_l3_if_in_entry_set(struct ppe_device *ppe_dev, u32 index,
+ 			    const struct ppe_l3_if_in_entry *entry)
+ {
+-	u32 base, val[2] = {};
++	u32 base, val[PPE_IN_L3_IF_TBL_WORDS] = {};
+ 	int ret;
+ 	int i;
+ 
+@@ -54,9 +54,12 @@
+ 	val[1] |= entry->ttl_exceed_de_acce ? PPE_IN_L3_IF_TBL_TTL_EXCEED_DE_ACCE : 0;
+ 	val[1] |= FIELD_PREP(PPE_IN_L3_IF_TBL_MAC_BITMAP, entry->mac_bitmap);
+ 	val[1] |= entry->pppoe_en ? PPE_IN_L3_IF_TBL_PPPOE_EN : 0;
++	val[1] |= FIELD_PREP(PPE_IN_L3_IF_TBL_MRU_IPV6, entry->mru_ipv6);
++
++	val[2] = FIELD_PREP(PPE_IN_L3_IF_TBL_MTU_IPV6, entry->mtu_ipv6);
+ 
+ 	base = PPE_IN_L3_IF_TBL_ADDR + index * PPE_IN_L3_IF_TBL_INC;
+-	for (i = 0; i < 2; i++) {
++	for (i = 0; i < PPE_IN_L3_IF_TBL_WORDS; i++) {
+ 		ret = regmap_write(ppe_dev->regmap, base + i * 4, val[i]);
+ 		if (ret)
+ 			return ret;
+@@ -76,7 +79,7 @@
+ int ppe_l3_if_in_entry_get(struct ppe_device *ppe_dev, u32 index,
+ 			    struct ppe_l3_if_in_entry *entry)
+ {
+-	u32 base, val[2];
++	u32 base, val[PPE_IN_L3_IF_TBL_WORDS];
+ 	int ret;
+ 	int i;
+ 
+@@ -84,7 +87,7 @@
+ 		return -EINVAL;
+ 
+ 	base = PPE_IN_L3_IF_TBL_ADDR + index * PPE_IN_L3_IF_TBL_INC;
+-	for (i = 0; i < 2; i++) {
++	for (i = 0; i < PPE_IN_L3_IF_TBL_WORDS; i++) {
+ 		ret = regmap_read(ppe_dev->regmap, base + i * 4, &val[i]);
+ 		if (ret)
+ 			return ret;
+@@ -101,6 +104,8 @@
+ 	entry->ttl_exceed_de_acce = !!(val[1] & PPE_IN_L3_IF_TBL_TTL_EXCEED_DE_ACCE);
+ 	entry->mac_bitmap = FIELD_GET(PPE_IN_L3_IF_TBL_MAC_BITMAP, val[1]);
+ 	entry->pppoe_en = !!(val[1] & PPE_IN_L3_IF_TBL_PPPOE_EN);
++	entry->mru_ipv6 = FIELD_GET(PPE_IN_L3_IF_TBL_MRU_IPV6, val[1]);
++	entry->mtu_ipv6 = FIELD_GET(PPE_IN_L3_IF_TBL_MTU_IPV6, val[2]);
+ 
+ 	return 0;
+ }
+diff --color -ruN w1/drivers/net/ethernet/qualcomm/ppe/ppe_l3_if.h w2/drivers/net/ethernet/qualcomm/ppe/ppe_l3_if.h
+--- a/drivers/net/ethernet/qualcomm/ppe/ppe_l3_if.h
++++ b/drivers/net/ethernet/qualcomm/ppe/ppe_l3_if.h
+@@ -15,6 +15,8 @@
+  * struct ppe_l3_if_in_entry - PPE ingress L3 interface table entry.
+  * @mru: Maximum receive unit enforced on this L3 interface, in bytes.
+  * @mtu: Maximum transmit unit enforced on this L3 interface, in bytes.
++ * @mru_ipv6: As @mru, for IPv6 packets.
++ * @mtu_ipv6: As @mtu, for IPv6 packets.
+  * @ttl_dec_bypass: Whether to skip decrementing TTL / hop limit for
+  * traffic routed through this L3 interface.
+  * @ipv4_uc_route_en: Whether IPv4 unicast routing is enabled.
+@@ -33,6 +35,8 @@
+ struct ppe_l3_if_in_entry {
+ 	u16 mru;
+ 	u16 mtu;
++	u16 mru_ipv6;
++	u16 mtu_ipv6;
+ 	bool ttl_dec_bypass;
+ 	bool ipv4_uc_route_en;
+ 	bool ipv6_uc_route_en;
+diff --color -ruN w1/drivers/net/ethernet/qualcomm/ppe/ppe_nexthop.c w2/drivers/net/ethernet/qualcomm/ppe/ppe_nexthop.c
+--- a/drivers/net/ethernet/qualcomm/ppe/ppe_nexthop.c
++++ b/drivers/net/ethernet/qualcomm/ppe/ppe_nexthop.c
+@@ -57,8 +57,10 @@
+ 	mac = ether_addr_to_u64(entry->dmac);
+ 
+ 	val[0] = FIELD_PREP(PPE_IN_NEXTHOP_TBL_TYPE, entry->port_valid ? 1 : 0);
+-	val[0] |= FIELD_PREP(PPE_IN_NEXTHOP_TBL_PORT_VSI,
+-			      entry->port_valid ? entry->port : entry->vsi);
++	if (entry->port_valid)
++		val[0] |= FIELD_PREP(PPE_IN_NEXTHOP_TBL_PORT, entry->port);
++	else
++		val[0] |= FIELD_PREP(PPE_IN_NEXTHOP_TBL_VSI, entry->vsi);
+ 	val[0] |= FIELD_PREP(PPE_IN_NEXTHOP_TBL_POST_L3_IF, entry->post_l3_if);
+ 	val[0] |= entry->ip_to_me ? PPE_IN_NEXTHOP_TBL_IP_TO_ME : 0;
+ 	val[0] |= entry->stag_fmt ? PPE_IN_NEXTHOP_TBL_STAG_FMT : 0;
+@@ -111,9 +113,9 @@
+ 
+ 	entry->port_valid = FIELD_GET(PPE_IN_NEXTHOP_TBL_TYPE, val[0]);
+ 	if (entry->port_valid)
+-		entry->port = FIELD_GET(PPE_IN_NEXTHOP_TBL_PORT_VSI, val[0]);
++		entry->port = FIELD_GET(PPE_IN_NEXTHOP_TBL_PORT, val[0]);
+ 	else
+-		entry->vsi = FIELD_GET(PPE_IN_NEXTHOP_TBL_PORT_VSI, val[0]);
++		entry->vsi = FIELD_GET(PPE_IN_NEXTHOP_TBL_VSI, val[0]);
+ 	entry->post_l3_if = FIELD_GET(PPE_IN_NEXTHOP_TBL_POST_L3_IF, val[0]);
+ 	entry->ip_to_me = !!(val[0] & PPE_IN_NEXTHOP_TBL_IP_TO_ME);
+ 	entry->stag_fmt = !!(val[0] & PPE_IN_NEXTHOP_TBL_STAG_FMT);
+diff --color -ruN w1/drivers/net/ethernet/qualcomm/ppe/ppe_offload.c w2/drivers/net/ethernet/qualcomm/ppe/ppe_offload.c
+--- a/drivers/net/ethernet/qualcomm/ppe/ppe_offload.c
++++ b/drivers/net/ethernet/qualcomm/ppe/ppe_offload.c
+@@ -256,6 +256,7 @@
+ 	const struct flow_action_entry *act;
+ 	bool vlan_push_seen = false;
+ 	u16 vlan_push_vid = 0;
++	unsigned int pmtu;
+ 	u8 ip_proto;
+ 	int action;
+ 	int ret;
+@@ -362,6 +363,18 @@
+ 	if (!odev || !eth.seen)
+ 		return ppe_offload_decline("odev=%d eth.seen=%d", !!odev, eth.seen);
+ 
++	/* Hardware checks each packet's L3 length against the flow's
++	 * PMTU and redirects oversized ones to the CPU. Take it from the
++	 * redirect target itself (before any VLAN unwrap below), as the
++	 * vendor stack does with the transmit interface's MTU.
++	 */
++	pmtu = READ_ONCE(odev->mtu);
++	/* Unlike the vendor stack, which clamps to its jumbo maximum, decline
++	 * rather than program a PMTU the packets can't match.
++	 */
++	if (pmtu > GENMASK(13, 0))	/* PMTU_0 (11 bits) + PMTU_1 (3 bits) */
++		return ppe_offload_decline("odev=%s mtu=%u too large", netdev_name(odev), pmtu);
++
+ 	/* A redirect to a VLAN netdevice (e.g. a tagged wan.10) needs a
+ 	 * matching FLOW_ACTION_VLAN_PUSH for the tag this driver is expected
+ 	 * to insert on egress, and the actual EDMA hardware programming
+@@ -421,7 +434,7 @@
+ 	memset(&nexthop, 0, sizeof(nexthop));
+ 	nexthop.port_valid = true;
+ 	/* Assumes this driver's own port_id numbering matches the
+-	 * vendor fal_port_t numbering PPE_IN_NEXTHOP_TBL_PORT_VSI
++	 * vendor fal_port_t numbering PPE_IN_NEXTHOP_TBL_PORT
+ 	 * expects (both apparently 1-based with 0 reserved) -- not
+ 	 * independently confirmed against vendor source, flagged for
+ 	 * hardware-test-time verification.
+@@ -464,6 +477,8 @@
+ 	flow_ipv4.match_ip = match_dst;
+ 	flow_ipv4.match_sport = be16_to_cpu(match_sport);
+ 	flow_ipv4.match_dport = be16_to_cpu(match_dport);
++	flow_ipv4.pmtu = pmtu;
++	flow_ipv4.pmtu_check_l3 = true;
+ 	ppe_flow_ipv4_snat_entry_encode(&flow_ipv4, flow_words);
+ 
+ 	flow_index = 0;
+diff --color -ruN w1/drivers/net/ethernet/qualcomm/ppe/ppe_regs.h w2/drivers/net/ethernet/qualcomm/ppe/ppe_regs.h
+--- a/drivers/net/ethernet/qualcomm/ppe/ppe_regs.h
++++ b/drivers/net/ethernet/qualcomm/ppe/ppe_regs.h
+@@ -1119,8 +1119,16 @@
+  * the operation, then poll PPE_IN_FLOW_TBL_OP_RSLT until VALID_CNT is set.
+  * Register offsets include the 0x200000 base of the flow-table sub-block
+  * (named IPE_L3 in the vendor SDK) within the PPE's MMIO window.
++ *
++ * IPQ5332 is an APPE/MPPE part: the vendor SDK is built with -DAPPE
++ * -DMPPE for it, so every IPE_L3 table below uses the vendor headers'
++ * "#if defined(APPE)" addresses, strides and entry layouts, not the
++ * IPQ807x (HPPE) "#else" ones. On APPE, 0x2004bc (the HPPE host op
++ * address) is FLOW_CTRL1 instead.
+  */
+-#define PPE_IN_FLOW_TBL_OP_ADDR			0x2003b8
++#define PPE_IN_FLOW_TBL_ENTRIES			2048
++
++#define PPE_IN_FLOW_TBL_OP_ADDR			0x200528
+ #define PPE_IN_FLOW_TBL_OP_CMD_ID		GENMASK(3, 0)
+ #define PPE_IN_FLOW_TBL_OP_BYP_RSLT_EN		BIT(4)
+ #define PPE_IN_FLOW_TBL_OP_OP_TYPE		GENMASK(7, 5)
+@@ -1129,11 +1137,11 @@
+ #define PPE_IN_FLOW_TBL_OP_OP_HOST_EN		BIT(11)
+ #define PPE_IN_FLOW_TBL_OP_ENTRY_INDEX		GENMASK(23, 12)
+ 
+-#define PPE_IN_FLOW_TBL_OP_DATA_ADDR		0x2003c0
+-#define PPE_IN_FLOW_TBL_OP_DATA_ENTRIES		9
++#define PPE_IN_FLOW_TBL_OP_DATA_ADDR		0x200550
++#define PPE_IN_FLOW_TBL_OP_DATA_ENTRIES		11
+ #define PPE_IN_FLOW_TBL_OP_DATA_INC		0x4
+ 
+-#define PPE_IN_FLOW_TBL_OP_RSLT_ADDR		0x20040c
++#define PPE_IN_FLOW_TBL_OP_RSLT_ADDR		0x2005c4
+ #define PPE_IN_FLOW_TBL_OP_RSLT_CMD_ID		GENMASK(3, 0)
+ #define PPE_IN_FLOW_TBL_OP_RSLT_OP_RSLT		BIT(4)
+ #define PPE_IN_FLOW_TBL_OP_RSLT_ENTRY_INDEX	GENMASK(16, 5)
+@@ -1143,7 +1151,7 @@
+  * indirectly with the same command/data/result sequence as the flow
+  * table above, but with its own register addresses and bitfield widths.
+  */
+-#define PPE_HOST_TBL_OP_ADDR			0x2004bc
++#define PPE_HOST_TBL_OP_ADDR			0x200724
+ #define PPE_HOST_TBL_OP_CMD_ID			GENMASK(3, 0)
+ #define PPE_HOST_TBL_OP_BYP_RSLT_EN		BIT(4)
+ #define PPE_HOST_TBL_OP_OP_TYPE			GENMASK(7, 5)
+@@ -1151,11 +1159,11 @@
+ #define PPE_HOST_TBL_OP_OP_MODE			BIT(10)
+ #define PPE_HOST_TBL_OP_ENTRY_INDEX		GENMASK(23, 11)
+ 
+-#define PPE_HOST_TBL_OP_DATA_ADDR		0x2004c0
++#define PPE_HOST_TBL_OP_DATA_ADDR		0x200738
+ #define PPE_HOST_TBL_OP_DATA_ENTRIES		10
+ #define PPE_HOST_TBL_OP_DATA_INC		0x4
+ 
+-#define PPE_HOST_TBL_OP_RSLT_ADDR		0x2004e8
++#define PPE_HOST_TBL_OP_RSLT_ADDR		0x200770
+ #define PPE_HOST_TBL_OP_RSLT_CMD_ID		GENMASK(3, 0)
+ #define PPE_HOST_TBL_OP_RSLT_OP_RSLT		BIT(4)
+ #define PPE_HOST_TBL_OP_RSLT_ENTRY_INDEX	GENMASK(17, 5)
+@@ -1163,8 +1171,8 @@
+ 
+ /* Field layout of an IPv4 host table entry (PPE_HOST_TBL_IPV4_ENTRY_WORDS
+  * words, written/read through ppe_host_entry_add/del() -- see
+- * ppe_host.c). Confirmed against the vendor SDK's non-APPE
+- * struct host_tbl (include/hsl/hppe/hppe_ip_reg.h) and its actual
++ * ppe_host.c). Confirmed against the vendor SDK's
++ * struct host_tbl, identical on APPE and non-APPE (include/hsl/hppe/hppe_ip_reg.h) and its actual
+  * assignment code (adpt_hppe_ip_host_add(), ppe_drv_host_v4_add()).
+  */
+ 
+@@ -1179,18 +1187,19 @@
+ /* Word 1 (IP_ADDR) is a single whole-word value, no bitfield mask. */
+ 
+ /* Nexthop table, unlike the flow and host tables above, is addressed
+- * directly: one fixed-size (4-word) entry per index, no indirect
++ * directly: one fixed-size (4-word, 0x20-strided on APPE) entry per index, no indirect
+  * command/data/result sequence. Each entry rewrites a packet's
+  * destination MAC (and, for a DNAT nexthop, its destination IP) before
+  * it egresses through a physical/virtual port or into a VSI.
+  */
+ #define PPE_IN_NEXTHOP_TBL_ADDR			0x260000
+ #define PPE_IN_NEXTHOP_TBL_ENTRIES		768
+-#define PPE_IN_NEXTHOP_TBL_INC			0x10
++#define PPE_IN_NEXTHOP_TBL_INC			0x20
+ 
+ /* Word 0. */
+ #define PPE_IN_NEXTHOP_TBL_TYPE			BIT(0)
+-#define PPE_IN_NEXTHOP_TBL_PORT_VSI		GENMASK(8, 1)
++#define PPE_IN_NEXTHOP_TBL_PORT			GENMASK(8, 1)
++#define PPE_IN_NEXTHOP_TBL_VSI			GENMASK(6, 1)
+ #define PPE_IN_NEXTHOP_TBL_POST_L3_IF		GENMASK(16, 9)
+ #define PPE_IN_NEXTHOP_TBL_IP_TO_ME		BIT(17)
+ #define PPE_IN_NEXTHOP_TBL_STAG_FMT		BIT(18)
+@@ -1208,18 +1217,16 @@
+ 
+ /* Ingress L3 interface table: per-L3-interface MTU/MRU/route-enable
+  * config, referenced by a flow entry's SRC_L3_IF and consulted on
+- * ingress. Addressed directly, two words per entry (the vendor SDK's
+- * non-APPE union in_l3_if_tbl_u -- APPE adds extra IPv6-specific
+- * fields this chip's field layout doesn't have, same #if defined(APPE)
+- * split already relied on throughout this driver). Final address is
+- * IPE_L3_BASE_ADDR (0x200000) + IN_L3_IF_TBL_ADDRESS (0x2000, non-APPE)
+- * -- confirmed against hppe_in_l3_if_tbl_get/set()'s own address
+- * computation, and within this driver's already-mapped "IPE L3"
+- * regmap range (0x200000-0x2fffff).
++ * ingress. Addressed directly, three words per entry on APPE (the
++ * vendor SDK's APPE union in_l3_if_tbl_u, which adds separate IPv6
++ * MRU/MTU fields). Final address is IPE_L3_BASE_ADDR (0x200000) +
++ * IN_L3_IF_TBL_ADDRESS (0x6000, APPE), within this driver's
++ * already-mapped "IPE L3" regmap range (0x200000-0x2fffff).
+  */
+-#define PPE_IN_L3_IF_TBL_ADDR			0x202000
++#define PPE_IN_L3_IF_TBL_ADDR			0x206000
+ #define PPE_IN_L3_IF_TBL_ENTRIES		256
+-#define PPE_IN_L3_IF_TBL_INC			0x8
++#define PPE_IN_L3_IF_TBL_INC			0x10
++#define PPE_IN_L3_IF_TBL_WORDS			3
+ 
+ /* Word 0. */
+ #define PPE_IN_L3_IF_TBL_MRU			GENMASK(13, 0)
+@@ -1234,6 +1241,13 @@
+ #define PPE_IN_L3_IF_TBL_TTL_EXCEED_DE_ACCE	BIT(2)
+ #define PPE_IN_L3_IF_TBL_MAC_BITMAP		GENMASK(10, 3)
+ #define PPE_IN_L3_IF_TBL_PPPOE_EN		BIT(11)
++#define PPE_IN_L3_IF_TBL_DMAC_CHECK_DIS		BIT(12)
++#define PPE_IN_L3_IF_TBL_VPN_ID			GENMASK(17, 13)
++#define PPE_IN_L3_IF_TBL_MRU_IPV6		GENMASK(31, 18)
++
++/* Word 2. */
++#define PPE_IN_L3_IF_TBL_MTU_IPV6		GENMASK(13, 0)
++#define PPE_IN_L3_IF_TBL_UDP_CSM0_CMD		GENMASK(15, 14)
+ 
+ /* Egress L3 interface table: per-L3-interface source MAC (and, when
+  * PPPoE-encapsulating, session ID) applied on egress. Referenced by a
+@@ -1241,12 +1255,10 @@
+  * nexthop, not just tunnel/PPPoE ones -- confirmed via
+  * ppe_drv_nexthop_v4_get_and_ref() unconditionally setting
+  * fal_nh.if_index. Addressed directly, three words per entry (the
+- * vendor SDK's non-APPE union eg_l3_if_tbl_u; APPE adds tunnel fields
+- * this chip doesn't have). Final address is NSS_PTX_CSR_BASE_ADDR
+- * (0x020000) + EG_L3_IF_TBL_ADDRESS (0xe000, non-APPE) -- confirmed
+- * against hppe_eg_l3_if_tbl_get/set()'s own address computation, and
+- * within this driver's already-mapped "PTX CSR" regmap range
+- * (0x20000-0x5ffff).
++ * vendor SDK's APPE union eg_l3_if_tbl_u; its extra tunnel fields in
++ * word 2 are left zero). Final address is NSS_PTX_CSR_BASE_ADDR
++ * (0x020000) + EG_L3_IF_TBL_ADDRESS (0x3000, APPE), within this
++ * driver's already-mapped "PTX CSR" regmap range (0x20000-0x5ffff).
+  *
+  * MAC address byte-order confirmed against the vendor's own packing
+  * (adpt_hppe_ip.c: mac_addr_0 = uc[5] | uc[4] << 8 | uc[3] << 16 |
+@@ -1254,7 +1266,7 @@
+  * ether_addr_to_u64()'s low 32 bits in word 0 and high 16 bits in the
+  * low half of word 1, the mirror image of PPE_IN_NEXTHOP_TBL's split.
+  */
+-#define PPE_EG_L3_IF_TBL_ADDR			0x02e000
++#define PPE_EG_L3_IF_TBL_ADDR			0x023000
+ #define PPE_EG_L3_IF_TBL_ENTRIES		256
+ #define PPE_EG_L3_IF_TBL_INC			0x10
+ 
+@@ -1272,10 +1284,10 @@
+  * PUB_ADDR_INDEX. Small (16 entries) and direct-addressed, a single
+  * whole-word IP value per entry -- confirmed against
+  * hppe_in_pub_ip_addr_tbl_get/set()'s own address computation:
+- * IPE_L3_BASE_ADDR (0x200000) + IN_PUB_IP_ADDR_TBL_ADDRESS (0x378,
+- * non-APPE), within this driver's already-mapped "IPE L3" range.
++ * IPE_L3_BASE_ADDR (0x200000) + IN_PUB_IP_ADDR_TBL_ADDRESS (0x4d8,
++ * APPE), within this driver's already-mapped "IPE L3" range.
+  */
+-#define PPE_PUB_IP_ADDR_TBL_ADDR		0x200378
++#define PPE_PUB_IP_ADDR_TBL_ADDR		0x2004d8
+ #define PPE_PUB_IP_ADDR_TBL_ENTRIES		16
+ #define PPE_PUB_IP_ADDR_TBL_INC		0x4
+ 
+@@ -1318,4 +1330,10 @@
+ 
+ /* Word 4. */
+ #define PPE_FLOW_TBL_L4_DPORT_1			GENMASK(11, 0)
++#define PPE_FLOW_TBL_VPN_ID			GENMASK(19, 12)
++#define PPE_FLOW_TBL_PMTU_CHECK_TYPE		BIT(20)
++#define PPE_FLOW_TBL_PMTU_0			GENMASK(31, 21)
++
++/* Word 5. */
++#define PPE_FLOW_TBL_PMTU_1			GENMASK(2, 0)
+ #endif

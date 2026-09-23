@@ -1,0 +1,36 @@
+From: village <village@flint3-port>
+Subject: hsl: sfp_phy: fix PHY driver registration API for kernel 6.18
+
+Same issue as 001-qca808x-kernel-6.18-phy-api.patch: phy_driver_register()/
+phy_driver_unregister() were replaced upstream by the batch
+phy_drivers_register()/phy_drivers_unregister() API.
+
+The line 341 IN_PHY_I2C_MODE call site is left alone -- that config option
+is not enabled in our build, so it never actually compiles, and this SFP
+PHY driver as a whole is not relevant to the Flint 3 (BE9300, no SFP cage)
+-- fixed only for build correctness of the unconditionally-compiled vendor
+source tree.
+
+--- a/src/hsl/phy/sfp_phy.c
++++ b/src/hsl/phy/sfp_phy.c
+@@ -387,11 +387,7 @@
+ 	int ret = 0;
+ 	if(sfp_phy_drv_registered == A_FALSE)
+ 	{
+-#if (LINUX_VERSION_CODE >= KERNEL_VERSION(4,9,0))
+-		ret = phy_driver_register(&sfp_phy_driver, THIS_MODULE);
+-#else
+-		ret = phy_driver_register(&sfp_phy_driver);
+-#endif
++		ret = phy_drivers_register(&sfp_phy_driver, 1, THIS_MODULE);
+ 		sfp_phy_drv_registered = A_TRUE;
+ 	}
+ 	return ret;
+@@ -401,7 +397,7 @@
+ {
+ 	if (sfp_phy_drv_registered == A_TRUE)
+ 	{
+-		phy_driver_unregister(&sfp_phy_driver);
++		phy_drivers_unregister(&sfp_phy_driver, 1);
+ 	}
+ }

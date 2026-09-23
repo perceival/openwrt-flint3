@@ -39,36 +39,7 @@ Signed-off-by: JiaY-shi <shi05275@163.com>
  void ath12k_dp_link_peer_unmap_event(struct ath12k_base *ab, u16 peer_id);
 --- a/drivers/net/wireless/ath/ath12k/mac.c
 +++ b/drivers/net/wireless/ath/ath12k/mac.c
-@@ -3587,10 +3587,26 @@ static void ath12k_peer_assoc_prepare(st
- 				      struct ath12k_wmi_peer_assoc_arg *arg,
- 				      bool reassoc)
- {
-+	struct ath12k_dp_link_peer *peer;
-+	struct ath12k_dp *dp = ath12k_ab_to_dp(ar->ab);
-+
- 	lockdep_assert_wiphy(ath12k_ar_to_hw(ar)->wiphy);
- 
- 	memset(arg, 0, sizeof(*arg));
- 
-+	/* Reset the target peer's status before the completion is cleared, so
-+	 * that a confirmation still in flight from an earlier, timed-out peer
-+	 * assoc on this radio is absorbed by the reinit instead of being read
-+	 * back as this command's result. arg is not populated yet, so key the
-+	 * lookup off the link vif and link sta it is about to be built from.
-+	 */
-+	spin_lock_bh(&dp->dp_lock);
-+	peer = ath12k_dp_link_peer_find_by_vdev_and_addr(dp, arvif->vdev_id,
-+							 arsta->addr);
-+	if (peer)
-+		peer->assoc_status = U32_MAX;
-+	spin_unlock_bh(&dp->dp_lock);
-+
- 	reinit_completion(&ar->peer_assoc_done);
- 
- 	arg->peer_new_assoc = !reassoc;
-@@ -3610,8 +3626,47 @@ static void ath12k_peer_assoc_prepare(st
- 
- 	arsta->peer_nss = arg->peer_nss;
+@@ -3648,6 +3648,45 @@ static void ath12k_peer_assoc_prepare(st
  	/* TODO: amsdu_disable req? */
  }
  
@@ -114,37 +85,42 @@ Signed-off-by: JiaY-shi <shi05275@163.com>
  static int ath12k_setup_peer_smps(struct ath12k *ar, struct ath12k_link_vif *arvif,
  				  const u8 *addr,
  				  const struct ieee80211_sta_ht_cap *ht_cap,
-@@ -3938,6 +3992,9 @@
- 		return;
- 	}
+@@ -3870,11 +3909,23 @@ static u32 ath12k_mac_ieee80211_sta_bw_t
+ }
  
-+	if (ath12k_mac_peer_assoc_status(ar, arvif->vdev_id, bss_conf->bssid))
-+		return;
+ static int ath12k_mac_peer_assoc(struct ath12k *ar,
+ 				 struct ath12k_wmi_peer_assoc_arg *peer_arg)
+ {
++	struct ath12k_dp_link_peer *peer;
++	struct ath12k_dp *dp = ath12k_ab_to_dp(ar->ab);
+ 	struct ath12k_hw *ah = ath12k_ar_to_ah(ar);
+ 	int ret;
+ 
++	/* A completion is shared by the radio. Reset the target peer as well
++	 * so an unrelated or stale confirmation cannot look like success.
++	 */
++	spin_lock_bh(&dp->dp_lock);
++	peer = ath12k_dp_link_peer_find_by_vdev_and_addr(dp, peer_arg->vdev_id,
++								 peer_arg->peer_mac);
++	if (peer)
++		peer->assoc_status = U32_MAX;
++	spin_unlock_bh(&dp->dp_lock);
 +
- 	ret = ath12k_setup_peer_smps(ar, arvif, bss_conf->bssid,
- 				     &link_sta->ht_cap, &link_sta->he_6ghz_capa);
- 	if (ret) {
-@@ -6506,6 +6563,10 @@
+ 	reinit_completion(&ar->peer_assoc_done);
+ 	reinit_completion(&ah->peer_ml_id_done);
+ 
+@@ -3891,6 +3942,11 @@ static int ath12k_mac_peer_assoc(struct
  		return -ETIMEDOUT;
  	}
  
-+	ret = ath12k_mac_peer_assoc_status(ar, arvif->vdev_id, arsta->addr);
++	ret = ath12k_mac_peer_assoc_status(ar, peer_arg->vdev_id,
++					   peer_arg->peer_mac);
 +	if (ret)
 +		return ret;
 +
- 	num_vht_rates = ath12k_mac_bitrate_mask_num_vht_rates(ar, band, mask);
- 	num_he_rates = ath12k_mac_bitrate_mask_num_he_rates(ar, band, mask);
- 	num_eht_rates = ath12k_mac_bitrate_mask_num_eht_rates(ar, band, mask);
-@@ -6861,6 +6922,9 @@
- 			if (!wait_for_completion_timeout(&ar->peer_assoc_done, 1 * HZ))
- 				ath12k_warn(ar->ab, "failed to get peer assoc conf event for %pM vdev %i\n",
- 					    arsta->addr, arvif->vdev_id);
-+			else
-+				ath12k_mac_peer_assoc_status(ar, arvif->vdev_id,
-+							     arsta->addr);
- 		}
- 	}
- }
+ 	/*
+ 	 * For devices where the firmware allocates the MLD peer ID, the host
+ 	 * learns the real ID only from the MLO_RX_PEER_MAP HTT event, which is
 --- a/drivers/net/wireless/ath/ath12k/wmi.c
 +++ b/drivers/net/wireless/ath/ath12k/wmi.c
 @@ -6857,28 +6857,60 @@ ath12k_pull_vdev_install_key_compl_ev(st

@@ -1,0 +1,218 @@
+From: Kamil Bienkiewicz <perceivalpercy@gmail.com>
+Subject: [PATCH] net: ethernet: qualcomm: ppe: add inert TC-offload
+ block registration
+
+Continuation of the PPE hardware flow-offload port -- see
+project_flint3_ppe_hw_offload_research.md for the full architectural
+context. This is the first half of the TC-hook shim, split
+deliberately in two per prior review: this half only registers the TC
+block callback so the kernel's flow-offload infrastructure can find
+this driver and offer it flows; ppe_offload_flow_cmd() declines every
+FLOW_CLS_REPLACE with -EOPNOTSUPP rather than parsing a flow_rule or
+programming any hardware. The second half -- actually accepting and
+programming flows -- is a separate, larger change that needs its own
+review and the project's live-hardware go-ahead, not bundled in here.
+
+Modeled on drivers/net/ethernet/mediatek/mtk_ppe_offload.c's TC block
+bind/unbind handling (flow_block_cb_alloc/_lookup/_incref/_decref/
+_add/_remove, requiring FLOW_BLOCK_BINDER_TYPE_CLSACT_INGRESS), read
+in full before writing this. Only one PPE instance exists per SoC, so
+a single file-scope block callback list is sufficient rather than
+introducing a per-device context struct now -- the hardware-programming
+half will need real state (an rhashtable of offloaded flows, links to
+the host/nexthop pools from 0418) and is expected to introduce that
+struct when it lands, not before.
+
+Wires .ndo_setup_tc onto edma_port_netdev_ops, which -- unlike 0419's
+register write -- has no runtime effect on its own: NETIF_F_HW_TC is
+deliberately *not* set on the netdevice's features in this patch, and
+this project's current nftables config uses software flowtables
+(kmod-nft-offload) with no hardware-offload flag, so nothing in the
+kernel's flow-offload infrastructure has any reason to call this
+callback in the current running configuration. It is reachable only if
+something explicitly requests hardware-offloaded TC/nftables flow
+acceleration on one of these netdevices, which nothing does yet.
+
+Compile-tested only (module builds and links cleanly, all three new
+symbols present); no hardware testing has been done.
+
+Signed-off-by: Kamil Bienkiewicz <perceivalpercy@gmail.com>
+---
+--- a/drivers/net/ethernet/qualcomm/ppe/Makefile
++++ b/drivers/net/ethernet/qualcomm/ppe/Makefile
+@@ -4,7 +4,7 @@
+ #
+ 
+ obj-$(CONFIG_QCOM_PPE) += qcom-ppe.o
+-qcom-ppe-objs := ppe.o ppe_config.o ppe_debugfs.o ppe_port.o ppe_api.o ppe_flow.o ppe_host.o ppe_nexthop.o ppe_flow_ipv4.o ppe_l3_if.o ppe_host_pool.o ppe_nexthop_pool.o
++qcom-ppe-objs := ppe.o ppe_config.o ppe_debugfs.o ppe_port.o ppe_api.o ppe_flow.o ppe_host.o ppe_nexthop.o ppe_flow_ipv4.o ppe_l3_if.o ppe_host_pool.o ppe_nexthop_pool.o ppe_offload.o
+ 
+ #EDMA
+ qcom-ppe-objs += edma.o edma_cfg_rx.o edma_cfg_tx.o edma_debugfs.o edma_port.o edma_rx.o edma_tx.o edma_ethtool.o
+--- a/drivers/net/ethernet/qualcomm/ppe/edma_port.c
++++ b/drivers/net/ethernet/qualcomm/ppe/edma_port.c
+@@ -16,6 +16,7 @@
+ #include "edma_cfg_tx.h"
+ #include "edma_port.h"
+ #include "ppe_l3_if.h"
++#include "ppe_offload.h"
+ #include "ppe_regs.h"
+ 
+ /* Number of netdev queues. */
+@@ -360,6 +361,7 @@
+ 	.ndo_eth_ioctl = edma_port_ioctl,
+ 	.ndo_features_check = edma_port_feature_check,
+ 	.ndo_select_queue = edma_port_select_queue,
++	.ndo_setup_tc = ppe_offload_setup_tc,
+ };
+ 
+ /**
+--- /dev/null
++++ b/drivers/net/ethernet/qualcomm/ppe/ppe_offload.h
+@@ -0,0 +1,15 @@
++/* SPDX-License-Identifier: GPL-2.0-only
++ *
++ * Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.
++ */
++
++#ifndef __PPE_OFFLOAD_H__
++#define __PPE_OFFLOAD_H__
++
++struct net_device;
++enum tc_setup_type;
++
++int ppe_offload_setup_tc(struct net_device *netdev, enum tc_setup_type type,
++			  void *type_data);
++
++#endif
+--- /dev/null
++++ b/drivers/net/ethernet/qualcomm/ppe/ppe_offload.c
+@@ -0,0 +1,128 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/*
++ * Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.
++ */
++
++/* PPE hardware flow-offload TC hook -- .ndo_setup_tc entry point for
++ * this driver's netdevices, modeled on drivers/net/ethernet/mediatek/
++ * mtk_ppe_offload.c.
++ *
++ * This is deliberately the *inert* half only: it registers the TC
++ * block callback so the kernel's flow-offload infrastructure can find
++ * this driver and offer it flows, but ppe_offload_flow_cmd() declines
++ * every FLOW_CLS_REPLACE with -EOPNOTSUPP rather than actually parsing
++ * a flow_rule and programming hardware. That is the next piece, and is
++ * gated on its own review -- unlike this file, it will not be inert.
++ *
++ * Only one PPE instance exists per SoC, so a single file-scope block
++ * callback list (rather than one embedded in some per-device context
++ * struct) is sufficient here and avoids introducing state this half
++ * doesn't need. The hardware-programming half will need real
++ * per-device state (an rhashtable of offloaded flows, references to
++ * the host/nexthop pools) and is expected to introduce that struct
++ * when it lands.
++ */
++
++#include <linux/list.h>
++#include <linux/netdevice.h>
++#include <net/flow_offload.h>
++#include <net/pkt_cls.h>
++
++#include "ppe_offload.h"
++
++static LIST_HEAD(ppe_offload_block_cb_list);
++
++static int ppe_offload_flow_cmd(struct net_device *netdev, struct flow_cls_offload *cls)
++{
++	switch (cls->command) {
++	case FLOW_CLS_REPLACE:
++		/* Hardware programming not yet implemented. */
++		return -EOPNOTSUPP;
++	case FLOW_CLS_DESTROY:
++	case FLOW_CLS_STATS:
++		/* Nothing is ever successfully offloaded yet, so the
++		 * kernel never has a reason to call these for a flow
++		 * this driver produced.
++		 */
++		return -EOPNOTSUPP;
++	default:
++		return -EOPNOTSUPP;
++	}
++}
++
++static int ppe_offload_setup_tc_block_cb(enum tc_setup_type type, void *type_data,
++					  void *cb_priv)
++{
++	struct net_device *netdev = cb_priv;
++
++	if (!tc_can_offload(netdev))
++		return -EOPNOTSUPP;
++
++	switch (type) {
++	case TC_SETUP_CLSFLOWER:
++		return ppe_offload_flow_cmd(netdev, type_data);
++	default:
++		return -EOPNOTSUPP;
++	}
++}
++
++static int ppe_offload_setup_tc_block(struct net_device *netdev,
++				       struct flow_block_offload *f)
++{
++	struct flow_block_cb *block_cb;
++
++	if (f->binder_type != FLOW_BLOCK_BINDER_TYPE_CLSACT_INGRESS)
++		return -EOPNOTSUPP;
++
++	switch (f->command) {
++	case FLOW_BLOCK_BIND:
++		block_cb = flow_block_cb_lookup(f->block, ppe_offload_setup_tc_block_cb,
++						 netdev);
++		if (block_cb) {
++			flow_block_cb_incref(block_cb);
++			return 0;
++		}
++
++		block_cb = flow_block_cb_alloc(ppe_offload_setup_tc_block_cb, netdev,
++						netdev, NULL);
++		if (IS_ERR(block_cb))
++			return PTR_ERR(block_cb);
++
++		flow_block_cb_incref(block_cb);
++		flow_block_cb_add(block_cb, f);
++		list_add_tail(&block_cb->driver_list, &ppe_offload_block_cb_list);
++		return 0;
++	case FLOW_BLOCK_UNBIND:
++		block_cb = flow_block_cb_lookup(f->block, ppe_offload_setup_tc_block_cb,
++						 netdev);
++		if (!block_cb)
++			return -ENOENT;
++
++		if (!flow_block_cb_decref(block_cb)) {
++			flow_block_cb_remove(block_cb, f);
++			list_del(&block_cb->driver_list);
++		}
++		return 0;
++	default:
++		return -EOPNOTSUPP;
++	}
++}
++
++/**
++ * ppe_offload_setup_tc() - .ndo_setup_tc entry point for PPE hardware offload.
++ * @netdev: The netdevice TC is being configured on.
++ * @type: The TC setup operation.
++ * @type_data: Operation-specific data.
++ *
++ * Return: 0 on success, a negative error code otherwise.
++ */
++int ppe_offload_setup_tc(struct net_device *netdev, enum tc_setup_type type, void *type_data)
++{
++	switch (type) {
++	case TC_SETUP_BLOCK:
++	case TC_SETUP_FT:
++		return ppe_offload_setup_tc_block(netdev, type_data);
++	default:
++		return -EOPNOTSUPP;
++	}
++}

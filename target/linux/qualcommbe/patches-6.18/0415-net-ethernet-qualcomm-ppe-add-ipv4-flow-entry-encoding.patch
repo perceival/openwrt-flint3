@@ -1,0 +1,317 @@
+From: Kamil Bienkiewicz <perceivalpercy@gmail.com>
+Subject: [PATCH] net: ethernet: qualcomm: ppe: add IPv4 flow entry field
+ encoding (SNAT variant)
+
+Continuation of 0411-0414 -- see project_flint3_ppe_hw_offload_research.md
+for the full architectural context. 0411-0413 built the three table
+primitives (flow/host/nexthop) a hardware NAT flow entry needs; this
+adds the actual field encoding for one of them -- translating a plain C
+struct describing an IPv4 5-tuple flow entry into the
+PPE_FLOW_TBL_ENTRY_WORDS-word format ppe_flow_entry_add() writes.
+
+Scoped to the SNAT (source NAT) forwarding variant only -- the
+quintessential home-router masquerade case and the primary motivation
+for this whole effort. DNAT/ROUTE/BRIDGE reuse the same word 1 bit
+range (bits 32-59 of the full entry) for different fields depending on
+FWD_TYPE and each need their own struct/encode function; not
+implemented here, and noted as such in both the new header and the
+register comments in ppe_regs.h.
+
+All field values (entry_type IPv4/IPv6, protocol_type TCP/UDP/UDPLITE/
+other, host_addr_index_type source/dest selector, fwd_type FORWARD/
+SNAT/DNAT/ROUTE/BRIDGE/DROP/RDT_TO_CPU, and the exact bit position of
+every field including the ones that cross word boundaries -- PRI_PROFILE
+splits 1+4 bits across words 1/2, the IP address splits 20+12 bits
+across words 2/3, L4_DPORT splits 4+12 bits across words 3/4) were
+confirmed against the vendor SDK's own packed bitfield struct (struct
+in_flow_tbl_0, include/hsl/hppe/hppe_flow_reg.h) and its actual
+field-assignment code (adpt_hppe_flow_entry_add(),
+src/adpt/hppe/adpt_hppe_flow.c) -- not derived from the abstract
+register field-offset table alone, which documents the *combined*
+32-bit-address-space view of these fields (e.g. one 32-bit PRI_PROFILE-
+adjacent block) rather than how they actually land once split across
+32-bit hardware words.
+
+IP address representation matches ppe_nexthop.c's dnat_ip: a plain
+32-bit register value equal to be32_to_cpu() of the address, confirmed
+via fal_ip4_addr_t's definition (a bare a_uint32_t assigned with no
+byte manipulation in vendor code) -- same convention, verified again
+rather than assumed to carry over.
+
+As with 0411-0413's register-level work, wrote a standalone Python
+model of the exact FIELD_PREP/FIELD_GET packing logic and round-tripped
+a representative entry (every field, non-trivial values) before writing
+this patch, to catch any bit-position mistakes independent of the code
+compiling.
+
+Not wired into anything yet, no behavioral effect. Compile-tested only
+(module builds and links cleanly, both new symbols confirmed present
+via nm); no hardware testing, since nothing calls these functions yet.
+
+Signed-off-by: Kamil Bienkiewicz <perceivalpercy@gmail.com>
+---
+--- a/drivers/net/ethernet/qualcomm/ppe/Makefile
++++ b/drivers/net/ethernet/qualcomm/ppe/Makefile
+@@ -4,7 +4,7 @@
+ #
+ 
+ obj-$(CONFIG_QCOM_PPE) += qcom-ppe.o
+-qcom-ppe-objs := ppe.o ppe_config.o ppe_debugfs.o ppe_port.o ppe_api.o ppe_flow.o ppe_host.o ppe_nexthop.o
++qcom-ppe-objs := ppe.o ppe_config.o ppe_debugfs.o ppe_port.o ppe_api.o ppe_flow.o ppe_host.o ppe_nexthop.o ppe_flow_ipv4.o
+ 
+ #EDMA
+ qcom-ppe-objs += edma.o edma_cfg_rx.o edma_cfg_tx.o edma_debugfs.o edma_port.o edma_rx.o edma_tx.o edma_ethtool.o
+--- a/drivers/net/ethernet/qualcomm/ppe/ppe_regs.h
++++ b/drivers/net/ethernet/qualcomm/ppe/ppe_regs.h
+@@ -1188,4 +1188,44 @@
+ /* Word 2 (MAC_ADDR_1) and word 3 (IP_ADDR_DNAT) are each a single
+  * whole-word value, so need no bitfield mask.
+  */
++
++/* Field layout of an IPv4 5-tuple flow entry (PPE_FLOW_TBL_ENTRY_WORDS
++ * words, written through PPE_IN_FLOW_TBL_OP_DATA / read back through
++ * PPE_IN_FLOW_TBL_OP_RSLT -- see ppe_flow.h/.c). This is the
++ * SNAT-variant field layout (union in_flow_tbl_u's bf0 in the vendor
++ * SDK); DNAT/ROUTE/BRIDGE reuse the same word 1 bit range (12-31) for
++ * different fields and need their own layout when implemented.
++ */
++
++/* Word 0. */
++#define PPE_FLOW_TBL_VALID			BIT(0)
++#define PPE_FLOW_TBL_ENTRY_TYPE			BIT(1)
++#define PPE_FLOW_TBL_HOST_ADDR_INDEX_TYPE	BIT(2)
++#define PPE_FLOW_TBL_HOST_ADDR_INDEX		GENMASK(15, 3)
++#define PPE_FLOW_TBL_PROTOCOL_TYPE		GENMASK(17, 16)
++#define PPE_FLOW_TBL_AGE			GENMASK(19, 18)
++#define PPE_FLOW_TBL_SRC_L3_IF_VALID		BIT(20)
++#define PPE_FLOW_TBL_SRC_L3_IF			GENMASK(28, 21)
++#define PPE_FLOW_TBL_FWD_TYPE			GENMASK(31, 29)
++
++/* Word 1 (SNAT variant: next-hop index + rewritten source port). */
++#define PPE_FLOW_TBL_SNAT_NEXT_HOP		GENMASK(11, 0)
++#define PPE_FLOW_TBL_SNAT_L4_PORT		GENMASK(27, 12)
++#define PPE_FLOW_TBL_DE_ACCE			BIT(28)
++#define PPE_FLOW_TBL_COPY_TO_CPU_EN		BIT(29)
++#define PPE_FLOW_TBL_SYN_TOGGLE			BIT(30)
++#define PPE_FLOW_TBL_PRI_PROFILE_0		BIT(31)
++
++/* Word 2. */
++#define PPE_FLOW_TBL_PRI_PROFILE_1		GENMASK(3, 0)
++#define PPE_FLOW_TBL_SERVICE_CODE		GENMASK(11, 4)
++#define PPE_FLOW_TBL_IP_ADDR_0			GENMASK(31, 12)
++
++/* Word 3. */
++#define PPE_FLOW_TBL_IP_ADDR_1			GENMASK(11, 0)
++#define PPE_FLOW_TBL_L4_SPORT			GENMASK(27, 12)
++#define PPE_FLOW_TBL_L4_DPORT_0			GENMASK(31, 28)
++
++/* Word 4. */
++#define PPE_FLOW_TBL_L4_DPORT_1			GENMASK(11, 0)
+ #endif
+--- /dev/null
++++ b/drivers/net/ethernet/qualcomm/ppe/ppe_flow_ipv4.h
+@@ -0,0 +1,92 @@
++/* SPDX-License-Identifier: GPL-2.0-only
++ *
++ * Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.
++ */
++
++#ifndef __PPE_FLOW_IPV4_H__
++#define __PPE_FLOW_IPV4_H__
++
++#include <linux/types.h>
++
++#include "ppe_flow.h"
++
++/**
++ * enum ppe_flow_protocol - Layer-4 protocol matched by a flow entry.
++ */
++enum ppe_flow_protocol {
++	PPE_FLOW_PROTO_OTHER = 0,
++	PPE_FLOW_PROTO_TCP = 1,
++	PPE_FLOW_PROTO_UDP = 2,
++	PPE_FLOW_PROTO_UDPLITE = 3,
++};
++
++/**
++ * enum ppe_flow_fwd_type - Forwarding action performed by a flow entry.
++ * Hardware field width is 3 bits; only PPE_FLOW_FWD_SNAT's field layout
++ * (struct in_flow_tbl_0 in the vendor SDK) has been implemented so far
++ * -- DNAT/ROUTE/BRIDGE each reuse the same word 1 bit range for
++ * different fields and need their own entry struct/encode function.
++ */
++enum ppe_flow_fwd_type {
++	PPE_FLOW_FWD_FORWARD = 0,
++	PPE_FLOW_FWD_SNAT = 1,
++	PPE_FLOW_FWD_DNAT = 2,
++	PPE_FLOW_FWD_ROUTE = 3,
++	PPE_FLOW_FWD_BRIDGE = 4,
++	PPE_FLOW_FWD_DROP = 5,
++	PPE_FLOW_FWD_RDT_TO_CPU = 6,
++};
++
++/**
++ * struct ppe_flow_ipv4_snat_entry - IPv4 5-tuple flow entry, SNAT variant.
++ * @valid: Whether this entry is active.
++ * @host_addr_is_dst: @host_addr_index refers to the destination IP's host
++ * table entry when true, the source IP's when false. The endpoint this
++ * does *not* refer to is @match_ip below.
++ * @host_addr_index: Host table index (see ppe_host.h) for the endpoint
++ * selected by @host_addr_is_dst.
++ * @protocol: Layer-4 protocol to match.
++ * @age: Hardware aging counter; write 0 on entry creation, hardware
++ * updates it as traffic hits the entry.
++ * @src_l3_if_valid: Whether @src_l3_if should be matched.
++ * @src_l3_if: Source L3 interface index to match, when @src_l3_if_valid.
++ * @snat_nexthop: Nexthop table index (see ppe_nexthop.h) this flow's
++ * traffic egresses through after SNAT rewrite.
++ * @snat_src_port: Source port to rewrite matched packets to.
++ * @deacclr_en: Whether to de-accelerate (stop hardware-offloading) this
++ * flow under hardware-defined conditions (e.g. a TCP control flag).
++ * @copy_to_cpu: Whether to also copy matched packets to the CPU path.
++ * @syn_toggle: Updated by hardware; not meaningful to set on creation.
++ * @pri_profile: QoS priority profile index for this flow.
++ * @service_code: Service code applied to matched packets.
++ * @match_ip: The 5-tuple match IP address for the endpoint not covered
++ * by @host_addr_index (network byte order).
++ * @match_sport: Source port to match.
++ * @match_dport: Destination port to match.
++ */
++struct ppe_flow_ipv4_snat_entry {
++	bool valid;
++	bool host_addr_is_dst;
++	u16 host_addr_index;
++	enum ppe_flow_protocol protocol;
++	u8 age;
++	bool src_l3_if_valid;
++	u8 src_l3_if;
++	u16 snat_nexthop;
++	u16 snat_src_port;
++	bool deacclr_en;
++	bool copy_to_cpu;
++	u8 syn_toggle;
++	u8 pri_profile;
++	u8 service_code;
++	__be32 match_ip;
++	u16 match_sport;
++	u16 match_dport;
++};
++
++void ppe_flow_ipv4_snat_entry_encode(const struct ppe_flow_ipv4_snat_entry *entry,
++				      u32 words[PPE_FLOW_TBL_ENTRY_WORDS]);
++void ppe_flow_ipv4_snat_entry_decode(const u32 words[PPE_FLOW_TBL_ENTRY_WORDS],
++				      struct ppe_flow_ipv4_snat_entry *entry);
++
++#endif
+--- /dev/null
++++ b/drivers/net/ethernet/qualcomm/ppe/ppe_flow_ipv4.c
+@@ -0,0 +1,109 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/*
++ * Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.
++ */
++
++/* IPv4 5-tuple flow entry field encoding, SNAT variant.
++ *
++ * This packs/unpacks struct ppe_flow_ipv4_snat_entry to/from the
++ * PPE_FLOW_TBL_ENTRY_WORDS-word format ppe_flow_entry_add()/whatever
++ * read-back path is eventually built expects. Field layout is cross-word:
++ * PRI_PROFILE splits 1+4 bits across words 1/2, the 32-bit IP address
++ * splits 20+12 bits across words 2/3, and L4_DPORT splits 4+12 bits
++ * across words 3/4 -- all confirmed against the vendor SDK's own packed
++ * bitfield struct (struct in_flow_tbl_0, include/hsl/hppe/hppe_flow_reg.h)
++ * and its actual field-assignment code (adpt_hppe_flow_entry_add(),
++ * src/adpt/hppe/adpt_hppe_flow.c), not derived from the field-offset
++ * table alone.
++ *
++ * IP address representation matches ppe_nexthop.c's dnat_ip: a plain
++ * 32-bit register value equal to be32_to_cpu() of the address, confirmed
++ * via fal_ip4_addr_t's definition (a bare a_uint32_t assigned with no
++ * byte manipulation in vendor code).
++ */
++
++#include <linux/bitfield.h>
++#include <linux/types.h>
++
++#include "ppe_flow.h"
++#include "ppe_flow_ipv4.h"
++#include "ppe_regs.h"
++
++/**
++ * ppe_flow_ipv4_snat_entry_encode() - Pack an IPv4 SNAT flow entry.
++ * @entry: The entry to pack.
++ * @words: Where to write the packed PPE_FLOW_TBL_ENTRY_WORDS words.
++ */
++void ppe_flow_ipv4_snat_entry_encode(const struct ppe_flow_ipv4_snat_entry *entry,
++				      u32 words[PPE_FLOW_TBL_ENTRY_WORDS])
++{
++	u32 ip = be32_to_cpu(entry->match_ip);
++
++	words[0] = entry->valid ? PPE_FLOW_TBL_VALID : 0;
++	/* ENTRY_TYPE is always 0 (IPv4) in this file. */
++	words[0] |= entry->host_addr_is_dst ? PPE_FLOW_TBL_HOST_ADDR_INDEX_TYPE : 0;
++	words[0] |= FIELD_PREP(PPE_FLOW_TBL_HOST_ADDR_INDEX, entry->host_addr_index);
++	words[0] |= FIELD_PREP(PPE_FLOW_TBL_PROTOCOL_TYPE, entry->protocol);
++	words[0] |= FIELD_PREP(PPE_FLOW_TBL_AGE, entry->age);
++	words[0] |= entry->src_l3_if_valid ? PPE_FLOW_TBL_SRC_L3_IF_VALID : 0;
++	words[0] |= FIELD_PREP(PPE_FLOW_TBL_SRC_L3_IF, entry->src_l3_if);
++	words[0] |= FIELD_PREP(PPE_FLOW_TBL_FWD_TYPE, PPE_FLOW_FWD_SNAT);
++
++	words[1] = FIELD_PREP(PPE_FLOW_TBL_SNAT_NEXT_HOP, entry->snat_nexthop);
++	words[1] |= FIELD_PREP(PPE_FLOW_TBL_SNAT_L4_PORT, entry->snat_src_port);
++	words[1] |= entry->deacclr_en ? PPE_FLOW_TBL_DE_ACCE : 0;
++	words[1] |= entry->copy_to_cpu ? PPE_FLOW_TBL_COPY_TO_CPU_EN : 0;
++	words[1] |= entry->syn_toggle ? PPE_FLOW_TBL_SYN_TOGGLE : 0;
++	words[1] |= FIELD_PREP(PPE_FLOW_TBL_PRI_PROFILE_0, entry->pri_profile & 0x1);
++
++	words[2] = FIELD_PREP(PPE_FLOW_TBL_PRI_PROFILE_1, entry->pri_profile >> 1);
++	words[2] |= FIELD_PREP(PPE_FLOW_TBL_SERVICE_CODE, entry->service_code);
++	words[2] |= FIELD_PREP(PPE_FLOW_TBL_IP_ADDR_0, ip);
++
++	words[3] = FIELD_PREP(PPE_FLOW_TBL_IP_ADDR_1, ip >> 20);
++	words[3] |= FIELD_PREP(PPE_FLOW_TBL_L4_SPORT, entry->match_sport);
++	words[3] |= FIELD_PREP(PPE_FLOW_TBL_L4_DPORT_0, entry->match_dport);
++
++	words[4] = FIELD_PREP(PPE_FLOW_TBL_L4_DPORT_1, entry->match_dport >> 4);
++}
++
++/**
++ * ppe_flow_ipv4_snat_entry_decode() - Unpack an IPv4 SNAT flow entry.
++ * @words: The packed PPE_FLOW_TBL_ENTRY_WORDS words to unpack.
++ * @entry: Where to store the unpacked entry.
++ *
++ * Does not check FWD_TYPE; callers are expected to only decode entries
++ * they know are the SNAT variant (e.g. ones they wrote themselves, or
++ * ones whose FWD_TYPE field they've checked equals PPE_FLOW_FWD_SNAT).
++ */
++void ppe_flow_ipv4_snat_entry_decode(const u32 words[PPE_FLOW_TBL_ENTRY_WORDS],
++				      struct ppe_flow_ipv4_snat_entry *entry)
++{
++	u32 ip;
++
++	entry->valid = !!(words[0] & PPE_FLOW_TBL_VALID);
++	entry->host_addr_is_dst = !!(words[0] & PPE_FLOW_TBL_HOST_ADDR_INDEX_TYPE);
++	entry->host_addr_index = FIELD_GET(PPE_FLOW_TBL_HOST_ADDR_INDEX, words[0]);
++	entry->protocol = FIELD_GET(PPE_FLOW_TBL_PROTOCOL_TYPE, words[0]);
++	entry->age = FIELD_GET(PPE_FLOW_TBL_AGE, words[0]);
++	entry->src_l3_if_valid = !!(words[0] & PPE_FLOW_TBL_SRC_L3_IF_VALID);
++	entry->src_l3_if = FIELD_GET(PPE_FLOW_TBL_SRC_L3_IF, words[0]);
++
++	entry->snat_nexthop = FIELD_GET(PPE_FLOW_TBL_SNAT_NEXT_HOP, words[1]);
++	entry->snat_src_port = FIELD_GET(PPE_FLOW_TBL_SNAT_L4_PORT, words[1]);
++	entry->deacclr_en = !!(words[1] & PPE_FLOW_TBL_DE_ACCE);
++	entry->copy_to_cpu = !!(words[1] & PPE_FLOW_TBL_COPY_TO_CPU_EN);
++	entry->syn_toggle = !!(words[1] & PPE_FLOW_TBL_SYN_TOGGLE);
++
++	entry->pri_profile = FIELD_GET(PPE_FLOW_TBL_PRI_PROFILE_0, words[1]) |
++			      (FIELD_GET(PPE_FLOW_TBL_PRI_PROFILE_1, words[2]) << 1);
++	entry->service_code = FIELD_GET(PPE_FLOW_TBL_SERVICE_CODE, words[2]);
++
++	ip = FIELD_GET(PPE_FLOW_TBL_IP_ADDR_0, words[2]) |
++	     (FIELD_GET(PPE_FLOW_TBL_IP_ADDR_1, words[3]) << 20);
++	entry->match_ip = cpu_to_be32(ip);
++
++	entry->match_sport = FIELD_GET(PPE_FLOW_TBL_L4_SPORT, words[3]);
++	entry->match_dport = FIELD_GET(PPE_FLOW_TBL_L4_DPORT_0, words[3]) |
++			      (FIELD_GET(PPE_FLOW_TBL_L4_DPORT_1, words[4]) << 4);
++}

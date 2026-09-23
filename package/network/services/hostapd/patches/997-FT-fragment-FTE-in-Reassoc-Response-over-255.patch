@@ -1,0 +1,76 @@
+From: Kamil Bienkiewicz <perceivalpercy@gmail.com>
+Subject: [PATCH] FT: Fragment the FTE in the Reassociation Response frame when it exceeds 255 octets
+
+With the MLO GTK, MLO IGTK, and MLO BIGTK subelements of two or more
+links (about 110 octets per link) the FTE of the Reassociation Response
+frame for a non-AP MLD exceeds the maximum element size. The Length
+field was silently truncated, so the frame was malformed and the
+non-AP MLD rejected every multi-link FT reassociation (it then retried
+with a single link and re-associated shortly afterwards to get its
+other links back).
+
+Split the FTE into the element with 255 octets of data followed by
+Fragment elements, as allowed since IEEE Std 802.11-2020 (10.28.11) and
+already parsed by wpa_ft_parse_ies(). The MIC is calculated over the
+FTE and the Fragment elements as they appear in the frame, including
+the Fragment element headers, which matches the receiver side.
+
+Signed-off-by: Kamil Bienkiewicz <perceivalpercy@gmail.com>
+---
+--- a/src/ap/wpa_auth_ft.c
++++ b/src/ap/wpa_auth_ft.c
+@@ -2988,6 +2988,54 @@
+ 	ftie_len = res;
+ 	pos += res;
+ 
++	if (ftie_len > 2 + 255) {
++		/*
++		 * The FTE exceeds the maximum element size (e.g., with the MLO
++		 * GTK/IGTK/BIGTK subelements of several links), so it has to be
++		 * split into the FTE with 255 octets of data followed by
++		 * Fragment elements (IEEE Std 802.11, 10.28.11). The MIC is
++		 * calculated over the FTE and the Fragment elements as they
++		 * appear in the frame, i.e., including the Fragment element
++		 * headers, which is how wpa_ft_parse_ies() reconstructs the
++		 * protected data on the receiving side.
++		 */
++		size_t data_len = ftie_len - 2, rem, n;
++		size_t frag_len = 2 + 255 +
++			((data_len - 255 + 254) / 255) * 2 + (data_len - 255);
++		u8 *tmp, *src;
++
++		if (frag_len > (size_t) (end - ftie)) {
++			wpa_printf(MSG_DEBUG,
++				   "FT: Not enough room for a fragmented FTE");
++			return NULL;
++		}
++		tmp = os_memdup(ftie + 2, data_len);
++		if (!tmp)
++			return NULL;
++		pos = ftie;
++		src = tmp;
++		*pos++ = WLAN_EID_FAST_BSS_TRANSITION;
++		*pos++ = 255;
++		os_memcpy(pos, src, 255);
++		pos += 255;
++		src += 255;
++		rem = data_len - 255;
++		while (rem > 0) {
++			n = rem > 255 ? 255 : rem;
++			*pos++ = WLAN_EID_FRAGMENT;
++			*pos++ = n;
++			os_memcpy(pos, src, n);
++			pos += n;
++			src += n;
++			rem -= n;
++		}
++		os_free(tmp);
++		ftie_len = pos - ftie;
++		wpa_printf(MSG_DEBUG,
++			   "FT: FTE fragmented: %u octets of data in %u octets of elements",
++			   (unsigned int) data_len, (unsigned int) ftie_len);
++	}
++
+ 	if (sm->wpa_key_mgmt == WPA_KEY_MGMT_FT_SAE_EXT_KEY &&
+ 	    key_len == SHA512_MAC_LEN) {
+ 		struct rsn_ftie_sha512 *_ftie =

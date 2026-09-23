@@ -1,0 +1,109 @@
+From: Kamil Bienkiewicz <perceivalpercy@gmail.com>
+Subject: [PATCH] net: ethernet: qualcomm: ppe: log which stage a flow
+ offload failed at
+
+ppe_offload_flow_replace() declines unsupported flows with a log line
+and reports accepted ones, but a failure after a flow has been
+accepted for offload -- a public-IP, nexthop, host or flow table
+operation, or the bookkeeping after it -- returned silently. That hides
+exactly the outcome a first hardware test needs to see (for example a
+host table ADD still timing out). Log the failing stage and error,
+ratelimited like the existing declined/accepted messages.
+
+Signed-off-by: Kamil Bienkiewicz <perceivalpercy@gmail.com>
+---
+--- a/drivers/net/ethernet/qualcomm/ppe/ppe_offload.c
++++ b/drivers/net/ethernet/qualcomm/ppe/ppe_offload.c
+@@ -259,6 +259,7 @@
+ 	unsigned int pmtu;
+ 	u8 ip_proto;
+ 	int action;
++	const char *stage = NULL;
+ 	int ret;
+ 
+ 	if (!flow_rule_match_key(rule, FLOW_DISSECTOR_KEY_CONTROL) ||
+@@ -419,14 +420,17 @@
+ 
+ 	if (rhashtable_lookup_fast(&priv->flow_table, &cls->cookie, ppe_offload_flow_ht_params)) {
+ 		ret = -EEXIST;
++		stage = "exists";
+ 		goto unlock;
+ 	}
+ 
+ 	/* Public IP entry for the translated (post-SNAT) source address. */
+ 	ret = ppe_pub_ip_pool_get_and_ref(priv->ppe_dev, &priv->pub_ip_pool, new_src,
+ 					   &pub_ip_index);
+-	if (ret)
++	if (ret) {
++		stage = "pub_ip";
+ 		goto unlock;
++	}
+ 
+ 	/* Nexthop: egress port + resolved next-hop MAC + the public IP
+ 	 * entry just obtained.
+@@ -450,8 +454,10 @@
+ 
+ 	ret = ppe_nexthop_pool_get_and_ref(priv->ppe_dev, &priv->nexthop_pool, &nexthop,
+ 					    &nexthop_index);
+-	if (ret)
++	if (ret) {
++		stage = "nexthop";
+ 		goto deref_pub_ip;
++	}
+ 
+ 	/* Host entry for the original (pre-NAT) source address -- the
+ 	 * LAN client, shared across every flow through it.
+@@ -464,8 +470,10 @@
+ 
+ 	ret = ppe_host_pool_get_and_ref(priv->ppe_dev, &priv->host_pool, PPE_FLOW_OP_MODE_HASH,
+ 					 host_words, PPE_HOST_TBL_IPV4_ENTRY_WORDS, &host_index);
+-	if (ret)
++	if (ret) {
++		stage = "host";
+ 		goto deref_nexthop;
++	}
+ 
+ 	memset(&flow_ipv4, 0, sizeof(flow_ipv4));
+ 	flow_ipv4.valid = true;
+@@ -483,8 +491,10 @@
+ 
+ 	flow_index = 0;
+ 	ret = ppe_flow_entry_add(priv->ppe_dev, PPE_FLOW_OP_MODE_HASH, flow_words, &flow_index);
+-	if (ret)
++	if (ret) {
++		stage = "flow";
+ 		goto deref_host;
++	}
+ 
+ 	/* HASH mode places this entry purely by hashing its match key, so
+ 	 * an identical key (e.g. a same-5-tuple reconnect) always lands on
+@@ -503,6 +513,7 @@
+ 	entry = kzalloc(sizeof(*entry), GFP_KERNEL);
+ 	if (!entry) {
+ 		ret = -ENOMEM;
++		stage = "alloc";
+ 		goto del_flow;
+ 	}
+ 
+@@ -514,8 +525,10 @@
+ 	entry->flow_valid = true;
+ 
+ 	ret = rhashtable_insert_fast(&priv->flow_table, &entry->node, ppe_offload_flow_ht_params);
+-	if (ret)
++	if (ret) {
++		stage = "insert";
+ 		goto free_entry;
++	}
+ 
+ 	priv->flow_owner[flow_index] = entry;
+ 
+@@ -540,6 +553,9 @@
+ unlock:
+ 	mutex_unlock(&priv->lock);
+ 
++	if (stage)
++		pr_info_ratelimited("ppe_offload: replace failed at %s: %d\n", stage, ret);
++
+ 	return ret;
+ }
+ 

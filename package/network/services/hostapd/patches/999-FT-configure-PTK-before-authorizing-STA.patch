@@ -1,0 +1,52 @@
+From: Kamil Bienkiewicz <perceivalpercy@gmail.com>
+Subject: [PATCH] FT: configure the PTK before marking the STA authorized in the driver
+
+After a successful FT (re)association handle_assoc_cb() marked the
+station authorized and pushed the STA flags to the driver first, and
+only then let the RSN authenticator retry the PTK configuration that
+could not be completed during FT authentication (WPA_ASSOC_FT). After
+the 4-way handshake the order is the opposite: the PTK is configured
+and only then is the station authorized.
+
+With an AP MLD and a non-AP MLD on ath12k this order mattered: the
+station was authorized on all links before any pairwise key existed and
+the data path stayed dead after the FT roam. Configure the PTK before
+hostapd_set_sta_flags() so that both paths look the same to the driver.
+
+Signed-off-by: Kamil Bienkiewicz <perceivalpercy@gmail.com>
+---
+--- a/src/ap/ieee802_11.c
++++ b/src/ap/ieee802_11.c
+@@ -8563,6 +8563,21 @@
+ 			goto handle_ml;
+ 	}
+ 
++#ifdef CONFIG_IEEE80211R_AP
++	if (sta->auth_alg == WLAN_AUTH_FT) {
++		/*
++		 * Configure the PTK derived in the FT protocol before the
++		 * driver STA entry is marked authorized, i.e., in the same
++		 * order as after the 4-way handshake. The driver STA entry
++		 * exists at this point (it was added or updated when the
++		 * (Re)Association Response frame was sent), so the earlier
++		 * attempt from the FT authentication that could not be
++		 * completed is retried here.
++		 */
++		wpa_auth_sm_event(sta->wpa_sm, WPA_ASSOC_FT);
++	}
++#endif /* CONFIG_IEEE80211R_AP */
++
+ 	hostapd_set_sta_flags(hapd, sta);
+ 
+ 	if (!(sta->flags & WLAN_STA_WDS) && sta->pending_wds_enable) {
+@@ -8591,9 +8606,7 @@
+ 			hostapd_set_wds_encryption(hapd, sta, ifname_wds);
+ 	}
+ 
+-	if (sta->auth_alg == WLAN_AUTH_FT)
+-		wpa_auth_sm_event(sta->wpa_sm, WPA_ASSOC_FT);
+-	else
++	if (sta->auth_alg != WLAN_AUTH_FT)
+ 		wpa_auth_sm_event(sta->wpa_sm, WPA_ASSOC);
+ 	hapd->new_assoc_sta_cb(hapd, sta, !new_assoc);
+ 	ieee802_1x_notify_port_enabled(sta->eapol_sm, 1);

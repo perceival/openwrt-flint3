@@ -1,0 +1,51 @@
+From: village <village@flint3-port>
+Subject: hsl: qca808x: fix PHY driver registration API for kernel 6.18
+
+This vendor driver targets an older kernel where struct phy_driver's
+match_phy_device took a single struct phy_device * argument, and
+phy_driver_register()/phy_driver_unregister() existed as singular
+wrappers. Both changed upstream:
+- match_phy_device gained a second `const struct phy_driver *` argument
+  (see include/linux/phy.h)
+- phy_driver_register/phy_driver_unregister were replaced entirely by
+  the batch phy_drivers_register()/phy_drivers_unregister() API, which
+  takes an array + count.
+
+The QCA8084/QCA8081 PHYs this file matches are not present on the
+Flint 3 (BE9300) -- WAN is RTL8221B, LAN goes through the RTL8372N
+switch -- so this file is unconditionally compiled as part of the
+vendor SDK's PHY driver set but never actually probes anything on this
+board. Fixed for build correctness regardless.
+
+--- a/src/hsl/phy/qca808x.c
++++ b/src/hsl/phy/qca808x.c
+@@ -600,7 +600,8 @@
+ 	return err;
+ }
+
+-int qca808x_match_phy_device(struct phy_device *phydev)
++int qca808x_match_phy_device(struct phy_device *phydev,
++			      const struct phy_driver *drv)
+ {
+ 	a_uint32_t phy_id = 0;
+
+@@ -693,17 +694,13 @@
+ a_int32_t qca808x_phy_driver_register(void)
+ {
+ 	a_int32_t ret;
+-#if (LINUX_VERSION_CODE >= KERNEL_VERSION(4,9,0))
+-	ret = phy_driver_register(&qca808x_phy_driver, THIS_MODULE);
+-#else
+-	ret = phy_driver_register(&qca808x_phy_driver);
+-#endif
++	ret = phy_drivers_register(&qca808x_phy_driver, 1, THIS_MODULE);
+ 	return ret;
+ }
+
+ void qca808x_phy_driver_unregister(void)
+ {
+-	phy_driver_unregister(&qca808x_phy_driver);
++	phy_drivers_unregister(&qca808x_phy_driver, 1);
+ }
+
+ void qca808x_phydev_init(a_uint32_t dev_id, a_uint32_t port_id)

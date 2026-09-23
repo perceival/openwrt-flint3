@@ -1,0 +1,650 @@
+From: Kamil Bienkiewicz <perceivalpercy@gmail.com>
+Subject: [PATCH] AP MLD: Add FT (Fast BSS Transition) support for non-AP MLDs
+
+FT authentication and reassociation from a non-AP MLD were not handled:
+the FT Authentication frame was not recognized as an MLO frame (so the
+STA entry used the link address and no Basic Multi-Link element was
+returned), the PMK-R0/PMK-R1/PTK derivation used the link addresses
+instead of the MLD MAC addresses, the R1KH-ID defaulted to the per-link
+BSSID, and the FTE MIC calculation and the group key subelements in the
+Reassociation Response frame followed the non-MLO rules.
+
+Implement the AP MLD side of FT over-the-air per IEEE Std 802.11be:
+- recognize FT Authentication frames from non-AP MLDs and set the ML
+  information in the RSN authenticator before the PTK is derived
+- use the MLD MAC addresses (SPA/AA) in PMK-R0, PMK-R1, PMKR1Name, and
+  PTK derivation
+- default the R1KH-ID of an AP MLD to the AP MLD MAC address on all
+  affiliated links
+- include the non-AP MLD link addresses in the Reassociation Request
+  frame FTE MIC (13.8.4) and the affiliated AP RSNEs/RSNXEs and BSSIDs in
+  the Reassociation Response frame FTE MIC with the matching element
+  count (13.8.5)
+- deliver per-link group keys with the MLO GTK/IGTK/BIGTK subelements
+
+The rules follow the wlantest implementation of the same calculations.
+FT over-the-DS with AP MLDs is not changed.
+
+Signed-off-by: Kamil Bienkiewicz <perceivalpercy@gmail.com>
+---
+--- a/src/ap/ieee802_11_eht.c
++++ b/src/ap/ieee802_11_eht.c
+@@ -1105,8 +1105,12 @@
+ 
+ 		return pos;
+ #endif /* CONFIG_SAE */
+-	/* TODO: Support additional algorithms that can be used for MLO */
+ 	case WLAN_AUTH_FT:
++		/* FT Authentication frames carry no fixed fields after the
++		 * Status Code; the elements (RSNE, MDE, FTE, Basic Multi-Link
++		 * element) start immediately. */
++		return pos;
++	/* TODO: Support additional algorithms that can be used for MLO */
+ 	case WLAN_AUTH_FILS_SK:
+ 	case WLAN_AUTH_FILS_SK_PFS:
+ 	case WLAN_AUTH_FILS_PK:
+--- a/src/ap/ieee802_11.c
++++ b/src/ap/ieee802_11.c
+@@ -552,11 +552,14 @@
+ 	struct sta_info *sta;
+ 	int reply_res;
+ 
+-	reply_res = send_auth_reply(hapd, NULL, dst, WLAN_AUTH_FT,
++	/* Look up the STA first so that the Basic Multi-Link element gets
++	 * added to the reply for a non-AP MLD. */
++	sta = ap_get_sta(hapd, dst);
++
++	reply_res = send_auth_reply(hapd, sta, dst, WLAN_AUTH_FT,
+ 				    auth_transaction, status, ies, ies_len,
+ 				    "auth-ft-finish");
+ 
+-	sta = ap_get_sta(hapd, dst);
+ 	if (sta == NULL)
+ 		return;
+ 
+@@ -4576,6 +4579,20 @@
+ 			resp = WLAN_STATUS_UNSPECIFIED_FAILURE;
+ 			goto fail;
+ 		}
++#ifdef CONFIG_IEEE80211BE
++		if (ap_sta_is_mld(hapd, sta)) {
++			/* Only the link used for FT authentication is known at
++			 * this point; the full set of requested links is
++			 * learned from the Reassociation Request frame. The
++			 * RSN authenticator needs the MLD MAC addresses (SPA
++			 * and AA) already for the PTK derivation in FT
++			 * authentication. */
++			sta->mld_info.links[sta->mld_assoc_link_id].valid = true;
++			wpa_auth_set_ml_info(sta->wpa_sm,
++					     sta->mld_assoc_link_id,
++					     &sta->mld_info);
++		}
++#endif /* CONFIG_IEEE80211BE */
+ 		wpa_ft_process_auth(sta->wpa_sm,
+ 				    auth_transaction, mgmt->u.auth.variable,
+ 				    len - IEEE80211_HDRLEN -
+--- a/src/ap/wpa_auth.c
++++ b/src/ap/wpa_auth.c
+@@ -91,7 +91,7 @@
+ static const int dot11RSNAConfigSATimeout = 60;
+ 
+ 
+-static const u8 * wpa_auth_get_aa(const struct wpa_state_machine *sm)
++const u8 * wpa_auth_get_aa(const struct wpa_state_machine *sm)
+ {
+ #ifdef CONFIG_IEEE80211BE
+ 	if (sm->mld_assoc_link_id >= 0)
+@@ -101,7 +101,7 @@
+ }
+ 
+ 
+-static const u8 * wpa_auth_get_spa(const struct wpa_state_machine *sm)
++const u8 * wpa_auth_get_spa(const struct wpa_state_machine *sm)
+ {
+ #ifdef CONFIG_IEEE80211BE
+ 	if (sm->mld_assoc_link_id >= 0)
+--- a/src/ap/wpa_auth_i.h
++++ b/src/ap/wpa_auth_i.h
+@@ -357,4 +357,9 @@
+ 			  const u8 *pmk_r0_name);
+ #endif /* CONFIG_IEEE80211R_AP */
+ 
++/* Authenticator Address (AA) and Supplicant Address (SPA) for key derivation:
++ * the MLD MAC addresses for a non-AP MLD, the link addresses otherwise. */
++const u8 * wpa_auth_get_aa(const struct wpa_state_machine *sm);
++const u8 * wpa_auth_get_spa(const struct wpa_state_machine *sm);
++
+ #endif /* WPA_AUTH_I_H */
+--- a/src/ap/hostapd.c
++++ b/src/ap/hostapd.c
+@@ -1620,8 +1620,18 @@
+ 			hapd->iconf->ieee80211ax;
+ 
+ #ifdef CONFIG_IEEE80211R_AP
+-	if (is_zero_ether_addr(conf->r1_key_holder))
+-		os_memcpy(conf->r1_key_holder, hapd->own_addr, ETH_ALEN);
++	if (is_zero_ether_addr(conf->r1_key_holder)) {
++#ifdef CONFIG_IEEE80211BE
++		/* The R1KH of an AP MLD is the AP MLD itself, so all affiliated
++		 * APs share the AP MLD MAC address as their R1KH-ID. */
++		if (conf->mld_ap && hapd->mld)
++			os_memcpy(conf->r1_key_holder, hapd->mld->mld_addr,
++				  ETH_ALEN);
++		else
++#endif /* CONFIG_IEEE80211BE */
++			os_memcpy(conf->r1_key_holder, hapd->own_addr,
++				  ETH_ALEN);
++	}
+ #endif /* CONFIG_IEEE80211R_AP */
+ 
+ #ifdef CONFIG_MESH
+--- a/src/ap/wpa_auth_ft.c
++++ b/src/ap/wpa_auth_ft.c
+@@ -2137,16 +2137,19 @@
+ 		return -1;
+ 	}
+ 
++	/* For a non-AP MLD, the MLD MAC addresses are used as SPA and AA */
+ 	if (wpa_derive_pmk_r0(mpmk, mpmk_len, ssid, ssid_len, mdid,
+-			      r0kh, r0kh_len, sm->addr,
++			      r0kh, r0kh_len, wpa_auth_get_spa(sm),
+ 			      pmk_r0, pmk_r0_name,
+ 			      sm->wpa_key_mgmt) < 0 ||
+-	    wpa_derive_pmk_r1(pmk_r0, pmk_r0_len, pmk_r0_name, r1kh, sm->addr,
++	    wpa_derive_pmk_r1(pmk_r0, pmk_r0_len, pmk_r0_name, r1kh,
++			      wpa_auth_get_spa(sm),
+ 			      pmk_r1, sm->pmk_r1_name) < 0)
+ 		return -1;
+ 
+ 	return wpa_pmk_r1_to_ptk(pmk_r1, pmk_r1_len, sm->SNonce, sm->ANonce,
+-				 sm->addr, sm->wpa_auth->addr, sm->pmk_r1_name,
++				 wpa_auth_get_spa(sm), wpa_auth_get_aa(sm),
++				 sm->pmk_r1_name,
+ 				 ptk, ptk_name, sm->wpa_key_mgmt, sm->pairwise,
+ 				 kdk_len);
+ }
+@@ -2199,6 +2202,238 @@
+ }
+ 
+ 
++#ifdef CONFIG_IEEE80211BE
++
++static bool wpa_ft_mlo(const struct wpa_state_machine *sm)
++{
++	return sm->mld_assoc_link_id >= 0;
++}
++
++
++/*
++ * Link addresses of the non-AP MLD (ap == false) or BSSIDs of the affiliated
++ * APs of the AP MLD (ap == true) for the links negotiated by the STA,
++ * concatenated in increasing link ID order. These are included in the FTE MIC
++ * calculation for MLO (IEEE Std 802.11be, 13.8.4 and 13.8.5).
++ */
++static struct wpabuf * wpa_ft_mlo_link_addrs(struct wpa_state_machine *sm,
++					     bool ap)
++{
++	struct wpabuf *buf;
++	unsigned int link_id;
++
++	buf = wpabuf_alloc(MAX_NUM_MLD_LINKS * ETH_ALEN);
++	if (!buf)
++		return NULL;
++
++	for (link_id = 0; link_id < MAX_NUM_MLD_LINKS; link_id++) {
++		const struct mld_link *link = &sm->mld_links[link_id];
++
++		if (!link->valid || !link->wpa_auth)
++			continue;
++		wpabuf_put_data(buf, ap ? link->wpa_auth->addr : link->peer_addr,
++				ETH_ALEN);
++		wpa_printf(MSG_DEBUG, "FT: MLO link %u %s address " MACSTR,
++			   link_id, ap ? "AP" : "STA",
++			   MAC2STR(ap ? link->wpa_auth->addr :
++				   link->peer_addr));
++	}
++
++	return buf;
++}
++
++
++/*
++ * RSNEs (or RSNXEs, if rsnxe) of the affiliated APs of the AP MLD for the
++ * links negotiated by the STA, concatenated in increasing link ID order. The
++ * number of elements included is returned in *count.
++ */
++static struct wpabuf * wpa_ft_mlo_link_rsn_ies(struct wpa_state_machine *sm,
++					       bool rsnxe, unsigned int *count)
++{
++	struct wpabuf *buf;
++	unsigned int link_id;
++
++	*count = 0;
++	buf = wpabuf_alloc(MAX_NUM_MLD_LINKS * 257);
++	if (!buf)
++		return NULL;
++
++	for (link_id = 0; link_id < MAX_NUM_MLD_LINKS; link_id++) {
++		const struct mld_link *link = &sm->mld_links[link_id];
++		const struct wpa_authenticator *la = link->wpa_auth;
++		const u8 *ie;
++
++		if (!link->valid || !la)
++			continue;
++		ie = get_ie(la->wpa_ie, la->wpa_ie_len,
++			    rsnxe ? WLAN_EID_RSNX : WLAN_EID_RSN);
++		if (!ie)
++			continue;
++		wpabuf_put_data(buf, ie, 2 + ie[1]);
++		(*count)++;
++	}
++
++	return buf;
++}
++
++
++static int wpa_ft_mlo_wrap_key(const u8 *kek, size_t kek_len, const u8 *key,
++			       size_t key_len, u8 *out, const char *name)
++{
++	if (aes_wrap(kek, kek_len, key_len / 8, key, out)) {
++		wpa_printf(MSG_DEBUG,
++			   "FT: MLO %s subelem encryption failed: kek_len=%d",
++			   name, (int) kek_len);
++		return -1;
++	}
++	return 0;
++}
++
++
++/*
++ * MLO GTK, MLO IGTK, and MLO BIGTK subelements for all links negotiated by the
++ * STA. The formats match the non-MLO GTK/IGTK/BIGTK subelements with a Link ID
++ * Info field added after Key Info (GTK) or after IPN/BIPN (IGTK/BIGTK).
++ */
++static u8 * wpa_ft_mlo_group_key_subelems(struct wpa_state_machine *sm,
++					  size_t *len, int vlan_id)
++{
++	struct wpa_auth_config *conf = &sm->wpa_auth->conf;
++	const u8 *kek;
++	size_t kek_len;
++	u8 *buf, *pos;
++	size_t buflen;
++	unsigned int link_id;
++
++	if (wpa_key_mgmt_fils(sm->wpa_key_mgmt)) {
++		kek = sm->PTK.kek2;
++		kek_len = sm->PTK.kek2_len;
++	} else {
++		kek = sm->PTK.kek;
++		kek_len = sm->PTK.kek_len;
++	}
++
++	/* Worst case per link: GTK 2+2+1+1+8+(32+8+8) and two times
++	 * IGTK/BIGTK 2+2+6+1+1+(32+8) */
++	buflen = MAX_NUM_MLD_LINKS * (62 + 2 * 52);
++	buf = os_zalloc(buflen);
++	if (!buf)
++		return NULL;
++	pos = buf;
++
++	for (link_id = 0; link_id < MAX_NUM_MLD_LINKS; link_id++) {
++		struct mld_link *link = &sm->mld_links[link_id];
++		struct wpa_auth_ml_link_key_info info;
++		u8 keybuf[WPA_GTK_MAX_LEN];
++		size_t key_len, pad_len;
++
++		if (!link->valid || !link->wpa_auth)
++			continue;
++
++		os_memset(&info, 0, sizeof(info));
++		info.link_id = link_id;
++		wpa_auth_ml_get_key_info(link->wpa_auth, &info,
++					 sm->mgmt_frame_prot, conf->beacon_prot,
++					 false, vlan_id);
++
++		/* MLO GTK: Sub-elem ID[1] | Length[1] | Key Info[2] |
++		 * Link ID Info[1] | Key Length[1] | RSC[8] | Key[5..32] */
++		key_len = info.gtk_len;
++		if (!info.gtk || !key_len || key_len > sizeof(keybuf))
++			goto fail;
++		os_memcpy(keybuf, info.gtk, key_len);
++		if (conf->disable_gtk && random_get_bytes(keybuf, key_len) < 0)
++			goto fail;
++		/* Pad key for AES Key Wrap if it is not multiple of 8 bytes or
++		 * is less than 16 bytes. */
++		pad_len = key_len % 8;
++		if (pad_len)
++			pad_len = 8 - pad_len;
++		if (key_len + pad_len < 16)
++			pad_len += 8;
++		if (pad_len) {
++			os_memset(keybuf + key_len, 0, pad_len);
++			keybuf[key_len] = 0xdd;
++			key_len += pad_len;
++		}
++
++		wpa_printf(MSG_DEBUG, "FT: MLO GTK subelem: link=%u", link_id);
++		*pos++ = FTIE_SUBELEM_MLO_GTK;
++		*pos++ = 2 + 1 + 1 + 8 + key_len + 8;
++		WPA_PUT_LE16(pos, info.gtkidx & 0x03);
++		pos += 2;
++		*pos++ = link_id & 0x0f;
++		*pos++ = info.gtk_len;
++		os_memcpy(pos, info.pn, 6); /* RSC = PN[6] || 0[2] */
++		pos += 8;
++		if (wpa_ft_mlo_wrap_key(kek, kek_len, keybuf, key_len, pos,
++					"GTK") < 0) {
++			forced_memzero(keybuf, sizeof(keybuf));
++			goto fail;
++		}
++		forced_memzero(keybuf, sizeof(keybuf));
++		pos += key_len + 8;
++
++		if (!sm->mgmt_frame_prot)
++			continue;
++
++		/* MLO IGTK: Sub-elem ID[1] | Length[1] | KeyID[2] | IPN[6] |
++		 * Link ID Info[1] | Key Length[1] | Key[16+8] */
++		if (!info.igtk || !info.igtk_len)
++			goto fail;
++		wpa_printf(MSG_DEBUG, "FT: MLO IGTK subelem: link=%u", link_id);
++		*pos++ = FTIE_SUBELEM_MLO_IGTK;
++		*pos++ = 2 + 6 + 1 + 1 + info.igtk_len + 8;
++		WPA_PUT_LE16(pos, info.igtkidx);
++		pos += 2;
++		os_memcpy(pos, info.ipn, 6);
++		pos += 6;
++		*pos++ = link_id & 0x0f;
++		*pos++ = info.igtk_len;
++		if (wpa_ft_mlo_wrap_key(kek, kek_len, info.igtk, info.igtk_len,
++					pos, "IGTK") < 0)
++			goto fail;
++		pos += info.igtk_len + 8;
++
++		if (!conf->beacon_prot || !info.bigtk)
++			continue;
++
++		/* MLO BIGTK: Sub-elem ID[1] | Length[1] | KeyID[2] | BIPN[6] |
++		 * Link ID Info[1] | Key Length[1] | Key[16+8] */
++		wpa_printf(MSG_DEBUG, "FT: MLO BIGTK subelem: link=%u",
++			   link_id);
++		*pos++ = FTIE_SUBELEM_MLO_BIGTK;
++		*pos++ = 2 + 6 + 1 + 1 + info.igtk_len + 8;
++		WPA_PUT_LE16(pos, info.bigtkidx);
++		pos += 2;
++		os_memcpy(pos, info.bipn, 6);
++		pos += 6;
++		*pos++ = link_id & 0x0f;
++		*pos++ = info.igtk_len;
++		if (wpa_ft_mlo_wrap_key(kek, kek_len, info.bigtk, info.igtk_len,
++					pos, "BIGTK") < 0)
++			goto fail;
++		pos += info.igtk_len + 8;
++	}
++
++	*len = pos - buf;
++	return buf;
++fail:
++	bin_clear_free(buf, buflen);
++	return NULL;
++}
++
++#else /* CONFIG_IEEE80211BE */
++
++static bool wpa_ft_mlo(const struct wpa_state_machine *sm)
++{
++	return false;
++}
++
++#endif /* CONFIG_IEEE80211BE */
++
++
+ static u8 * wpa_ft_gtk_subelem(struct wpa_state_machine *sm, size_t *len,
+ 			       bool reassoc, int vlan_id)
+ {
+@@ -2536,6 +2771,9 @@
+ 	const u8 *kck;
+ 	size_t kck_len;
+ 	size_t key_len;
++	const u8 *mic_rsnie, *mic_rsnxe;
++	size_t mic_rsnie_len, mic_rsnxe_len;
++	struct wpabuf *extra = NULL, *ml_rsne = NULL, *ml_rsnxe = NULL;
+ 
+ 	if (sm == NULL)
+ 		return pos;
+@@ -2610,8 +2848,14 @@
+ 
+ 	/* Fast BSS Transition Information */
+ 	if (auth_alg == WLAN_AUTH_FT) {
+-		subelem = wpa_ft_gtk_subelem(sm, &subelem_len, reassoc,
+-					     vlan_id);
++#ifdef CONFIG_IEEE80211BE
++		if (wpa_ft_mlo(sm))
++			subelem = wpa_ft_mlo_group_key_subelems(sm, &subelem_len,
++								vlan_id);
++		else
++#endif /* CONFIG_IEEE80211BE */
++			subelem = wpa_ft_gtk_subelem(sm, &subelem_len, reassoc,
++						     vlan_id);
+ 		if (!subelem) {
+ 			wpa_printf(MSG_DEBUG,
+ 				   "FT: Failed to add GTK subelement");
+@@ -2621,7 +2865,7 @@
+ 		r0kh_id_len = sm->r0kh_id_len;
+ 		anonce = sm->ANonce;
+ 		snonce = sm->SNonce;
+-		if (sm->mgmt_frame_prot) {
++		if (!wpa_ft_mlo(sm) && sm->mgmt_frame_prot) {
+ 			u8 *igtk;
+ 			size_t igtk_len;
+ 			u8 *nbuf;
+@@ -2643,7 +2887,8 @@
+ 			subelem_len += igtk_len;
+ 			os_free(igtk);
+ 		}
+-		if (sm->mgmt_frame_prot && conf->beacon_prot) {
++		if (!wpa_ft_mlo(sm) && sm->mgmt_frame_prot &&
++		    conf->beacon_prot) {
+ 			u8 *bigtk;
+ 			size_t bigtk_len;
+ 			u8 *nbuf;
+@@ -2764,8 +3009,12 @@
+ 		fte_mic = _ftie->mic;
+ 		elem_count = &_ftie->mic_control[1];
+ 	}
+-	if (auth_alg == WLAN_AUTH_FT)
+-		*elem_count = 3; /* Information element count */
++	if (auth_alg == WLAN_AUTH_FT) {
++		/* Information element count: MDE, FTE, and RSNE; for MLO, the
++		 * RSNEs (and RSNXEs) of the affiliated APs are counted
++		 * separately below. */
++		*elem_count = wpa_ft_mlo(sm) ? 2 : 3;
++	}
+ 
+ 	ric_start = pos;
+ 	if (wpa_ft_parse_ies(req_ies, req_ies_len, &parse,
+@@ -2800,9 +3049,40 @@
+ 		rsnxe_len = sm->wpa_auth->conf.rsnxe_override_ft_len;
+ 	}
+ #endif /* CONFIG_TESTING_OPTIONS */
+-	if (auth_alg == WLAN_AUTH_FT && rsnxe_len)
++	if (auth_alg == WLAN_AUTH_FT && rsnxe_len && !wpa_ft_mlo(sm))
+ 		*elem_count += 1;
+ 
++	mic_rsnie = rsnie;
++	mic_rsnie_len = rsnie_len;
++	mic_rsnxe = rsnxe_len ? rsnxe : NULL;
++	mic_rsnxe_len = rsnxe_len;
++
++#ifdef CONFIG_IEEE80211BE
++	if (auth_alg == WLAN_AUTH_FT && wpa_ft_mlo(sm)) {
++		unsigned int n_rsne, n_rsnxe;
++
++		/* IEEE Std 802.11be, 13.8.5: for a non-AP MLD, the MIC is
++		 * calculated over the MLD MAC addresses, the RSNE and RSNXE of
++		 * each affiliated AP for the requested links, and the BSSIDs of
++		 * those affiliated APs. */
++		ml_rsne = wpa_ft_mlo_link_rsn_ies(sm, false, &n_rsne);
++		ml_rsnxe = wpa_ft_mlo_link_rsn_ies(sm, true, &n_rsnxe);
++		extra = wpa_ft_mlo_link_addrs(sm, true);
++		if (!ml_rsne || !ml_rsnxe || !extra) {
++			pos = NULL;
++			goto fail;
++		}
++		*elem_count += n_rsne + n_rsnxe;
++		mic_rsnie = wpabuf_head(ml_rsne);
++		mic_rsnie_len = wpabuf_len(ml_rsne);
++		mic_rsnxe = wpabuf_len(ml_rsnxe) ? wpabuf_head(ml_rsnxe) : NULL;
++		mic_rsnxe_len = wpabuf_len(ml_rsnxe);
++		wpa_printf(MSG_DEBUG,
++			   "FT: MLO Reassoc Resp MIC: %u RSNE(s), %u RSNXE(s), element count %u",
++			   n_rsne, n_rsnxe, *elem_count);
++	}
++#endif /* CONFIG_IEEE80211BE */
++
+ 	if (wpa_key_mgmt_fils(sm->wpa_key_mgmt)) {
+ 		kck = sm->PTK.kck2;
+ 		kck_len = sm->PTK.kck2_len;
+@@ -2812,12 +3092,12 @@
+ 	}
+ 	if (auth_alg == WLAN_AUTH_FT &&
+ 	    wpa_ft_mic(sm->wpa_key_mgmt, kck, kck_len,
+-		       sm->addr, sm->wpa_auth->addr, 6,
++		       wpa_auth_get_spa(sm), wpa_auth_get_aa(sm), 6,
+ 		       mdie, mdie_len, ftie, ftie_len,
+-		       rsnie, rsnie_len,
++		       mic_rsnie, mic_rsnie_len,
+ 		       ric_start, ric_start ? pos - ric_start : 0,
+-		       rsnxe_len ? rsnxe : NULL, rsnxe_len,
+-		       NULL,
++		       mic_rsnxe, mic_rsnxe_len,
++		       extra,
+ 		       fte_mic) < 0) {
+ 		wpa_printf(MSG_DEBUG, "FT: Failed to calculate MIC");
+ 		pos = NULL;
+@@ -2833,6 +3113,9 @@
+ 	os_memcpy(sm->assoc_resp_ftie, ftie, ftie_len);
+ 
+ fail:
++	wpabuf_free(extra);
++	wpabuf_free(ml_rsne);
++	wpabuf_free(ml_rsnxe);
+ 	wpa_ft_parse_ies_free(&parse);
+ 	return pos;
+ }
+@@ -2961,11 +3244,12 @@
+ 			break;
+ 
+ 		if (wpa_derive_pmk_r0(pmk, PMK_LEN, ssid, ssid_len, mdid, r0kh,
+-				      r0kh_len, sm->addr,
++				      r0kh_len, wpa_auth_get_spa(sm),
+ 				      pmk_r0, pmk_r0_name,
+ 				      WPA_KEY_MGMT_FT_PSK) < 0 ||
+ 		    wpa_derive_pmk_r1(pmk_r0, PMK_LEN, pmk_r0_name, r1kh,
+-				      sm->addr, pmk_r1, pmk_r1_name) < 0 ||
++				      wpa_auth_get_spa(sm), pmk_r1,
++				      pmk_r1_name) < 0 ||
+ 		    os_memcmp_const(pmk_r1_name, req_pmk_r1_name,
+ 				    WPA_PMK_NAME_LEN) != 0)
+ 			continue;
+@@ -3086,7 +3370,8 @@
+ 
+ 	if (wpa_derive_pmk_r1(r0->pmk_r0, r0->pmk_r0_len, r0->pmk_r0_name,
+ 			      conf->r1_key_holder,
+-			      sm->addr, out_pmk_r1, out_pmk_r1_name) < 0)
++			      wpa_auth_get_spa(sm), out_pmk_r1,
++			      out_pmk_r1_name) < 0)
+ 		return -1;
+ 
+ 	os_get_reltime(&now);
+@@ -3204,7 +3489,8 @@
+ 	    wpa_key_mgmt_ft_psk(sm->wpa_key_mgmt)) {
+ 		if (wpa_derive_pmk_r1_name(parse.rsn_pmkid,
+ 					   sm->wpa_auth->conf.r1_key_holder,
+-					   sm->addr, pmk_r1_name, PMK_LEN) < 0)
++					   wpa_auth_get_spa(sm), pmk_r1_name,
++					   PMK_LEN) < 0)
+ 			goto out;
+ 		if (wpa_ft_psk_pmk_r1(sm, pmk_r1_name, pmk_r1, &pairwise,
+ 				      &vlan, &identity, &identity_len,
+@@ -3231,7 +3517,8 @@
+ 			continue;
+ 		if (wpa_derive_pmk_r1_name(parse.rsn_pmkid,
+ 					   sm->wpa_auth->conf.r1_key_holder,
+-					   sm->addr, pmk_r1_name, len) < 0)
++					   wpa_auth_get_spa(sm), pmk_r1_name,
++					   len) < 0)
+ 			continue;
+ 
+ 		if (wpa_ft_fetch_pmk_r1(sm->wpa_auth, sm->addr, pmk_r1_name,
+@@ -3338,8 +3625,10 @@
+ 	else
+ 		kdk_len = 0;
+ 
++	/* For a non-AP MLD, the MLD MAC addresses are used as SPA and AA */
+ 	if (wpa_pmk_r1_to_ptk(pmk_r1, pmk_r1_len, sm->SNonce, sm->ANonce,
+-			      sm->addr, sm->wpa_auth->addr, pmk_r1_name,
++			      wpa_auth_get_spa(sm), wpa_auth_get_aa(sm),
++			      pmk_r1_name,
+ 			      &sm->PTK, ptk_name, parse.key_mgmt,
+ 			      pairwise, kdk_len) < 0)
+ 		goto out;
+@@ -3466,6 +3755,7 @@
+ 	const u8 *kck;
+ 	size_t kck_len;
+ 	struct wpa_auth_config *conf;
++	struct wpabuf *extra = NULL;
+ 	int retval = WLAN_STATUS_UNSPECIFIED_FAILURE;
+ 
+ 	if (sm == NULL)
+@@ -3613,15 +3903,26 @@
+ 		kck = sm->PTK.kck;
+ 		kck_len = sm->PTK.kck_len;
+ 	}
++#ifdef CONFIG_IEEE80211BE
++	if (wpa_ft_mlo(sm)) {
++		/* IEEE Std 802.11be, 13.8.4: for a non-AP MLD, the MIC is
++		 * calculated over the MLD MAC addresses and additionally the
++		 * link addresses of the non-AP MLD for the requested links. */
++		extra = wpa_ft_mlo_link_addrs(sm, false);
++		if (!extra)
++			goto out;
++	}
++#endif /* CONFIG_IEEE80211BE */
++
+ 	if (wpa_ft_mic(sm->wpa_key_mgmt, kck, kck_len,
+-		       sm->addr, sm->wpa_auth->addr, 5,
++		       wpa_auth_get_spa(sm), wpa_auth_get_aa(sm), 5,
+ 		       parse.mdie - 2, parse.mdie_len + 2,
+ 		       parse.ftie - 2, parse.ftie_len + 2,
+ 		       parse.rsn - 2, parse.rsn_len + 2,
+ 		       parse.ric, parse.ric_len,
+ 		       parse.rsnxe ? parse.rsnxe - 2 : NULL,
+ 		       parse.rsnxe ? parse.rsnxe_len + 2 : 0,
+-		       NULL,
++		       extra,
+ 		       mic) < 0) {
+ 		wpa_printf(MSG_DEBUG, "FT: Failed to calculate MIC");
+ 		goto out;
+@@ -3629,8 +3930,11 @@
+ 
+ 	if (os_memcmp_const(mic, parse.fte_mic, mic_len) != 0) {
+ 		wpa_printf(MSG_DEBUG, "FT: Invalid MIC in FTIE");
+-		wpa_printf(MSG_DEBUG, "FT: addr=" MACSTR " auth_addr=" MACSTR,
+-			   MAC2STR(sm->addr), MAC2STR(sm->wpa_auth->addr));
++		wpa_printf(MSG_DEBUG, "FT: addr=" MACSTR " auth_addr=" MACSTR
++			   " (SPA=" MACSTR " AA=" MACSTR ")",
++			   MAC2STR(sm->addr), MAC2STR(sm->wpa_auth->addr),
++			   MAC2STR(wpa_auth_get_spa(sm)),
++			   MAC2STR(wpa_auth_get_aa(sm)));
+ 		wpa_hexdump(MSG_MSGDUMP, "FT: Received MIC",
+ 			    parse.fte_mic, mic_len);
+ 		wpa_hexdump(MSG_MSGDUMP, "FT: Calculated MIC", mic, mic_len);
+@@ -3698,6 +4002,7 @@
+ 
+ 	retval = WLAN_STATUS_SUCCESS;
+ out:
++	wpabuf_free(extra);
+ 	wpa_ft_parse_ies_free(&parse);
+ 	return retval;
+ }

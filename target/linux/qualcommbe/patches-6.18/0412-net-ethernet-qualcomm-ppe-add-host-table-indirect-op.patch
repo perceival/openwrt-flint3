@@ -1,0 +1,216 @@
+From: Kamil Bienkiewicz <perceivalpercy@gmail.com>
+Subject: [PATCH] net: ethernet: qualcomm: ppe: add host table indirect-op
+ primitive
+
+Continuation of 0411 (flow table indirect-op primitive) -- see
+project_flint3_ppe_hw_offload_research.md for the full architectural
+context. The PPE host table (IP address -> nexthop binding, the second
+piece a hardware NAT/flow entry needs after the flow table itself) uses
+the same command/data/result indirect-access pattern as the flow table,
+confirmed by reading qca-ssdk's hppe_host_op_common()/hppe_host_entry_op()
+(src/hsl/hppe/hppe_ip.c) -- same CMD_ID/OP_TYPE/HASH_BLOCK_BITMAP=3/
+OP_MODE/ENTRY_INDEX trigger word shape, same VALID_CNT/OP_RSLT/
+ENTRY_INDEX result word shape -- but with its own register addresses and
+slightly different bitfield widths (13-bit entry index vs flow's 12-bit,
+no OP_HOST_EN bit) and, unlike flow, entries of varying width depending
+on IPv4 (3 words) vs IPv6 (5 words) rather than one fixed size.
+
+Deliberately did not build a shared cross-table abstraction on the
+strength of only two tables with different field widths; ppe_host.c is
+its own small, self-contained file mirroring ppe_flow.c's shape, not a
+generic parameterized helper. Note for the next table: unlike flow and
+host, the PPE nexthop table (IN_NEXTHOP_TBL) is directly addressed --
+one fixed MMIO offset per entry, matching this driver's existing
+scheduler-table style (ppe_scheduler_l0_queue_map_set() et al.) -- not
+another instance of this indirect pattern.
+
+Reused ppe_flow.h's ppe_flow_op_mode enum for host table's addressing
+mode (HASH/INDEX) rather than duplicating an identical enum under a
+ppe_host_-prefixed name, since it's a PPE-wide addressing concept, not
+flow-specific -- worth a real rename/relocation once there's upstream
+submission in view, not before.
+
+As with 0411: not wired into anything yet, no behavioral effect.
+Compile-tested only (module builds and links cleanly via the same
+surgical M=... build against the extracted kernel tree; all three new
+symbols confirmed present via nm); no hardware testing, since nothing
+calls these functions yet.
+
+Signed-off-by: Kamil Bienkiewicz <perceivalpercy@gmail.com>
+---
+--- a/drivers/net/ethernet/qualcomm/ppe/Makefile
++++ b/drivers/net/ethernet/qualcomm/ppe/Makefile
+@@ -4,7 +4,7 @@
+ #
+ 
+ obj-$(CONFIG_QCOM_PPE) += qcom-ppe.o
+-qcom-ppe-objs := ppe.o ppe_config.o ppe_debugfs.o ppe_port.o ppe_api.o ppe_flow.o
++qcom-ppe-objs := ppe.o ppe_config.o ppe_debugfs.o ppe_port.o ppe_api.o ppe_flow.o ppe_host.o
+ 
+ #EDMA
+ qcom-ppe-objs += edma.o edma_cfg_rx.o edma_cfg_tx.o edma_debugfs.o edma_port.o edma_rx.o edma_tx.o edma_ethtool.o
+--- a/drivers/net/ethernet/qualcomm/ppe/ppe_regs.h
++++ b/drivers/net/ethernet/qualcomm/ppe/ppe_regs.h
+@@ -1138,4 +1138,26 @@
+ #define PPE_IN_FLOW_TBL_OP_RSLT_OP_RSLT		BIT(4)
+ #define PPE_IN_FLOW_TBL_OP_RSLT_ENTRY_INDEX	GENMASK(16, 5)
+ #define PPE_IN_FLOW_TBL_OP_RSLT_VALID_CNT	GENMASK(20, 17)
++
++/* IPv4/IPv6 host table (IP address -> nexthop binding), accessed
++ * indirectly with the same command/data/result sequence as the flow
++ * table above, but with its own register addresses and bitfield widths.
++ */
++#define PPE_HOST_TBL_OP_ADDR			0x2004bc
++#define PPE_HOST_TBL_OP_CMD_ID			GENMASK(3, 0)
++#define PPE_HOST_TBL_OP_BYP_RSLT_EN		BIT(4)
++#define PPE_HOST_TBL_OP_OP_TYPE			GENMASK(7, 5)
++#define PPE_HOST_TBL_OP_HASH_BLOCK_BITMAP	GENMASK(9, 8)
++#define PPE_HOST_TBL_OP_OP_MODE			BIT(10)
++#define PPE_HOST_TBL_OP_ENTRY_INDEX		GENMASK(23, 11)
++
++#define PPE_HOST_TBL_OP_DATA_ADDR		0x2004c0
++#define PPE_HOST_TBL_OP_DATA_ENTRIES		10
++#define PPE_HOST_TBL_OP_DATA_INC		0x4
++
++#define PPE_HOST_TBL_OP_RSLT_ADDR		0x2004e8
++#define PPE_HOST_TBL_OP_RSLT_CMD_ID		GENMASK(3, 0)
++#define PPE_HOST_TBL_OP_RSLT_OP_RSLT		BIT(4)
++#define PPE_HOST_TBL_OP_RSLT_ENTRY_INDEX	GENMASK(17, 5)
++#define PPE_HOST_TBL_OP_RSLT_VALID_CNT		GENMASK(21, 18)
+ #endif
+--- /dev/null
++++ b/drivers/net/ethernet/qualcomm/ppe/ppe_host.h
+@@ -0,0 +1,24 @@
++/* SPDX-License-Identifier: GPL-2.0-only
++ *
++ * Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.
++ */
++
++#ifndef __PPE_HOST_H__
++#define __PPE_HOST_H__
++
++#include <linux/types.h>
++
++#include "ppe.h"
++#include "ppe_flow.h" /* for enum ppe_flow_op_mode (HASH/INDEX addressing),
++			* shared across the PPE's indirect tables
++			*/
++
++/* Word count of an IPv4 (3) or IPv6 (5) host table entry. */
++#define PPE_HOST_TBL_IPV4_ENTRY_WORDS		3
++#define PPE_HOST_TBL_IPV6_ENTRY_WORDS		5
++
++int ppe_host_entry_add(struct ppe_device *ppe_dev, enum ppe_flow_op_mode mode,
++			const u32 *entry, unsigned int num_words, u32 *index);
++int ppe_host_entry_del(struct ppe_device *ppe_dev, u32 index);
++
++#endif
+--- /dev/null
++++ b/drivers/net/ethernet/qualcomm/ppe/ppe_host.c
+@@ -0,0 +1,106 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/*
++ * Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.
++ */
++
++/* PPE host table -- IP address to nexthop bindings. Accessed indirectly
++ * with the same command/data/result register sequence as the flow table
++ * (see ppe_flow.c), but through its own register set and with entries
++ * of varying width (3 words for IPv4, 5 for IPv6).
++ */
++
++#include <linux/bitfield.h>
++#include <linux/regmap.h>
++
++#include "ppe.h"
++#include "ppe_flow.h"
++#include "ppe_host.h"
++#include "ppe_regs.h"
++
++/* Values for PPE_HOST_TBL_OP's OP_TYPE field. */
++enum ppe_host_tbl_op_type {
++	PPE_HOST_TBL_OP_ADD = 0,
++	PPE_HOST_TBL_OP_DEL,
++	PPE_HOST_TBL_OP_GET,
++	PPE_HOST_TBL_OP_FLUSH,
++};
++
++/* Trigger the given host table operation and wait for hardware to
++ * complete it. *index is the entry index to operate on for
++ * PPE_FLOW_OP_MODE_INDEX (input); for PPE_FLOW_OP_MODE_HASH it is
++ * ignored on input and set to the hardware-assigned index on success.
++ */
++static int ppe_host_tbl_op_wait(struct ppe_device *ppe_dev,
++				 enum ppe_host_tbl_op_type op_type,
++				 enum ppe_flow_op_mode mode, u32 *index)
++{
++	u32 val, rslt;
++	int ret;
++
++	val = FIELD_PREP(PPE_HOST_TBL_OP_OP_TYPE, op_type);
++	val |= FIELD_PREP(PPE_HOST_TBL_OP_HASH_BLOCK_BITMAP, 3);
++	val |= FIELD_PREP(PPE_HOST_TBL_OP_OP_MODE, mode);
++	val |= FIELD_PREP(PPE_HOST_TBL_OP_ENTRY_INDEX, *index);
++
++	ret = regmap_write(ppe_dev->regmap, PPE_HOST_TBL_OP_ADDR, val);
++	if (ret)
++		return ret;
++
++	ret = regmap_read_poll_timeout(ppe_dev->regmap, PPE_HOST_TBL_OP_RSLT_ADDR,
++					rslt, FIELD_GET(PPE_HOST_TBL_OP_RSLT_VALID_CNT, rslt),
++					10, 2000);
++	if (ret)
++		return ret;
++
++	if (FIELD_GET(PPE_HOST_TBL_OP_RSLT_OP_RSLT, rslt))
++		return -EIO;
++
++	*index = FIELD_GET(PPE_HOST_TBL_OP_RSLT_ENTRY_INDEX, rslt);
++
++	return 0;
++}
++
++/**
++ * ppe_host_entry_add() - Add (or overwrite) a PPE host table entry.
++ * @ppe_dev: PPE device.
++ * @mode: Hash-based or caller-indexed entry placement.
++ * @entry: The host entry to write, as PPE_HOST_TBL_IPV4_ENTRY_WORDS (IPv4)
++ * or PPE_HOST_TBL_IPV6_ENTRY_WORDS (IPv6) 32-bit words.
++ * @num_words: Number of words in @entry.
++ * @index: In PPE_FLOW_OP_MODE_INDEX, the entry index to write to (input).
++ * On success, always holds the entry's final hardware index: unchanged
++ * for PPE_FLOW_OP_MODE_INDEX, hardware-assigned for PPE_FLOW_OP_MODE_HASH.
++ *
++ * Return: 0 on success, a negative error code on failure.
++ */
++int ppe_host_entry_add(struct ppe_device *ppe_dev, enum ppe_flow_op_mode mode,
++			const u32 *entry, unsigned int num_words, u32 *index)
++{
++	unsigned int i;
++	int ret;
++
++	if (num_words > PPE_HOST_TBL_OP_DATA_ENTRIES)
++		return -EINVAL;
++
++	for (i = 0; i < num_words; i++) {
++		ret = regmap_write(ppe_dev->regmap,
++				    PPE_HOST_TBL_OP_DATA_ADDR + i * PPE_HOST_TBL_OP_DATA_INC,
++				    entry[i]);
++		if (ret)
++			return ret;
++	}
++
++	return ppe_host_tbl_op_wait(ppe_dev, PPE_HOST_TBL_OP_ADD, mode, index);
++}
++
++/**
++ * ppe_host_entry_del() - Delete a PPE host table entry by index.
++ * @ppe_dev: PPE device.
++ * @index: The entry index to delete.
++ *
++ * Return: 0 on success, a negative error code on failure.
++ */
++int ppe_host_entry_del(struct ppe_device *ppe_dev, u32 index)
++{
++	return ppe_host_tbl_op_wait(ppe_dev, PPE_HOST_TBL_OP_DEL, PPE_FLOW_OP_MODE_INDEX, &index);
++}
