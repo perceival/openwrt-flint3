@@ -1803,6 +1803,96 @@ static int rtl837x_port_vlan_fast_age(struct dsa_switch *ds, int port, u16 vid)
 	return rtl837x_to_errno(ret);
 }
 
+/* The shared tag_8021q bridge VID is only meaningful while the bridge is
+ * VLAN-UNAWARE: there the tagger classifies by it and the switch picks the
+ * egress port from its own FDB. Once the bridge becomes VLAN-aware the tagger
+ * stops using it entirely (tag_vsc73xx_8021q returns the skb untouched when
+ * br_vlan_enabled()), but dsa_tag_8021q_bridge_join() has already made the
+ * user port a hardware member of it -- and a member is exactly what ingress
+ * filtering lets through. A client on such a port could therefore inject a
+ * frame carrying that internal VID and have it flooded inside the bridge VID
+ * and delivered to the CPU, where the VBID path attributes it to some port of
+ * that bridge. Drop the membership while filtering is on, restore it when it
+ * goes off. The CPU port keeps its membership either way -- the tagger needs
+ * it for the VLAN-unaware direction.
+ */
+static int rtl837x_bridge_vid_member(struct rtk_gsw *gsw, int port, bool member)
+{
+	struct dsa_port *dp = dsa_to_port(&gsw->ds, port);
+	typeof(gsw->vlan_table[0]) old_vlan;
+	unsigned int bridge_num;
+	u16 vid;
+	int ret;
+
+	bridge_num = dsa_port_bridge_num_get(dp);
+	if (!bridge_num)
+		return 0;
+
+	vid = dsa_tag_8021q_bridge_vid(bridge_num);
+	if (!vid || vid > RTK_VID_MAX)
+		return 0;
+
+	old_vlan = gsw->vlan_table[vid];
+
+	if (member) {
+		gsw->vlan_table[vid].valid = 1;
+		gsw->vlan_table[vid].vid = vid;
+		gsw->vlan_table[vid].mbr |= BIT(port);
+		gsw->vlan_table[vid].untag |= BIT(port);
+	} else {
+		gsw->vlan_table[vid].mbr &= ~BIT(port);
+		gsw->vlan_table[vid].untag &= ~BIT(port);
+	}
+
+	ret = rtl837x_write_vlan(gsw, vid);
+	if (ret)
+		gsw->vlan_table[vid] = old_vlan;
+
+	return ret;
+}
+
+/* Put a port into the hardware state for one VLAN-filtering mode.
+ *
+ * The step order is the whole point and differs by direction: each direction
+ * gives up a privilege before taking the matching protection away, so no
+ * intermediate state is more permissive than both the start and the end state.
+ * Rolling back is just applying the other mode, so the ordering is expressed
+ * once rather than being re-derived in every error path.
+ */
+static int rtl837x_apply_vlan_mode(struct rtk_gsw *gsw, int port,
+				   bool vlan_filtering)
+{
+	int ret;
+
+	if (vlan_filtering) {
+		/* Stop classifying into the bridge VID, leave it, and only
+		 * then start admitting tagged frames.
+		 */
+		ret = rtl837x_commit_pvid_for_mode(gsw, port, true);
+		if (ret)
+			return ret;
+
+		ret = rtl837x_bridge_vid_member(gsw, port, false);
+		if (ret)
+			return ret;
+
+		return rtl837x_set_ingress_policy(gsw, port, true);
+	}
+
+	/* Stop admitting tagged frames first, then rejoin the bridge VID and
+	 * classify into it again.
+	 */
+	ret = rtl837x_set_ingress_policy(gsw, port, false);
+	if (ret)
+		return ret;
+
+	ret = rtl837x_bridge_vid_member(gsw, port, true);
+	if (ret)
+		return ret;
+
+	return rtl837x_commit_pvid_for_mode(gsw, port, false);
+}
+
 static int rtl837x_port_vlan_filtering(struct dsa_switch *ds, int port,
 				       bool vlan_filtering,
 				       struct netlink_ext_ack *extack)
@@ -1818,23 +1908,12 @@ static int rtl837x_port_vlan_filtering(struct dsa_switch *ds, int port,
 	dp = dsa_to_port(ds, port);
 	old_vlan_filtering = dsa_port_is_vlan_filtering(dp);
 
-	/* rtl837x_set_ingress_policy() writes the restrictive knob first in both
-	 * directions, so this transition never exposes "filtering off + accept
-	 * all" even momentarily.
-	 */
-	ret = rtl837x_set_ingress_policy(gsw, port, vlan_filtering);
-	if (ret)
-		return ret;
-
-	ret = rtl837x_commit_pvid_for_mode(gsw, port, vlan_filtering);
+	ret = rtl837x_apply_vlan_mode(gsw, port, vlan_filtering);
 	if (ret) {
-		/* Roll back through the same ordered helper, so unwinding cannot
-		 * leave the port in the open combination either.
-		 */
-		rollback_ret = rtl837x_set_ingress_policy(gsw, port, old_vlan_filtering);
+		rollback_ret = rtl837x_apply_vlan_mode(gsw, port, old_vlan_filtering);
 		if (rollback_ret)
 			dev_err(gsw->dev,
-				"failed to restore VLAN ingress policy on port %d: %d\n",
+				"failed to restore VLAN mode on port %d: %d\n",
 				port, rollback_ret);
 	}
 
