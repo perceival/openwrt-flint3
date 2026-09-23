@@ -30,12 +30,14 @@ Signed-off-by: Kamil Bienkiewicz <perceivalpercy@gmail.com>
 ---
 --- a/drivers/net/ethernet/qualcomm/ppe/ppe.h
 +++ b/drivers/net/ethernet/qualcomm/ppe/ppe.h
-@@ -8,6 +8,7 @@
- 
+@@ -8,8 +8,9 @@
+
  #include <linux/compiler.h>
+ #include <linux/device.h>
  #include <linux/interconnect.h>
 +#include <linux/mutex.h>
- 
+ #include <linux/of.h>
+
  struct device;
  struct regmap;
 @@ -23,6 +24,13 @@

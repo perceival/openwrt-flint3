@@ -23,16 +23,22 @@ flowtable transmitting directly to the port, they carry the standalone
 VID 3076 and the client receives nothing, while the switch's own FDB has
 the client on a different port entirely.
 
-Use the bridge VID whenever the port is bridged, not just for
-already-forwarded frames. The switch then selects the egress port from
-its own FDB, which is what it does for bridge-forwarded traffic anyway,
-and a frame can no longer be tagged with a VLAN the port does not have.
+Use the bridge VID whenever a port on a VLAN-unaware bridge is
+transmitted to, not just for already-forwarded frames. The switch then
+selects the egress port from its own FDB, which is what it does for
+bridge-forwarded traffic anyway, and a frame can no longer be tagged
+with a VLAN the port does not have.
+
+VLAN-aware bridges are deliberately left exactly as they were. There
+every frame carries one of the bridge's own VLANs and the switch
+classifies by those, so tag_8021q does not decide the egress port and
+the untagged-return path stays restricted to bridge-forwarded frames.
 
 Bridge-forwarded traffic is unaffected: dsa_tag_8021q_bridge_join() sets
 tx_fwd_offload, and the bridge already marks what it forwards or
 originates, so that path took the bridge-VID branch before this change
 too. What changes is only frames that bypass bridge forwarding and are
-transmitted directly on the user port.
+transmitted directly on a port of a VLAN-unaware bridge.
 
 Link-local traffic (STP, LLDP, PTP, EAPOL) is addressed to one specific
 link and must keep precise targeting, so it is carved out and still uses
@@ -54,7 +60,7 @@ Signed-off-by: Kamil Bienkiewicz <perceivalpercy@gmail.com>
  
  #include "tag.h"
  #include "tag_8021q.h"
-@@ -13,13 +14,29 @@
+@@ -13,17 +14,43 @@
  {
  	struct dsa_port *dp = dsa_user_to_port(netdev);
  	u16 queue_mapping = skb_get_queue_mapping(skb);
@@ -67,6 +73,10 @@ Signed-off-by: Kamil Bienkiewicz <perceivalpercy@gmail.com>
 -		unsigned int bridge_num = dsa_port_bridge_num_get(dp);
 -		struct net_device *br = dsa_port_bridge_dev_get(dp);
 -
+-		if (br_vlan_enabled(br))
+-			return skb;
+-
+-		tx_vid = dsa_tag_8021q_bridge_vid(bridge_num);
 +	/* Link-local traffic (STP, LLDP, PTP, EAPOL) is addressed to one
 +	 * specific link, so it keeps the standalone VID and the precise
 +	 * targeting that comes with it. The driver is expected to keep
@@ -75,16 +85,30 @@ Signed-off-by: Kamil Bienkiewicz <perceivalpercy@gmail.com>
 +	if (is_link_local_ether_addr(eth_hdr(skb)->h_dest))
 +		br = NULL;
 +
-+	/* A bridged port has no standalone VLAN in hardware: joining a
-+	 * bridge replaces it with the bridge's VLAN. Sending with the
-+	 * standalone VID would hand the switch a VID it does not have and
-+	 * the frame is dropped -- which happens for anything transmitted
-+	 * straight onto the port instead of through the bridge, such as
-+	 * the netfilter flowtable's direct transmit path. Use the bridge
-+	 * VID for those too and let the switch pick the egress port from
-+	 * its own FDB, exactly as it does for bridge-forwarded frames.
-+	 */
 +	if (bridge_num && br) {
- 		if (br_vlan_enabled(br))
- 			return skb;
++		/* A VLAN-aware bridge tags every frame with one of its own
++		 * VLANs and the switch classifies by those, so tag_8021q has
++		 * no say in where the frame goes. Leave that case exactly as
++		 * it was: only what the bridge itself forwarded goes out
++		 * without a tag_8021q header.
++		 */
++		if (br_vlan_enabled(br)) {
++			if (skb->offload_fwd_mark)
++				return skb;
++		} else {
++			/* A bridged port has no standalone VLAN in hardware:
++			 * joining a bridge replaces it with the bridge's VLAN.
++			 * Sending with the standalone VID would hand the switch
++			 * a VID it does not have and the frame is dropped --
++			 * which happens for anything transmitted straight onto
++			 * the port instead of through the bridge, such as the
++			 * netfilter flowtable's direct transmit path. Use the
++			 * bridge VID for those too and let the switch pick the
++			 * egress port from its own FDB, exactly as it does for
++			 * bridge-forwarded frames.
++			 */
++			tx_vid = dsa_tag_8021q_bridge_vid(bridge_num);
++		}
+ 	}
  
+ 	pcp = netdev_txq_to_tc(netdev, queue_mapping);
