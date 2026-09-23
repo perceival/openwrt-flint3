@@ -1,0 +1,92 @@
+From: Kamil Bienkiewicz <perceivalpercy@gmail.com>
+Subject: [PATCH] net: ethernet: qualcomm: ppe: match CMD_ID on table op results
+
+The flow and host tables are driven through a command/result register
+pair, and each command carries a CMD_ID tag which the result register
+echoes back in PPE_IN_FLOW_TBL_OP_RSLT_CMD_ID / PPE_HOST_TBL_OP_RSLT_CMD_ID.
+We stamp that tag on the way in and then never look at it on the way out.
+
+Completion was instead inferred from VALID_CNT alone, which is a counter,
+not a one-shot valid bit, and nothing clears it between operations. A
+stale result left behind by an earlier op therefore satisfies the poll
+immediately, and the driver adopts that op's ENTRY_INDEX and OP_RSLT.
+
+The consequences are exactly the ones the tag exists to prevent: an add
+can come back with a foreign index, so the entry we actually programmed
+is tracked under the wrong index and never deleted -- it keeps
+NAT-forwarding a 5-tuple after conntrack and the firewall have torn the
+connection down -- and a delete issued for that index removes an
+unrelated live flow instead.
+
+Poll for our own CMD_ID as well as VALID_CNT, matching what the tag is
+for. The timeout is unchanged.
+
+Signed-off-by: Kamil Bienkiewicz <perceivalpercy@gmail.com>
+---
+--- a/drivers/net/ethernet/qualcomm/ppe/ppe_flow.c
++++ b/drivers/net/ethernet/qualcomm/ppe/ppe_flow.c
+@@ -41,10 +41,12 @@
+ 				 enum ppe_flow_tbl_op_type op_type,
+ 				 enum ppe_flow_op_mode mode, u32 *index)
+ {
+-	u32 val, rslt;
++	u32 val, rslt, cmd_id;
+ 	int ret;
+ 
+-	val = FIELD_PREP(PPE_IN_FLOW_TBL_OP_CMD_ID, ppe_flow_cmd_id++);
++	cmd_id = ppe_flow_cmd_id++ & FIELD_MAX(PPE_IN_FLOW_TBL_OP_CMD_ID);
++
++	val = FIELD_PREP(PPE_IN_FLOW_TBL_OP_CMD_ID, cmd_id);
+ 	val |= FIELD_PREP(PPE_IN_FLOW_TBL_OP_OP_TYPE, op_type);
+ 	val |= FIELD_PREP(PPE_IN_FLOW_TBL_OP_HASH_BLOCK_BITMAP, 3);
+ 	val |= FIELD_PREP(PPE_IN_FLOW_TBL_OP_OP_MODE, mode);
+@@ -54,8 +56,18 @@
+ 	if (ret)
+ 		return ret;
+ 
++	/* VALID_CNT is a counter, not a one-shot valid bit, and nothing clears
++	 * it between operations -- a stale result left by a previous op would
++	 * otherwise satisfy the poll immediately and we would adopt ITS entry
++	 * index. Match the command tag we just issued, which is what the tag is
++	 * for, so an add cannot return a foreign index (leaving the entry we
++	 * actually programmed untracked and never deleted) and a delete cannot
++	 * remove an unrelated live flow.
++	 */
+ 	ret = regmap_read_poll_timeout(ppe_dev->regmap, PPE_IN_FLOW_TBL_OP_RSLT_ADDR,
+-					rslt, FIELD_GET(PPE_IN_FLOW_TBL_OP_RSLT_VALID_CNT, rslt),
++					rslt,
++					FIELD_GET(PPE_IN_FLOW_TBL_OP_RSLT_VALID_CNT, rslt) &&
++					FIELD_GET(PPE_IN_FLOW_TBL_OP_RSLT_CMD_ID, rslt) == cmd_id,
+ 					10, 2000);
+ 	if (ret)
+ 		return ret;
+--- a/drivers/net/ethernet/qualcomm/ppe/ppe_host.c
++++ b/drivers/net/ethernet/qualcomm/ppe/ppe_host.c
+@@ -41,10 +41,12 @@
+ 				 enum ppe_host_tbl_op_type op_type,
+ 				 enum ppe_flow_op_mode mode, u32 *index)
+ {
+-	u32 val, rslt;
++	u32 val, rslt, cmd_id;
+ 	int ret;
+ 
+-	val = FIELD_PREP(PPE_HOST_TBL_OP_CMD_ID, ppe_host_cmd_id++);
++	cmd_id = ppe_host_cmd_id++ & FIELD_MAX(PPE_HOST_TBL_OP_CMD_ID);
++
++	val = FIELD_PREP(PPE_HOST_TBL_OP_CMD_ID, cmd_id);
+ 	val |= FIELD_PREP(PPE_HOST_TBL_OP_OP_TYPE, op_type);
+ 	val |= FIELD_PREP(PPE_HOST_TBL_OP_HASH_BLOCK_BITMAP, 3);
+ 	val |= FIELD_PREP(PPE_HOST_TBL_OP_OP_MODE, mode);
+@@ -54,8 +56,11 @@
+ 	if (ret)
+ 		return ret;
+ 
++	/* Match the command tag we issued -- see the comment in ppe_flow.c. */
+ 	ret = regmap_read_poll_timeout(ppe_dev->regmap, PPE_HOST_TBL_OP_RSLT_ADDR,
+-					rslt, FIELD_GET(PPE_HOST_TBL_OP_RSLT_VALID_CNT, rslt),
++					rslt,
++					FIELD_GET(PPE_HOST_TBL_OP_RSLT_VALID_CNT, rslt) &&
++					FIELD_GET(PPE_HOST_TBL_OP_RSLT_CMD_ID, rslt) == cmd_id,
+ 					10, 2000);
+ 	if (ret)
+ 		return ret;

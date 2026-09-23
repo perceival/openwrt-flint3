@@ -1,0 +1,170 @@
+From: Kamil Bienkiewicz <perceivalpercy@gmail.com>
+Subject: [PATCH] net: ethernet: qualcomm: ppe: harden the flow offload path
+
+Three fixes from a security review of the offload path.
+
+1. Stop logging kernel pointers and per-connection data at info level.
+   cls->cookie is (unsigned long)tuple -- a kernel heap address -- and it
+   was printed with %lx, bypassing the pointer hashing %p exists for, into
+   a log that is commonly forwarded off-box and attached to bug reports.
+   The per-flow lines also logged client source addresses for every
+   accepted connection, and the decline path let an unauthenticated client
+   flood the log with unoffloadable flows. The diagnostics move to
+   pr_debug (available via dynamic debug when actually investigating), the
+   cookie is not printed at all, and only genuine failure paths still log
+   unconditionally.
+
+2. Free tracked flows and their hardware entries on teardown.
+   ppe_offload_destroy() called rhashtable_destroy(), which leaks every
+   struct ppe_offload_flow_entry and, worse, leaves their hardware flow
+   entries programmed -- while the nexthop and pub-IP pools torn down
+   immediately afterwards are zeroed underneath them. Use
+   rhashtable_free_and_destroy() with a free function that removes what
+   each entry still owns first.
+
+3. Decline flows whose TCP flag mask we do not honour.
+   nf_flow_rule_match() builds TCP flows with tcp.flags = 0 masked to
+   RST|FIN precisely so that a teardown is not accelerated and conntrack
+   still sees it. We validated the other dissector keys but ignored
+   FLOW_DISSECTOR_KEY_TCP entirely, so the programmed entry matched a
+   superset of the software rule and would swallow FIN and RST. Decline
+   rather than silently accelerate more than we were asked to.
+
+Signed-off-by: Kamil Bienkiewicz <perceivalpercy@gmail.com>
+---
+--- a/drivers/net/ethernet/qualcomm/ppe/ppe_offload.c
++++ b/drivers/net/ethernet/qualcomm/ppe/ppe_offload.c
+@@ -231,12 +231,12 @@
+ 	return 0;
+ }
+ 
+-/* Temporary diagnostic instrumentation: logs exactly which check declined a
+- * real flow, ratelimited. Not intended to stay -- see
+- * project_flint3_ppe_hw_offload_research.md, "silent decline" debugging.
++/* Diagnostic: logs exactly which check declined a flow. pr_debug so an
++ * unauthenticated client cannot flood the log by generating unoffloadable
++ * flows; enable with dynamic debug when investigating a silent decline.
+  */
+ #define ppe_offload_decline(fmt, ...) \
+-	({ pr_info_ratelimited("ppe_offload: declined - " fmt "\n", ##__VA_ARGS__); -EOPNOTSUPP; })
++	({ pr_debug("ppe_offload: declined - " fmt "\n", ##__VA_ARGS__); -EOPNOTSUPP; })
+ 
+ /* Resolve the device a flow's packets arrive on down to the EDMA port
+  * whose ingress L3 interface hardware will match against, mirroring
+@@ -361,6 +361,21 @@
+ 	 * zones, WAN/LAN split) the kernel applies in software. The
+ 	 * vendor driver qualifies every flow the same way.
+ 	 */
++	/* nf_flow_rule_match() builds TCP flows with tcp.flags = 0 masked to
++	 * RST|FIN, precisely so that a teardown is NOT accelerated and conntrack
++	 * still observes it. We program no TCP-flag exception, so an entry would
++	 * match a superset of the software rule and swallow FIN/RST. Decline
++	 * instead of silently accelerating more than we were asked to.
++	 */
++	if (flow_rule_match_key(rule, FLOW_DISSECTOR_KEY_TCP)) {
++		struct flow_match_tcp tcp;
++
++		flow_rule_match_tcp(rule, &tcp);
++		if (tcp.mask->flags)
++			return ppe_offload_decline("tcp flag mask %#x not honoured",
++						    be16_to_cpu(tcp.mask->flags));
++	}
++
+ 	if (!flow_rule_match_key(rule, FLOW_DISSECTOR_KEY_META))
+ 		return ppe_offload_decline("no ingress interface in rule");
+ 
+@@ -588,8 +603,7 @@
+ 	 * our hardware entry.
+ 	 */
+ 	if (priv->flow_owner[flow_index]) {
+-		pr_info_ratelimited("ppe_offload: superseded cookie=%lu at flow_index=%u (new cookie=%lu)\n",
+-				     priv->flow_owner[flow_index]->cookie, flow_index, cls->cookie);
++		pr_debug("ppe_offload: superseded flow_index=%u\n", flow_index);
+ 		priv->flow_owner[flow_index]->flow_valid = false;
+ 	}
+ 
+@@ -617,9 +631,9 @@
+ 
+ 	mutex_unlock(&priv->lock);
+ 
+-	pr_info_ratelimited("ppe_offload: accepted flow_index=%u host_index=%u nexthop_index=%u pub_ip_index=%u src=%pI4->%pI4 odev=%s\n",
+-			     flow_index, host_index, nexthop_index, pub_ip_index,
+-			     &match_src, &new_src, netdev_name(odev));
++	pr_debug("ppe_offload: accepted flow_index=%u host_index=%u nexthop_index=%u pub_ip_index=%u src=%pI4->%pI4 odev=%s\n",
++		  flow_index, host_index, nexthop_index, pub_ip_index,
++		  &match_src, &new_src, netdev_name(odev));
+ 
+ 	return 0;
+ 
+@@ -688,8 +702,11 @@
+ static int ppe_offload_flow_cmd(struct net_device *netdev, struct ppe_offload_priv *priv,
+ 				 struct flow_cls_offload *cls)
+ {
+-	pr_info_ratelimited("ppe_offload: flow_cmd netdev=%s command=%d cookie=%lx\n",
+-			     netdev_name(netdev), cls->command, cls->cookie);
++	/* cls->cookie is a kernel heap address; printing it would defeat the
++	 * pointer hashing %p exists for, so it is deliberately not logged.
++	 */
++	pr_debug("ppe_offload: flow_cmd netdev=%s command=%d\n",
++		  netdev_name(netdev), cls->command);
+ 
+ 	switch (cls->command) {
+ 	case FLOW_CLS_REPLACE:
+@@ -732,7 +749,7 @@
+ {
+ 	struct flow_block_cb *block_cb;
+ 
+-	pr_info_ratelimited("ppe_offload: setup_tc_block netdev=%s binder_type=%d command=%d\n",
++	pr_debug("ppe_offload: setup_tc_block netdev=%s binder_type=%d command=%d\n",
+ 			     netdev_name(netdev), f->binder_type, f->command);
+ 
+ 	if (f->binder_type != FLOW_BLOCK_BINDER_TYPE_CLSACT_INGRESS)
+@@ -758,7 +775,7 @@
+ 		flow_block_cb_incref(block_cb);
+ 		flow_block_cb_add(block_cb, f);
+ 		list_add_tail(&block_cb->driver_list, &ppe_offload_block_cb_list);
+-		pr_info_ratelimited("ppe_offload: block bound on %s\n", netdev_name(netdev));
++		pr_debug("ppe_offload: block bound on %s\n", netdev_name(netdev));
+ 		return 0;
+ 	case FLOW_BLOCK_UNBIND:
+ 		block_cb = flow_block_cb_lookup(f->block, ppe_offload_setup_tc_block_cb,
+@@ -965,6 +982,25 @@
+ 	return 0;
+ }
+ 
++/* Free one tracked flow during teardown, removing whatever it still owns in
++ * hardware first. Called with no concurrent users: the indirect block callback
++ * is already unregistered.
++ */
++static void ppe_offload_flow_free_fn(void *ptr, void *arg)
++{
++	struct ppe_offload_flow_entry *entry = ptr;
++	struct ppe_offload_priv *priv = arg;
++
++	if (priv->flow_owner[entry->flow_index] == entry)
++		priv->flow_owner[entry->flow_index] = NULL;
++	if (entry->flow_valid)
++		ppe_flow_entry_del(priv->ppe_dev, entry->flow_index);
++	ppe_host_pool_deref(priv->ppe_dev, &priv->host_pool, entry->host_index);
++	ppe_nexthop_pool_deref(priv->ppe_dev, &priv->nexthop_pool, entry->nexthop_index);
++	ppe_pub_ip_pool_deref(priv->ppe_dev, &priv->pub_ip_pool, entry->pub_ip_index);
++	kfree(entry);
++}
++
+ /**
+  * ppe_offload_destroy() - Tear down PPE hardware flow-offload state.
+  * @ppe_dev: PPE device.
+@@ -978,7 +1014,12 @@
+ 
+ 	flow_indr_dev_unregister(ppe_offload_indr_setup_tc_cb, priv,
+ 				  ppe_offload_indr_block_unbind);
+-	rhashtable_destroy(&priv->flow_table);
++	/* Free the tracked flows AND tear down the hardware entries they own.
++	 * rhashtable_destroy() would leak every entry and leave hardware still
++	 * forwarding for them -- and the pools torn down just below would then
++	 * be zeroed underneath those still-programmed entries.
++	 */
++	rhashtable_free_and_destroy(&priv->flow_table, ppe_offload_flow_free_fn, priv);
+ 	ppe_pub_ip_pool_destroy(ppe_dev, &priv->pub_ip_pool);
+ 	ppe_nexthop_pool_destroy(ppe_dev, &priv->nexthop_pool);
+ 	ppe_host_pool_destroy(ppe_dev, &priv->host_pool);
