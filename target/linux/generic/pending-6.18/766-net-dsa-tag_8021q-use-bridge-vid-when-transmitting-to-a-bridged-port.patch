@@ -1,0 +1,77 @@
+From: Kamil Bienkiewicz <perceivalpercy@gmail.com>
+Subject: [PATCH] net: dsa: tag_vsc73xx_8021q: use the bridge VID when
+ transmitting to a bridged port
+
+Joining a bridge replaces a port's standalone tag_8021q VLAN with the
+bridge's VLAN (dsa_tag_8021q_bridge_join() adds the bridge VID and
+deletes the standalone one). The xmit path, however, only uses the
+bridge VID when skb->offload_fwd_mark is set, and otherwise tags with
+the standalone VID -- a VID the switch no longer has for that port, so
+the frame is dropped.
+
+That is not reachable while everything goes through the bridge, because
+bridge-forwarded frames carry the mark. It is reachable as soon as
+something transmits straight onto the user port instead: the netfilter
+flowtable's direct transmit path does exactly this once
+dev_fill_forward_path() has resolved a bridge port, and every packet of
+such a flow is then lost.
+
+Measured on an IPQ5332 board with an RTL8372N switch (rtl837x, which
+reuses this tagger): with the flowtable forwarding through the bridge,
+frames towards the client carry the bridge VID 3088 and arrive; with the
+flowtable transmitting directly to the port, they carry the standalone
+VID 3076 and the client receives nothing, while the switch's own FDB has
+the client on a different port entirely.
+
+Use the bridge VID whenever the port is bridged, not just for
+already-forwarded frames. The switch then selects the egress port from
+its own FDB, which is what it does for bridge-forwarded traffic anyway,
+and a frame can no longer be tagged with a VLAN the port does not have.
+
+Bridge-forwarded traffic is unaffected: dsa_tag_8021q_bridge_join() sets
+tx_fwd_offload, and the bridge already marks what it forwards or
+originates, so that path took the bridge-VID branch before this change
+too. What changes is only frames that bypass bridge forwarding and are
+transmitted directly on the user port.
+
+Caveat for an upstream submission: link-local control traffic sent
+directly on a bridged port (STP BPDUs via br_stp_bpdu.c, or LLDP/PTP/
+EAPOL from a raw socket) also goes from "tagged with a VID the switch
+does not have, and dropped" to "carried in the bridge VLAN", which lets
+the switch flood it to sibling bridge members instead of targeting one
+link. That is an improvement on being dropped, but tag_sja1105.c -- the
+mature implementation of this same pattern -- carves link-local frames
+out first and sends them through a precise management route.
+tag_vsc73xx_8021q.c has no such mechanism, before or after this patch;
+adding one is the remaining work before this is upstream-ready.
+
+Signed-off-by: Kamil Bienkiewicz <perceivalpercy@gmail.com>
+---
+--- a/net/dsa/tag_vsc73xx_8021q.c
++++ b/net/dsa/tag_vsc73xx_8021q.c
+@@ -13,13 +13,21 @@
+ {
+ 	struct dsa_port *dp = dsa_user_to_port(netdev);
+ 	u16 queue_mapping = skb_get_queue_mapping(skb);
++	unsigned int bridge_num = dsa_port_bridge_num_get(dp);
++	struct net_device *br = dsa_port_bridge_dev_get(dp);
+ 	u16 tx_vid = dsa_tag_8021q_standalone_vid(dp);
+ 	u8 pcp;
+ 
+-	if (skb->offload_fwd_mark) {
+-		unsigned int bridge_num = dsa_port_bridge_num_get(dp);
+-		struct net_device *br = dsa_port_bridge_dev_get(dp);
+-
++	/* A bridged port has no standalone VLAN in hardware: joining a
++	 * bridge replaces it with the bridge's VLAN. Sending with the
++	 * standalone VID would hand the switch a VID it does not have and
++	 * the frame is dropped -- which happens for anything transmitted
++	 * straight onto the port instead of through the bridge, such as
++	 * the netfilter flowtable's direct transmit path. Use the bridge
++	 * VID for those too and let the switch pick the egress port from
++	 * its own FDB, exactly as it does for bridge-forwarded frames.
++	 */
++	if (bridge_num && br) {
+ 		if (br_vlan_enabled(br))
+ 			return skb;
+ 

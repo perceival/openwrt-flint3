@@ -1,0 +1,78 @@
+From: Kamil Bienkiewicz <perceivalpercy@gmail.com>
+Subject: [PATCH] net: ethernet: qualcomm: ppe: write the whole L3_VP_PORT
+ table entry
+
+ppe_l3_if_port_bind() updated only word 0 of the entry, which hardware
+silently ignores: the entry latches when the last word of it is written.
+The binding therefore never took effect, and the ingress L3 interface a
+flow matches against stayed unset.
+
+Confirmed on an IPQ5332 (GL.iNet BE9300) with a probe module: a
+read-modify-write of word 0 alone left entries 1 and 2 reading
+0x00000000, while writing all four words gave 0x00000003 and 0x00000005
+-- valid, with the expected L3 interface indices. The vendor SDK always
+writes the full entry (hppe_reg_tbl_set() loops over every word).
+
+Read the entry, change the two L3 interface fields and write all four
+words back, so the rest of the entry (source-guard configuration) is
+preserved.
+
+Signed-off-by: Kamil Bienkiewicz <perceivalpercy@gmail.com>
+---
+--- a/drivers/net/ethernet/qualcomm/ppe/ppe_regs.h
++++ b/drivers/net/ethernet/qualcomm/ppe/ppe_regs.h
+@@ -1244,6 +1244,7 @@
+ #define PPE_L3_VP_PORT_TBL_ADDR			0x204000
+ #define PPE_L3_VP_PORT_TBL_ENTRIES		256
+ #define PPE_L3_VP_PORT_TBL_INC			0x10
++#define PPE_L3_VP_PORT_TBL_WORDS		4
+ 
+ /* Word 0. */
+ #define PPE_L3_VP_PORT_TBL_L3_IF_VALID		BIT(0)
+--- a/drivers/net/ethernet/qualcomm/ppe/ppe_l3_if.c
++++ b/drivers/net/ethernet/qualcomm/ppe/ppe_l3_if.c
+@@ -247,19 +247,37 @@
+ int ppe_l3_if_port_bind(struct ppe_device *ppe_dev, u32 port_id,
+ 			 u32 l3_if_index, bool valid)
+ {
+-	u32 addr, val = 0;
++	u32 addr, val[PPE_L3_VP_PORT_TBL_WORDS];
++	int ret;
++	int i;
+ 
+ 	if (port_id >= PPE_L3_VP_PORT_TBL_ENTRIES ||
+ 	    l3_if_index >= PPE_IN_L3_IF_TBL_ENTRIES)
+ 		return -EINVAL;
+ 
++	addr = PPE_L3_VP_PORT_TBL_ADDR + port_id * PPE_L3_VP_PORT_TBL_INC;
++
++	/* The entry only latches when every word is written, so read it
++	 * back, change the two L3 interface fields and write the whole
++	 * entry out again -- writing word 0 alone is silently dropped.
++	 */
++	for (i = 0; i < PPE_L3_VP_PORT_TBL_WORDS; i++) {
++		ret = regmap_read(ppe_dev->regmap, addr + i * 4, &val[i]);
++		if (ret)
++			return ret;
++	}
++
++	val[0] &= ~(PPE_L3_VP_PORT_TBL_L3_IF_VALID |
++		    PPE_L3_VP_PORT_TBL_L3_IF_INDEX);
+ 	if (valid)
+-		val = PPE_L3_VP_PORT_TBL_L3_IF_VALID |
+-		      FIELD_PREP(PPE_L3_VP_PORT_TBL_L3_IF_INDEX, l3_if_index);
++		val[0] |= PPE_L3_VP_PORT_TBL_L3_IF_VALID |
++			  FIELD_PREP(PPE_L3_VP_PORT_TBL_L3_IF_INDEX, l3_if_index);
+ 
+-	addr = PPE_L3_VP_PORT_TBL_ADDR + port_id * PPE_L3_VP_PORT_TBL_INC;
++	for (i = 0; i < PPE_L3_VP_PORT_TBL_WORDS; i++) {
++		ret = regmap_write(ppe_dev->regmap, addr + i * 4, val[i]);
++		if (ret)
++			return ret;
++	}
+ 
+-	return regmap_update_bits(ppe_dev->regmap, addr,
+-				   PPE_L3_VP_PORT_TBL_L3_IF_VALID |
+-				   PPE_L3_VP_PORT_TBL_L3_IF_INDEX, val);
++	return 0;
+ }
