@@ -900,6 +900,56 @@ static void rtl837x_stats_stop(struct rtk_gsw *gsw)
 	cancel_delayed_work_sync(&gsw->stats_work);
 }
 
+/* Apply a port's ingress policy for the given VLAN-filtering mode.
+ *
+ * Always write the RESTRICTIVE setting first, in both directions, so no
+ * transition ever passes through "ingress filtering off AND every frame type
+ * accepted" -- the exact combination that lets whatever is plugged into a user
+ * port choose its own VLAN. The two SDK calls are separate register writes and
+ * are never atomic with each other, and the off direction is routine, not just
+ * an admin toggle: DSA calls us with vlan_filtering=false from
+ * dsa_port_reset_vlan_filtering() whenever the last VLAN-aware bridge on the
+ * switch goes away.
+ *
+ * KNOWN GAP, deliberately not addressed here: a VLAN-AWARE bridge port stays at
+ * ACCEPT_FRAME_TYPE_ALL, and dsa_tag_8021q_bridge_join() has made it a hardware
+ * member of the shared bridge VID. Ingress filtering therefore does NOT stop it
+ * injecting a frame tagged with that VID -- the port genuinely is a member --
+ * which floods within the bridge VID and also reaches the CPU, where the VBID
+ * path attributes it to some port of that bridge. Closing that needs the user
+ * port's bridge-VID membership dropped while vlan_filtering is on (the tagger
+ * does not use that VID in VLAN-aware mode), which is a separate change.
+ */
+static int rtl837x_set_ingress_policy(struct rtk_gsw *gsw, int port,
+				      bool vlan_filtering)
+{
+	int ret;
+
+	if (vlan_filtering) {
+		/* Start checking membership before admitting tagged frames. */
+		ret = rtk_vlan_portIgrFilterEnable_set(port, ENABLED);
+		if (ret)
+			return rtl837x_to_errno(ret);
+
+		ret = rtk_vlan_portAcceptFrameType_set(port, ACCEPT_FRAME_TYPE_ALL);
+		if (ret)
+			return rtl837x_to_errno(ret);
+
+		return 0;
+	}
+
+	/* Stop admitting tagged frames before membership checking goes away. */
+	ret = rtk_vlan_portAcceptFrameType_set(port, ACCEPT_FRAME_TYPE_UNTAG_ONLY);
+	if (ret)
+		return rtl837x_to_errno(ret);
+
+	ret = rtk_vlan_portIgrFilterEnable_set(port, DISABLED);
+	if (ret)
+		return rtl837x_to_errno(ret);
+
+	return 0;
+}
+
 static int rtl837x_write_vlan(struct rtk_gsw *gsw, u16 vid)
 {
 	rtk_vlan_entry_t vlan = { 0 };
@@ -945,10 +995,6 @@ static int rtl837x_seed_vlan_table(struct rtk_gsw *gsw)
 		if (ret)
 			return rtl837x_to_errno(ret);
 
-		ret = rtk_vlan_portIgrFilterEnable_set(port, DISABLED);
-		if (ret)
-			return rtl837x_to_errno(ret);
-
 		/* With ingress filtering off, the switch would honour whatever
 		 * VLAN tag a frame arrives with, so anything plugged into a
 		 * user port could pick its own VLAN: the tag_8021q bridge VID
@@ -966,12 +1012,20 @@ static int rtl837x_seed_vlan_table(struct rtk_gsw *gsw)
 		 * unaffected. The CPU port must keep accepting tagged frames:
 		 * that is how the tagger addresses a port.
 		 */
-		ret = rtk_vlan_portAcceptFrameType_set(port,
-						       rtl837x_user_port(gsw, port) ?
-						       ACCEPT_FRAME_TYPE_UNTAG_ONLY :
-						       ACCEPT_FRAME_TYPE_ALL);
-		if (ret)
-			return rtl837x_to_errno(ret);
+		if (rtl837x_user_port(gsw, port)) {
+			ret = rtl837x_set_ingress_policy(gsw, port, false);
+			if (ret)
+				return ret;
+		} else {
+			ret = rtk_vlan_portIgrFilterEnable_set(port, DISABLED);
+			if (ret)
+				return rtl837x_to_errno(ret);
+
+			ret = rtk_vlan_portAcceptFrameType_set(port, ACCEPT_FRAME_TYPE_ALL);
+			if (ret)
+				return rtl837x_to_errno(ret);
+		}
+
 	}
 
 	return 0;
@@ -1764,46 +1818,24 @@ static int rtl837x_port_vlan_filtering(struct dsa_switch *ds, int port,
 	dp = dsa_to_port(ds, port);
 	old_vlan_filtering = dsa_port_is_vlan_filtering(dp);
 
-	ret = rtk_vlan_portIgrFilterEnable_set(port,
-					       vlan_filtering ? ENABLED : DISABLED);
-	if (ret)
-		return rtl837x_to_errno(ret);
-
-	/* A VLAN-aware bridge carries tagged traffic on user ports, so they
-	 * have to accept tagged frames -- but only once ingress filtering is
-	 * on to check membership, which is what stops a port injecting into a
-	 * VLAN it does not belong to. Without filtering, restrict the port to
-	 * untagged and priority-tagged frames again (see the seed).
+	/* rtl837x_set_ingress_policy() writes the restrictive knob first in both
+	 * directions, so this transition never exposes "filtering off + accept
+	 * all" even momentarily.
 	 */
-	ret = rtk_vlan_portAcceptFrameType_set(port,
-					       vlan_filtering ?
-					       ACCEPT_FRAME_TYPE_ALL :
-					       ACCEPT_FRAME_TYPE_UNTAG_ONLY);
-	if (ret) {
-		rollback_ret = rtk_vlan_portIgrFilterEnable_set(
-				port, old_vlan_filtering ? ENABLED : DISABLED);
-		if (rollback_ret)
-			dev_err(gsw->dev,
-				"failed to restore VLAN ingress filtering on port %d: %d\n",
-				port, rtl837x_to_errno(rollback_ret));
-		return rtl837x_to_errno(ret);
-	}
+	ret = rtl837x_set_ingress_policy(gsw, port, vlan_filtering);
+	if (ret)
+		return ret;
 
 	ret = rtl837x_commit_pvid_for_mode(gsw, port, vlan_filtering);
 	if (ret) {
-		rollback_ret = rtk_vlan_portIgrFilterEnable_set(
-				port, old_vlan_filtering ? ENABLED : DISABLED);
+		/* Roll back through the same ordered helper, so unwinding cannot
+		 * leave the port in the open combination either.
+		 */
+		rollback_ret = rtl837x_set_ingress_policy(gsw, port, old_vlan_filtering);
 		if (rollback_ret)
 			dev_err(gsw->dev,
-				"failed to restore VLAN ingress filtering on port %d: %d\n",
-				port, rtl837x_to_errno(rollback_ret));
-		rollback_ret = rtk_vlan_portAcceptFrameType_set(
-				port, old_vlan_filtering ?
-				ACCEPT_FRAME_TYPE_ALL : ACCEPT_FRAME_TYPE_UNTAG_ONLY);
-		if (rollback_ret)
-			dev_err(gsw->dev,
-				"failed to restore VLAN accept frame type on port %d: %d\n",
-				port, rtl837x_to_errno(rollback_ret));
+				"failed to restore VLAN ingress policy on port %d: %d\n",
+				port, rollback_ret);
 	}
 
 	return ret;
