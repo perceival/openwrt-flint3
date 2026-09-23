@@ -34,22 +34,27 @@ originates, so that path took the bridge-VID branch before this change
 too. What changes is only frames that bypass bridge forwarding and are
 transmitted directly on the user port.
 
-Caveat for an upstream submission: link-local control traffic sent
-directly on a bridged port (STP BPDUs via br_stp_bpdu.c, or LLDP/PTP/
-EAPOL from a raw socket) also goes from "tagged with a VID the switch
-does not have, and dropped" to "carried in the bridge VLAN", which lets
-the switch flood it to sibling bridge members instead of targeting one
-link. That is an improvement on being dropped, but tag_sja1105.c -- the
-mature implementation of this same pattern -- carves link-local frames
-out first and sends them through a precise management route.
-tag_vsc73xx_8021q.c has no such mechanism, before or after this patch;
-adding one is the remaining work before this is upstream-ready.
+Link-local traffic (STP, LLDP, PTP, EAPOL) is addressed to one specific
+link and must keep precise targeting, so it is carved out and still uses
+the standalone VID, the way tag_sja1105.c carves link-local frames out
+before its own imprecise path. For that to work the standalone VLAN has
+to stay present in hardware while the port is bridged; the rtl837x
+driver keeps it (the port's PVID is the bridge VLAN, so ingress
+classification and isolation are unchanged).
 
 Signed-off-by: Kamil Bienkiewicz <perceivalpercy@gmail.com>
 ---
 --- a/net/dsa/tag_vsc73xx_8021q.c
 +++ b/net/dsa/tag_vsc73xx_8021q.c
-@@ -13,13 +13,21 @@
+@@ -2,6 +2,7 @@
+ /* Copyright (C) 2024 Pawel Dembicki <paweldembicki@gmail.com>
+  */
+ #include <linux/dsa/8021q.h>
++#include <linux/etherdevice.h>
+ 
+ #include "tag.h"
+ #include "tag_8021q.h"
+@@ -13,13 +14,29 @@
  {
  	struct dsa_port *dp = dsa_user_to_port(netdev);
  	u16 queue_mapping = skb_get_queue_mapping(skb);
@@ -62,6 +67,14 @@ Signed-off-by: Kamil Bienkiewicz <perceivalpercy@gmail.com>
 -		unsigned int bridge_num = dsa_port_bridge_num_get(dp);
 -		struct net_device *br = dsa_port_bridge_dev_get(dp);
 -
++	/* Link-local traffic (STP, LLDP, PTP, EAPOL) is addressed to one
++	 * specific link, so it keeps the standalone VID and the precise
++	 * targeting that comes with it. The driver is expected to keep
++	 * that VLAN present in hardware for bridged ports.
++	 */
++	if (is_link_local_ether_addr(eth_hdr(skb)->h_dest))
++		br = NULL;
++
 +	/* A bridged port has no standalone VLAN in hardware: joining a
 +	 * bridge replaces it with the bridge's VLAN. Sending with the
 +	 * standalone VID would hand the switch a VID it does not have and
