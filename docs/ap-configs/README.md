@@ -58,11 +58,34 @@ Read the port's VLANs on each end — the backhaul port should look like a trunk
     wl0-ap2.sta1      10 PVID Egress Untagged
                       192
 
-The `bridge` tool is not installed by default on every image (`ip-bridge`).
 Failing that, test functionally from the station, which is the stronger check:
 
     ping -c2 -I br-lan.10  10.20.30.1      # management VLAN
     ping -c2 -I br-lan.192 192.168.2.1     # guest VLAN  <-- the one that breaks
+
+## The script's dependency is easy to lose
+
+`99-wds-vlan192` needs `/usr/sbin/bridge`, from the **ip-bridge** package, which
+is not in every image. What matters is not whether it is installed now but
+*where it came from*, because a sysupgrade replaces the rootfs and keeps only
+the overlay files you asked it to keep:
+
+    [ -e /rom/usr/sbin/bridge ]           && echo "in image - survives sysupgrade"
+    [ -e /overlay/upper/usr/sbin/bridge ] && echo "overlay only - LOST on sysupgrade"
+
+If it is overlay-only, the next sysupgrade removes it and the script can no
+longer do its job. The script does try `apk add ip-bridge` as a fallback, but
+that needs working package feeds for that exact release — which for a SNAPSHOT
+build will not be there indefinitely. Do not rely on it.
+
+Two durable options:
+
+* **Build it into the image.** If you build your own firmware, select
+  `CONFIG_PACKAGE_ip-bridge=y` and ideally make the build fail without it — the
+  failure mode is silent, so a missing tool is worth a hard stop.
+* **Use attendedsysupgrade** on devices whose firmware you do not build. It
+  rebuilds an image that includes your installed packages, so `ip-bridge`
+  survives.
 
 ## What has been removed from these files
 
