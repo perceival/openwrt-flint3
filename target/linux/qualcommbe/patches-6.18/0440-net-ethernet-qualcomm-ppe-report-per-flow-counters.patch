@@ -1,0 +1,244 @@
+From: Kamil Bienkiewicz <perceivalpercy@gmail.com>
+Subject: [PATCH] net: ethernet: qualcomm: ppe: report per-flow hardware counters
+
+Without FLOW_CLS_STATS the flowtable never sees activity on an offloaded
+flow, so it ages the connection out after its idle timeout and tears the
+hardware entry down with it. A long-lived but bursty connection therefore
+loses acceleration silently, and comes back only when a new flow is
+offered. This was the largest functional gap left in the offload.
+
+Add a primitive for the per-flow counter table and wire it to
+FLOW_CLS_STATS.
+
+Address, from the vendor SDK: INGRESS_POLICER_BASE_ADDR (0x100000,
+hppe_reg_access.h) + IN_FLOW_CNT_TBL_ADDRESS (0x20000, hppe_flow_reg.h),
+stride IN_FLOW_CNT_TBL_INC (0x10), as used by hppe_in_flow_cnt_tbl_get()
+in hppe_flow.c. HIT_PKT_COUNTER is 32 bits at offset 0; HIT_BYTE_COUNTER
+is 40 bits at offset 32, so bytes span word 1 and the low byte of word 2.
+
+Both the base and the table offset are defined unconditionally in the SDK
+-- deliberately checked, because they are NOT inside an "#if defined(APPE)"
+branch, unlike the IPE_L3 tables whose HPPE-vs-APPE difference previously
+sent every table write into the wrong place. hppe_flow_reg_be.h agrees.
+
+The counters are cumulative and not clear-on-read, so each entry keeps its
+previous reading and reports a delta. lastused is refreshed only when the
+packet count actually moves, which is what tells the flowtable the flow is
+alive. A counter that goes backwards (index reprogrammed underneath us)
+re-baselines instead of reporting a bogus delta.
+
+NOT HARDWARE-VERIFIED: confirming the counters actually increment needs an
+active offloaded flow, i.e. a unit in router mode. The address is verified
+against the SDK, the arithmetic is not yet verified against silicon.
+
+Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01TwrzKNAPLwfKWiBDhPePU3
+---
+--- a/drivers/net/ethernet/qualcomm/ppe/ppe_regs.h
++++ b/drivers/net/ethernet/qualcomm/ppe/ppe_regs.h
+@@ -1128,6 +1128,24 @@
+  */
+ #define PPE_IN_FLOW_TBL_ENTRIES			2048
+ 
++/* Per-flow hit counters, indexed by the flow table entry index.
++ *
++ * Address is INGRESS_POLICER_BASE_ADDR (0x100000) + IN_FLOW_CNT_TBL_ADDRESS
++ * (0x20000), stride IN_FLOW_CNT_TBL_INC (0x10), per the vendor SDK
++ * (hppe_flow.c: hppe_in_flow_cnt_tbl_get, hppe_reg_access.h, hppe_flow_reg.h).
++ * Both the base and the table offset are defined unconditionally there -- they
++ * are NOT inside an "#if defined(APPE)" branch, unlike the IPE_L3 tables that
++ * caused the HPPE/APPE address mix-up.
++ *
++ * The counters are cumulative and NOT clear-on-read, so callers must keep the
++ * previous value and report deltas.
++ */
++#define PPE_IN_FLOW_CNT_TBL_ADDR		0x120000
++#define PPE_IN_FLOW_CNT_TBL_INC			0x10
++#define PPE_IN_FLOW_CNT_TBL_ENTRIES		4096
++/* word 0: packets (32 bits); word 1 + low 8 bits of word 2: bytes (40 bits) */
++#define PPE_IN_FLOW_CNT_TBL_BYTE_HI		GENMASK(7, 0)
++
+ #define PPE_IN_FLOW_TBL_OP_ADDR			0x200528
+ #define PPE_IN_FLOW_TBL_OP_CMD_ID		GENMASK(3, 0)
+ #define PPE_IN_FLOW_TBL_OP_BYP_RSLT_EN		BIT(4)
+--- a/drivers/net/ethernet/qualcomm/ppe/ppe_flow.h
++++ b/drivers/net/ethernet/qualcomm/ppe/ppe_flow.h
+@@ -32,6 +32,8 @@
+ 	PPE_FLOW_OP_MODE_INDEX,
+ };
+ 
++int ppe_flow_counter_get(struct ppe_device *ppe_dev, u32 index,
++			 u64 *packets, u64 *bytes);
+ int ppe_flow_entry_add(struct ppe_device *ppe_dev, enum ppe_flow_op_mode mode,
+ 			const u32 entry[PPE_FLOW_TBL_ENTRY_WORDS], u32 *index);
+ int ppe_flow_entry_del(struct ppe_device *ppe_dev, u32 index);
+--- a/drivers/net/ethernet/qualcomm/ppe/ppe_flow.c
++++ b/drivers/net/ethernet/qualcomm/ppe/ppe_flow.c
+@@ -90,6 +90,43 @@
+ }
+ 
+ /**
++ * ppe_flow_counter_get() - Read a flow entry's cumulative hit counters.
++ * @ppe_dev: PPE device.
++ * @index: Flow table entry index.
++ * @packets: Out: packets matched by this entry since it was programmed.
++ * @bytes: Out: bytes matched by this entry since it was programmed.
++ *
++ * The counters live in a separate table from the flow entries themselves and are
++ * addressed directly (no command/result handshake). They are cumulative and not
++ * clear-on-read, so the caller is responsible for keeping the previous reading
++ * and reporting a delta.
++ *
++ * Return: 0 on success, a negative error code on failure.
++ */
++int ppe_flow_counter_get(struct ppe_device *ppe_dev, u32 index,
++			 u64 *packets, u64 *bytes)
++{
++	u32 addr, val[3];
++	int ret, i;
++
++	if (index >= PPE_IN_FLOW_CNT_TBL_ENTRIES)
++		return -EINVAL;
++
++	addr = PPE_IN_FLOW_CNT_TBL_ADDR + index * PPE_IN_FLOW_CNT_TBL_INC;
++
++	for (i = 0; i < ARRAY_SIZE(val); i++) {
++		ret = regmap_read(ppe_dev->regmap, addr + i * sizeof(u32), &val[i]);
++		if (ret)
++			return ret;
++	}
++
++	*packets = val[0];
++	*bytes = (u64)FIELD_GET(PPE_IN_FLOW_CNT_TBL_BYTE_HI, val[2]) << 32 | val[1];
++
++	return 0;
++}
++
++/**
+  * ppe_flow_entry_add() - Add (or overwrite) a PPE flow table entry.
+  * @ppe_dev: PPE device.
+  * @mode: Hash-based or caller-indexed entry placement.
+--- a/drivers/net/ethernet/qualcomm/ppe/ppe_offload.c
++++ b/drivers/net/ethernet/qualcomm/ppe/ppe_offload.c
+@@ -43,14 +43,13 @@
+  *   the time it offers the flow, so there's no reason to duplicate
+  *   that resolution here (and every reason not to, since getting it
+  *   wrong would misdirect real traffic).
+- * - FLOW_CLS_STATS is not implemented: this table's per-flow "age"
+- *   field isn't a packet/byte counter, and hardware keeps those
+- *   separately in a table this driver doesn't yet have a primitive
+- *   for. A long-lived offloaded connection can therefore be aged out
+- *   of conntrack independently of whether hardware is still
+- *   forwarding it -- acceptable for this milestone ("flows are
+- *   accepted and correctly forwarded"), not yet "flows survive
+- *   indefinitely once offloaded".
++ * - FLOW_CLS_STATS is implemented via the separate per-flow counter
++ *   table (the flow entry's own "age" field is not a packet/byte
++ *   counter). Counters are cumulative and not clear-on-read, so each
++ *   tracked flow keeps its previous reading and reports a delta, and
++ *   refreshes lastused only when the packet count actually moves --
++ *   which is what stops the flowtable ageing out a connection that
++ *   hardware is still forwarding.
+  *
+  * Hardware itself may also not consult the flow table at all yet for
+  * genuinely external ingress traffic -- ppe_servcode_init() bypasses
+@@ -121,6 +120,15 @@
+ 	u32 nexthop_index;
+ 	u32 pub_ip_index;
+ 	bool flow_valid;
++	/* Hardware counters are cumulative and not clear-on-read, so keep the
++	 * previous reading and report the difference. lastused is refreshed only
++	 * when the packet count actually moves, which is what tells the flowtable
++	 * the flow is alive and stops it ageing out a connection hardware is
++	 * still forwarding.
++	 */
++	u64 stats_packets;
++	u64 stats_bytes;
++	unsigned long lastused;
+ };
+ 
+ static const struct rhashtable_params ppe_offload_flow_ht_params = {
+@@ -627,6 +635,7 @@
+ 		goto free_entry;
+ 	}
+ 
++	entry->lastused = jiffies;
+ 	priv->flow_owner[flow_index] = entry;
+ 
+ 	mutex_unlock(&priv->lock);
+@@ -699,6 +708,65 @@
+ 	return 0;
+ }
+ 
++/* Report a flow's hardware counters to the flowtable.
++ *
++ * Without this the flowtable sees no activity on an offloaded flow and ages the
++ * connection out after its idle timeout, tearing down the hardware entry with
++ * it -- so a long-lived but bursty connection silently loses acceleration. The
++ * counters are cumulative, so report the delta since the last read and only
++ * refresh lastused when the packet count actually moved.
++ */
++static int ppe_offload_flow_stats(struct ppe_offload_priv *priv,
++				  struct flow_cls_offload *cls)
++{
++	struct ppe_offload_flow_entry *entry;
++	u64 packets, bytes, d_packets, d_bytes;
++	unsigned long lastused;
++	int ret;
++
++	mutex_lock(&priv->lock);
++
++	entry = rhashtable_lookup_fast(&priv->flow_table, &cls->cookie,
++				       ppe_offload_flow_ht_params);
++	if (!entry || !entry->flow_valid) {
++		mutex_unlock(&priv->lock);
++		return -ENOENT;
++	}
++
++	ret = ppe_flow_counter_get(priv->ppe_dev, entry->flow_index, &packets, &bytes);
++	if (ret) {
++		mutex_unlock(&priv->lock);
++		return ret;
++	}
++
++	/* A counter that went backwards means the index was reprogrammed under us
++	 * (hardware reset, or the slot reused). Re-baseline rather than report a
++	 * huge bogus delta.
++	 */
++	if (packets < entry->stats_packets || bytes < entry->stats_bytes) {
++		entry->stats_packets = packets;
++		entry->stats_bytes = bytes;
++		d_packets = 0;
++		d_bytes = 0;
++	} else {
++		d_packets = packets - entry->stats_packets;
++		d_bytes = bytes - entry->stats_bytes;
++		entry->stats_packets = packets;
++		entry->stats_bytes = bytes;
++	}
++
++	if (d_packets)
++		entry->lastused = jiffies;
++	lastused = entry->lastused;
++
++	mutex_unlock(&priv->lock);
++
++	flow_stats_update(&cls->stats, d_bytes, d_packets, 0, lastused,
++			  FLOW_ACTION_HW_STATS_DELAYED);
++
++	return 0;
++}
++
+ static int ppe_offload_flow_cmd(struct net_device *netdev, struct ppe_offload_priv *priv,
+ 				 struct flow_cls_offload *cls)
+ {
+@@ -714,8 +782,7 @@
+ 	case FLOW_CLS_DESTROY:
+ 		return ppe_offload_flow_destroy(priv, cls);
+ 	case FLOW_CLS_STATS:
+-		/* Not implemented -- see the file comment. */
+-		return -EOPNOTSUPP;
++		return ppe_offload_flow_stats(priv, cls);
+ 	default:
+ 		return -EOPNOTSUPP;
+ 	}
