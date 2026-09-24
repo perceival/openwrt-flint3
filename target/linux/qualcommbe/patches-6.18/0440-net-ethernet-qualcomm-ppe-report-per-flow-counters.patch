@@ -36,7 +36,7 @@ Claude-Session: https://claude.ai/code/session_01TwrzKNAPLwfKWiBDhPePU3
 ---
 --- a/drivers/net/ethernet/qualcomm/ppe/ppe_regs.h
 +++ b/drivers/net/ethernet/qualcomm/ppe/ppe_regs.h
-@@ -1128,6 +1128,24 @@
+@@ -1128,6 +1128,27 @@
   */
  #define PPE_IN_FLOW_TBL_ENTRIES			2048
  
@@ -56,25 +56,29 @@ Claude-Session: https://claude.ai/code/session_01TwrzKNAPLwfKWiBDhPePU3
 +#define PPE_IN_FLOW_CNT_TBL_INC			0x10
 +#define PPE_IN_FLOW_CNT_TBL_ENTRIES		4096
 +/* word 0: packets (32 bits); word 1 + low 8 bits of word 2: bytes (40 bits) */
++#define PPE_IN_FLOW_CNT_TBL_WORDS		3
 +#define PPE_IN_FLOW_CNT_TBL_BYTE_HI		GENMASK(7, 0)
++#define PPE_IN_FLOW_CNT_TBL_PKT_MAX		GENMASK_ULL(31, 0)
++#define PPE_IN_FLOW_CNT_TBL_BYTE_MAX		GENMASK_ULL(39, 0)
 +
  #define PPE_IN_FLOW_TBL_OP_ADDR			0x200528
  #define PPE_IN_FLOW_TBL_OP_CMD_ID		GENMASK(3, 0)
  #define PPE_IN_FLOW_TBL_OP_BYP_RSLT_EN		BIT(4)
 --- a/drivers/net/ethernet/qualcomm/ppe/ppe_flow.h
 +++ b/drivers/net/ethernet/qualcomm/ppe/ppe_flow.h
-@@ -32,6 +32,8 @@
+@@ -32,6 +32,9 @@
  	PPE_FLOW_OP_MODE_INDEX,
  };
  
 +int ppe_flow_counter_get(struct ppe_device *ppe_dev, u32 index,
 +			 u64 *packets, u64 *bytes);
++int ppe_flow_counter_clear(struct ppe_device *ppe_dev, u32 index);
  int ppe_flow_entry_add(struct ppe_device *ppe_dev, enum ppe_flow_op_mode mode,
  			const u32 entry[PPE_FLOW_TBL_ENTRY_WORDS], u32 *index);
  int ppe_flow_entry_del(struct ppe_device *ppe_dev, u32 index);
 --- a/drivers/net/ethernet/qualcomm/ppe/ppe_flow.c
 +++ b/drivers/net/ethernet/qualcomm/ppe/ppe_flow.c
-@@ -90,6 +90,43 @@
+@@ -90,6 +90,100 @@
  }
  
  /**
@@ -85,16 +89,76 @@ Claude-Session: https://claude.ai/code/session_01TwrzKNAPLwfKWiBDhPePU3
 + * @bytes: Out: bytes matched by this entry since it was programmed.
 + *
 + * The counters live in a separate table from the flow entries themselves and are
-+ * addressed directly (no command/result handshake). They are cumulative and not
-+ * clear-on-read, so the caller is responsible for keeping the previous reading
-+ * and reporting a delta.
++ * addressed directly (no command/result handshake). They are cumulative, are not
++ * clear-on-read, and are only zeroed when ppe_flow_entry_add() clears them for a
++ * freshly programmed index -- so the caller keeps the previous reading and
++ * reports a delta.
++ *
++ * The byte counter is 40 bits split across two words, and hardware keeps
++ * counting between the two reads, so a naive read can combine a pre-carry low
++ * word with a post-carry high byte and be wrong by 4GiB. Re-read the high byte
++ * and retry if it moved.
 + *
 + * Return: 0 on success, a negative error code on failure.
 + */
 +int ppe_flow_counter_get(struct ppe_device *ppe_dev, u32 index,
 +			 u64 *packets, u64 *bytes)
 +{
-+	u32 addr, val[3];
++	u32 addr, pkt, lo, hi, hi_again;
++	int ret, tries;
++
++	if (index >= PPE_IN_FLOW_CNT_TBL_ENTRIES)
++		return -EINVAL;
++
++	addr = PPE_IN_FLOW_CNT_TBL_ADDR + index * PPE_IN_FLOW_CNT_TBL_INC;
++
++	ret = regmap_read(ppe_dev->regmap, addr, &pkt);
++	if (ret)
++		return ret;
++
++	ret = regmap_read(ppe_dev->regmap, addr + 2 * sizeof(u32), &hi);
++	if (ret)
++		return ret;
++
++	/* Bounded: each retry needs another 32-bit carry to race us again. */
++	for (tries = 0; tries < 3; tries++) {
++		ret = regmap_read(ppe_dev->regmap, addr + sizeof(u32), &lo);
++		if (ret)
++			return ret;
++
++		ret = regmap_read(ppe_dev->regmap, addr + 2 * sizeof(u32), &hi_again);
++		if (ret)
++			return ret;
++
++		if (hi_again == hi)
++			break;
++
++		hi = hi_again;
++	}
++
++	*packets = pkt;
++	*bytes = (u64)FIELD_GET(PPE_IN_FLOW_CNT_TBL_BYTE_HI, hi) << 32 | lo;
++
++	return 0;
++}
++
++/**
++ * ppe_flow_counter_clear() - Zero a flow entry's hit counters.
++ * @ppe_dev: PPE device.
++ * @index: Flow table entry index.
++ *
++ * The counter table is separate RAM from the flow table and hardware does NOT
++ * reset it when a flow entry is programmed -- the vendor SDK exposes a distinct
++ * "counter cleanup" operation for exactly this and never calls it itself. Without
++ * an explicit clear, a reused index (a hash collision, or the same 5-tuple
++ * reconnecting) would report the previous occupant's entire lifetime as one
++ * instantaneous delta.
++ *
++ * Return: 0 on success, a negative error code on failure.
++ */
++int ppe_flow_counter_clear(struct ppe_device *ppe_dev, u32 index)
++{
++	u32 addr;
 +	int ret, i;
 +
 +	if (index >= PPE_IN_FLOW_CNT_TBL_ENTRIES)
@@ -102,14 +166,11 @@ Claude-Session: https://claude.ai/code/session_01TwrzKNAPLwfKWiBDhPePU3
 +
 +	addr = PPE_IN_FLOW_CNT_TBL_ADDR + index * PPE_IN_FLOW_CNT_TBL_INC;
 +
-+	for (i = 0; i < ARRAY_SIZE(val); i++) {
-+		ret = regmap_read(ppe_dev->regmap, addr + i * sizeof(u32), &val[i]);
++	for (i = 0; i < PPE_IN_FLOW_CNT_TBL_WORDS; i++) {
++		ret = regmap_write(ppe_dev->regmap, addr + i * sizeof(u32), 0);
 +		if (ret)
 +			return ret;
 +	}
-+
-+	*packets = val[0];
-+	*bytes = (u64)FIELD_GET(PPE_IN_FLOW_CNT_TBL_BYTE_HI, val[2]) << 32 | val[1];
 +
 +	return 0;
 +}
@@ -118,6 +179,23 @@ Claude-Session: https://claude.ai/code/session_01TwrzKNAPLwfKWiBDhPePU3
   * ppe_flow_entry_add() - Add (or overwrite) a PPE flow table entry.
   * @ppe_dev: PPE device.
   * @mode: Hash-based or caller-indexed entry placement.
+@@ -117,6 +211,16 @@
+ 	}
+ 
+ 	ret = ppe_flow_tbl_op_wait(ppe_dev, PPE_FLOW_TBL_OP_ADD, mode, index);
++	if (ret)
++		goto out;
++
++	/* Zero the hit counters for the index we just programmed, while still
++	 * holding the table lock and before the caller can publish the entry.
++	 * Hardware keeps them in separate RAM that survives a flow entry being
++	 * overwritten, so a reused index would otherwise attribute the previous
++	 * occupant's lifetime totals to this flow on its first stats poll.
++	 */
++	ret = ppe_flow_counter_clear(ppe_dev, *index);
+ out:
+ 	mutex_unlock(&ppe_dev->flow_tbl_lock);
+ 	return ret;
 --- a/drivers/net/ethernet/qualcomm/ppe/ppe_offload.c
 +++ b/drivers/net/ethernet/qualcomm/ppe/ppe_offload.c
 @@ -43,14 +43,13 @@
@@ -166,10 +244,28 @@ Claude-Session: https://claude.ai/code/session_01TwrzKNAPLwfKWiBDhPePU3
  	priv->flow_owner[flow_index] = entry;
  
  	mutex_unlock(&priv->lock);
-@@ -699,6 +708,65 @@
+@@ -699,6 +708,74 @@
  	return 0;
  }
  
++/* Difference between two readings of a counter that is @mask wide.
++ *
++ * The counters are narrower than u64 (32-bit packets, 40-bit bytes) and wrap,
++ * which at this port's sustained rates happens in hours for packets and roughly
++ * hourly for bytes -- routine for exactly the long-lived flows this reporting
++ * exists to keep alive. Masked subtraction recovers the true delta across a
++ * single wrap; treating "smaller than last time" as an error would instead
++ * silently drop one interval's traffic on every wrap.
++ *
++ * A clean baseline is what makes this safe: ppe_flow_entry_add() zeroes the
++ * counters for an index when it programs it, so a reading can only be lower than
++ * the previous one because it wrapped, not because the slot was reused.
++ */
++static u64 ppe_offload_counter_delta(u64 now, u64 prev, u64 mask)
++{
++	return (now - prev) & mask;
++}
++
 +/* Report a flow's hardware counters to the flowtable.
 + *
 + * Without this the flowtable sees no activity on an offloaded flow and ages the
@@ -201,21 +297,12 @@ Claude-Session: https://claude.ai/code/session_01TwrzKNAPLwfKWiBDhPePU3
 +		return ret;
 +	}
 +
-+	/* A counter that went backwards means the index was reprogrammed under us
-+	 * (hardware reset, or the slot reused). Re-baseline rather than report a
-+	 * huge bogus delta.
-+	 */
-+	if (packets < entry->stats_packets || bytes < entry->stats_bytes) {
-+		entry->stats_packets = packets;
-+		entry->stats_bytes = bytes;
-+		d_packets = 0;
-+		d_bytes = 0;
-+	} else {
-+		d_packets = packets - entry->stats_packets;
-+		d_bytes = bytes - entry->stats_bytes;
-+		entry->stats_packets = packets;
-+		entry->stats_bytes = bytes;
-+	}
++	d_packets = ppe_offload_counter_delta(packets, entry->stats_packets,
++					      PPE_IN_FLOW_CNT_TBL_PKT_MAX);
++	d_bytes = ppe_offload_counter_delta(bytes, entry->stats_bytes,
++					    PPE_IN_FLOW_CNT_TBL_BYTE_MAX);
++	entry->stats_packets = packets;
++	entry->stats_bytes = bytes;
 +
 +	if (d_packets)
 +		entry->lastused = jiffies;
@@ -232,7 +319,7 @@ Claude-Session: https://claude.ai/code/session_01TwrzKNAPLwfKWiBDhPePU3
  static int ppe_offload_flow_cmd(struct net_device *netdev, struct ppe_offload_priv *priv,
  				 struct flow_cls_offload *cls)
  {
-@@ -714,8 +782,7 @@
+@@ -714,8 +791,7 @@
  	case FLOW_CLS_DESTROY:
  		return ppe_offload_flow_destroy(priv, cls);
  	case FLOW_CLS_STATS:
