@@ -1,0 +1,60 @@
+config interface 'loopback'
+	option device 'lo'
+	option proto 'static'
+	list ipaddr '127.0.0.1/8'
+
+config globals 'globals'
+	option ula_prefix 'fd92:7e72:d16b::/48'
+	option packet_steering '2'
+
+config device
+	option name 'br-lan'
+	option type 'bridge'
+	list ports 'wan'
+	list ports 'lan1'
+	list ports 'lan2'
+	list ports 'lan3'
+	list ports 'lan4'
+
+config interface 'lan'
+	option device 'br-lan.10'
+	option proto 'static'
+	option ipaddr '10.20.30.2'
+	option netmask '255.255.255.0'
+	option ipv6 '1'
+	option gateway '10.20.30.1'
+	list dns '10.20.30.1'
+	option vid '10'
+
+config interface 'guest'
+	option device 'br-lan.192'
+	option proto 'none'
+	option vid '192'
+	option ipv6 '1'
+	option wds '1'
+
+config bridge-vlan
+	option device 'br-lan'
+	option vlan '10'
+	list ports 'wan:t'
+	list ports 'lan1:u*'
+	list ports 'lan2:u*'
+	list ports 'lan3:u*'
+	list ports 'lan4:u*'
+
+config bridge-vlan
+	option device 'br-lan'
+	option vlan '192'
+	list ports 'wan:t'
+
+config device
+	option name 'br-lan.10'
+	option type '8021q'
+	option ifname 'br-lan'
+	option vid '10'
+
+config device
+	option name 'br-lan.192'
+	option type '8021q'
+	option ifname 'br-lan'
+	option vid '192'

@@ -1,0 +1,59 @@
+# Restore br-lan VLANs on station/WDS ports that netifd does not configure.
+#
+# The radio backhaul between ap1 and risc-ap is a TRUNK: vlan10 (management/lan)
+# untagged plus vlan192 (guest/IoT) tagged. risc-ap serves the "guestnet" SSID and its
+# lan1/lan4/wan ports are vlan192, so without 192 everything behind the backhaul
+# is isolated while management vlan10 keeps working and hides the breakage.
+#
+# Two cases, both of which leave the port with no VLANs:
+#
+#  1. AP side (ap1/ap2): hostapd creates the 4addr/WDS port dynamically at
+#     association time - e.g. phy0.1-ap2.sta1 or wl0-ap2.sta1 - and netifd never
+#     sees it, so it inherits none of the parent's bridge VLANs. On a fresh
+#     AP_VLAN the bridge also gives it default PVID 1.
+#  2. Station side (risc-ap): the port is named after the radio index, and that
+#     index is NOT stable - `service network restart` can rename phy0-sta0 to
+#     phy1-sta0. The bridge-vlan lists in /etc/config/network name the old
+#     interface, so the renamed port matches nothing and loses vlan192.
+#
+# Hence the loose *sta* match (hyphen and dot forms) and the explicit re-add of
+# both VLANs. Only ports enslaved to br-lan are touched, so a station interface
+# on another bridge is left alone. Every bridge vlan add is idempotent.
+#
+# Device-agnostic: one image builds both ap1 and ap2, and risc-ap may associate
+# to either after a roam. Deployed on the APs and on risc-ap.
+#
+# 2026-09-24: this script was NOT carried across when an E8450 took over as ap1.
+# vlan192 silently lost its path - risc-ap kept broadcasting "guestnet" while
+# 192.168.2.1 was ARP-unreachable. Do not drop it from a rebuild.
+WDS_VLAN_UNTAGGED=10
+WDS_VLAN_TAGGED=192
+
+[ "$ACTION" = "add" ] || exit 0
+
+case "$INTERFACE" in
+  *sta*)
+    (
+      # let netifd finish enslaving the port to the bridge
+      sleep 3
+
+      master=$(readlink "/sys/class/net/$INTERFACE/master" 2>/dev/null)
+      case "${master##*/}" in
+        br-lan) ;;
+        *) exit 0 ;;
+      esac
+
+      if [ ! -x /usr/sbin/bridge ]; then
+        apk add ip-bridge >/dev/null 2>&1 || opkg install ip-bridge >/dev/null 2>&1
+      fi
+      [ -x /usr/sbin/bridge ] || { logger -t wds-vlan192 "no bridge tool, cannot trunk $INTERFACE"; exit 0; }
+
+      /usr/sbin/bridge vlan add dev "$INTERFACE" vid "$WDS_VLAN_UNTAGGED" pvid untagged 2>/dev/null
+      /usr/sbin/bridge vlan add dev "$INTERFACE" vid "$WDS_VLAN_TAGGED" 2>/dev/null \
+        && logger -t wds-vlan192 "restored vlan $WDS_VLAN_UNTAGGED+$WDS_VLAN_TAGGED on $INTERFACE"
+
+      # a fresh AP_VLAN lands in the bridge default VLAN 1; drop it
+      [ "$WDS_VLAN_UNTAGGED" = "1" ] || /usr/sbin/bridge vlan del dev "$INTERFACE" vid 1 2>/dev/null
+    ) &
+  ;;
+esac

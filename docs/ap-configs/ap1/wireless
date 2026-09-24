@@ -1,0 +1,89 @@
+# E8450 as ap1 replacement -- ported from ap1 (Flint 3).
+# Differences from ap1, both deliberate and accepted:
+#  - no 6 GHz radio on this hardware, so ap1's radio2 is dropped entirely
+#  - no MLO: lannet is served as two plain SAE BSSes (2.4 + 5) instead of an MLD
+#  - htmode: HT20 on 2.4 (MT7622 is 802.11n there), HE80 on 5 GHz
+# Everything else -- SSIDs, keys, VLAN/network mapping, WDS for risc-ap -- matches ap1.
+
+config wifi-device 'radio0'
+	option type 'mac80211'
+	option phy 'wl0'
+	option band '2g'
+	option channel '1'
+	# MT7622's built-in 2.4 GHz radio is 802.11n, so HT20 -- not HE/EHT.
+	# ap1 ran EHT20 here, i.e. also 20 MHz, so channel width is unchanged.
+	option htmode 'HT20'
+	option country 'PL'
+	option cell_density '0'
+	option disabled '0'
+
+config wifi-device 'radio1'
+	option type 'mac80211'
+	option phy 'wl1'
+	option band '5g'
+	option channel '44'
+	option htmode 'HE80'
+	option country 'PL'
+	option cell_density '0'
+	option disabled '0'
+
+# --- lannet (trusted, VLAN 10). No MLO on this hardware: one BSS per band. ---
+config wifi-iface 'lannet24'
+	option device 'radio0'
+	option mode 'ap'
+	option network 'lan'
+	option ssid 'LAN_SSID'
+	option encryption 'sae'
+	option key 'REDACTED'
+	option ieee80211r '0'
+	option disabled '0'
+
+config wifi-iface 'lannet5'
+	option device 'radio1'
+	option mode 'ap'
+	option network 'lan'
+	option ssid 'LAN_SSID'
+	option encryption 'sae'
+	option key 'REDACTED'
+	option ieee80211r '0'
+	option disabled '0'
+
+# --- guest / IoT (VLAN 192) ---
+config wifi-iface 'guest24'
+	option device 'radio0'
+	option mode 'ap'
+	option network 'guest'
+	option ssid 'GUEST_SSID'
+	option encryption 'psk2'
+	option key 'REDACTED'
+	option disabled '0'
+
+config wifi-iface 'guestnet2'
+	option device 'radio1'
+	option mode 'ap'
+	option network 'guest'
+	option ssid 'GUEST_SSID2'
+	option encryption 'psk2'
+	option key 'REDACTED'
+	option disabled '0'
+
+# --- WDS backhaul for risc-ap. wds=1 needs AP/VLAN, which both phys support. ---
+config wifi-iface 'uplink'
+	option device 'radio1'
+	option mode 'ap'
+	option network 'lan'
+	option ssid 'UPLINK_SSID'
+	option encryption 'psk2+ccmp'
+	option key 'REDACTED'
+	option wds '1'
+	option disabled '0'
+
+config wifi-iface 'uplink24'
+	option device 'radio0'
+	option mode 'ap'
+	option network 'lan'
+	option ssid 'UPLINK_SSID_24'
+	option encryption 'psk2+ccmp'
+	option key 'REDACTED'
+	option wds '1'
+	option disabled '0'
