@@ -1,0 +1,225 @@
+From: Kamil Bienkiewicz <perceivalpercy@gmail.com>
+Subject: [PATCH] net: ethernet: qualcomm: ppe: parameterise the NAT flow encoder
+
+Preparation for accelerating the reply direction. No behaviour change: the
+only caller now sets fwd_type = PPE_FLOW_FWD_SNAT explicitly and gets the
+same bits as before.
+
+The flow table entry is a union of per-forward-type overlays, and the
+vendor's SNAT and DNAT overlays (in_flow_tbl_0 and in_flow_tbl_3) are
+bit-for-bit identical -- same widths at the same offsets -- differing only
+in the names of two fields:
+
+  FAL_FLOW_SNAT -> bf0.next_hop1, bf0.l4_port1
+  FAL_FLOW_DNAT -> bf3.next_hop2, bf3.l4_port2
+
+(adpt_hppe_flow.c:278-284, hppe_flow_reg.h). So a single encoder serves
+both directions, and what distinguishes them is the FWD_TYPE field plus
+the meaning of the nexthop and L4 port: the source for an outbound
+masquerade, the destination for the reply.
+
+Rename the type and the two fields accordingly (snat_entry -> nat_entry,
+snat_nexthop -> nat_nexthop, snat_src_port -> nat_l4_port), take FWD_TYPE
+from the entry instead of hardcoding SNAT, and recover it on decode.
+
+The other forward types (FORWARD, ROUTE, BRIDGE) do have different
+overlays, so this encoder remains valid only for the two NAT variants --
+noted in the kernel-doc.
+
+Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01TwrzKNAPLwfKWiBDhPePU3
+---
+--- a/drivers/net/ethernet/qualcomm/ppe/ppe_flow_ipv4.h
++++ b/drivers/net/ethernet/qualcomm/ppe/ppe_flow_ipv4.h
+@@ -22,7 +22,10 @@
+ 
+ /**
+  * enum ppe_flow_fwd_type - Forwarding action performed by a flow entry.
+- * Hardware field width is 3 bits; only PPE_FLOW_FWD_SNAT's field layout
++ * Hardware field width is 3 bits. The SNAT and DNAT overlays are
++ * bit-for-bit identical (the vendor's in_flow_tbl_0 and in_flow_tbl_3
++ * differ only in the names of the nexthop and L4 port fields), so one
++ * encoder serves both; the other forward types have different layouts
+  * (struct in_flow_tbl_0 in the vendor SDK) has been implemented so far
+  * -- DNAT/ROUTE/BRIDGE each reuse the same word 1 bit range for
+  * different fields and need their own entry struct/encode function.
+@@ -38,7 +41,7 @@
+ };
+ 
+ /**
+- * struct ppe_flow_ipv4_snat_entry - IPv4 5-tuple flow entry, SNAT variant.
++ * struct ppe_flow_ipv4_nat_entry - IPv4 5-tuple flow entry, NAT variants.
+  * @valid: Whether this entry is active.
+  * @host_addr_is_dst: @host_addr_index refers to the destination IP's host
+  * table entry when true, the source IP's when false. The endpoint this
+@@ -50,9 +53,13 @@
+  * updates it as traffic hits the entry.
+  * @src_l3_if_valid: Whether @src_l3_if should be matched.
+  * @src_l3_if: Source L3 interface index to match, when @src_l3_if_valid.
+- * @snat_nexthop: Nexthop table index (see ppe_nexthop.h) this flow's
++ * @fwd_type: PPE_FLOW_FWD_SNAT or PPE_FLOW_FWD_DNAT. Selects which
++ * address the nexthop and L4 port rewrite: the source (outbound
++ * masquerade) or the destination (the reply direction).
++ * @nat_nexthop: Nexthop table index (see ppe_nexthop.h) this flow's
+  * traffic egresses through after SNAT rewrite.
+- * @snat_src_port: Source port to rewrite matched packets to.
++ * @nat_l4_port: L4 port to rewrite matched packets to -- source for
++ * SNAT, destination for DNAT.
+  * @deacclr_en: Whether to de-accelerate (stop hardware-offloading) this
+  * flow under hardware-defined conditions (e.g. a TCP control flag).
+  * @copy_to_cpu: Whether to also copy matched packets to the CPU path.
+@@ -69,16 +76,17 @@
+  * @pmtu_check_l3: Compare @pmtu against the L3 packet length (true) or
+  * the length including the L2 header (false).
+  */
+-struct ppe_flow_ipv4_snat_entry {
++struct ppe_flow_ipv4_nat_entry {
+ 	bool valid;
++	enum ppe_flow_fwd_type fwd_type;
+ 	bool host_addr_is_dst;
+ 	u16 host_addr_index;
+ 	enum ppe_flow_protocol protocol;
+ 	u8 age;
+ 	bool src_l3_if_valid;
+ 	u8 src_l3_if;
+-	u16 snat_nexthop;
+-	u16 snat_src_port;
++	u16 nat_nexthop;
++	u16 nat_l4_port;
+ 	bool deacclr_en;
+ 	bool copy_to_cpu;
+ 	u8 syn_toggle;
+@@ -91,9 +99,9 @@
+ 	bool pmtu_check_l3;
+ };
+ 
+-void ppe_flow_ipv4_snat_entry_encode(const struct ppe_flow_ipv4_snat_entry *entry,
++void ppe_flow_ipv4_nat_entry_encode(const struct ppe_flow_ipv4_nat_entry *entry,
+ 				      u32 words[PPE_FLOW_TBL_ENTRY_WORDS]);
+-void ppe_flow_ipv4_snat_entry_decode(const u32 words[PPE_FLOW_TBL_ENTRY_WORDS],
+-				      struct ppe_flow_ipv4_snat_entry *entry);
++void ppe_flow_ipv4_nat_entry_decode(const u32 words[PPE_FLOW_TBL_ENTRY_WORDS],
++				      struct ppe_flow_ipv4_nat_entry *entry);
+ 
+ #endif
+--- a/drivers/net/ethernet/qualcomm/ppe/ppe_flow_ipv4.c
++++ b/drivers/net/ethernet/qualcomm/ppe/ppe_flow_ipv4.c
+@@ -5,7 +5,7 @@
+ 
+ /* IPv4 5-tuple flow entry field encoding, SNAT variant.
+  *
+- * This packs/unpacks struct ppe_flow_ipv4_snat_entry to/from the
++ * This packs/unpacks struct ppe_flow_ipv4_nat_entry to/from the
+  * PPE_FLOW_TBL_ENTRY_WORDS-word format ppe_flow_entry_add()/whatever
+  * read-back path is eventually built expects. Field layout is cross-word:
+  * PRI_PROFILE splits 1+4 bits across words 1/2, the 32-bit IP address
+@@ -31,11 +31,11 @@
+ #include "ppe_regs.h"
+ 
+ /**
+- * ppe_flow_ipv4_snat_entry_encode() - Pack an IPv4 SNAT flow entry.
++ * ppe_flow_ipv4_nat_entry_encode() - Pack an IPv4 SNAT or DNAT flow entry.
+  * @entry: The entry to pack.
+  * @words: Where to write the packed PPE_FLOW_TBL_ENTRY_WORDS words.
+  */
+-void ppe_flow_ipv4_snat_entry_encode(const struct ppe_flow_ipv4_snat_entry *entry,
++void ppe_flow_ipv4_nat_entry_encode(const struct ppe_flow_ipv4_nat_entry *entry,
+ 				      u32 words[PPE_FLOW_TBL_ENTRY_WORDS])
+ {
+ 	u32 ip = be32_to_cpu(entry->match_ip);
+@@ -48,10 +48,10 @@
+ 	words[0] |= FIELD_PREP(PPE_FLOW_TBL_AGE, entry->age);
+ 	words[0] |= entry->src_l3_if_valid ? PPE_FLOW_TBL_SRC_L3_IF_VALID : 0;
+ 	words[0] |= FIELD_PREP(PPE_FLOW_TBL_SRC_L3_IF, entry->src_l3_if);
+-	words[0] |= FIELD_PREP(PPE_FLOW_TBL_FWD_TYPE, PPE_FLOW_FWD_SNAT);
++	words[0] |= FIELD_PREP(PPE_FLOW_TBL_FWD_TYPE, entry->fwd_type);
+ 
+-	words[1] = FIELD_PREP(PPE_FLOW_TBL_SNAT_NEXT_HOP, entry->snat_nexthop);
+-	words[1] |= FIELD_PREP(PPE_FLOW_TBL_SNAT_L4_PORT, entry->snat_src_port);
++	words[1] = FIELD_PREP(PPE_FLOW_TBL_SNAT_NEXT_HOP, entry->nat_nexthop);
++	words[1] |= FIELD_PREP(PPE_FLOW_TBL_SNAT_L4_PORT, entry->nat_l4_port);
+ 	words[1] |= entry->deacclr_en ? PPE_FLOW_TBL_DE_ACCE : 0;
+ 	words[1] |= entry->copy_to_cpu ? PPE_FLOW_TBL_COPY_TO_CPU_EN : 0;
+ 	words[1] |= entry->syn_toggle ? PPE_FLOW_TBL_SYN_TOGGLE : 0;
+@@ -72,20 +72,21 @@
+ }
+ 
+ /**
+- * ppe_flow_ipv4_snat_entry_decode() - Unpack an IPv4 SNAT flow entry.
++ * ppe_flow_ipv4_nat_entry_decode() - Unpack an IPv4 SNAT or DNAT flow entry.
+  * @words: The packed PPE_FLOW_TBL_ENTRY_WORDS words to unpack.
+  * @entry: Where to store the unpacked entry.
+  *
+- * Does not check FWD_TYPE; callers are expected to only decode entries
+- * they know are the SNAT variant (e.g. ones they wrote themselves, or
+- * ones whose FWD_TYPE field they've checked equals PPE_FLOW_FWD_SNAT).
++ * Recovers FWD_TYPE into entry->fwd_type, but does not validate it:
++ * callers are expected to only decode entries they know use one of the
++ * two NAT layouts (e.g. ones they wrote themselves).
+  */
+-void ppe_flow_ipv4_snat_entry_decode(const u32 words[PPE_FLOW_TBL_ENTRY_WORDS],
+-				      struct ppe_flow_ipv4_snat_entry *entry)
++void ppe_flow_ipv4_nat_entry_decode(const u32 words[PPE_FLOW_TBL_ENTRY_WORDS],
++				      struct ppe_flow_ipv4_nat_entry *entry)
+ {
+ 	u32 ip;
+ 
+ 	entry->valid = !!(words[0] & PPE_FLOW_TBL_VALID);
++	entry->fwd_type = FIELD_GET(PPE_FLOW_TBL_FWD_TYPE, words[0]);
+ 	entry->host_addr_is_dst = !!(words[0] & PPE_FLOW_TBL_HOST_ADDR_INDEX_TYPE);
+ 	entry->host_addr_index = FIELD_GET(PPE_FLOW_TBL_HOST_ADDR_INDEX, words[0]);
+ 	entry->protocol = FIELD_GET(PPE_FLOW_TBL_PROTOCOL_TYPE, words[0]);
+@@ -93,8 +94,8 @@
+ 	entry->src_l3_if_valid = !!(words[0] & PPE_FLOW_TBL_SRC_L3_IF_VALID);
+ 	entry->src_l3_if = FIELD_GET(PPE_FLOW_TBL_SRC_L3_IF, words[0]);
+ 
+-	entry->snat_nexthop = FIELD_GET(PPE_FLOW_TBL_SNAT_NEXT_HOP, words[1]);
+-	entry->snat_src_port = FIELD_GET(PPE_FLOW_TBL_SNAT_L4_PORT, words[1]);
++	entry->nat_nexthop = FIELD_GET(PPE_FLOW_TBL_SNAT_NEXT_HOP, words[1]);
++	entry->nat_l4_port = FIELD_GET(PPE_FLOW_TBL_SNAT_L4_PORT, words[1]);
+ 	entry->deacclr_en = !!(words[1] & PPE_FLOW_TBL_DE_ACCE);
+ 	entry->copy_to_cpu = !!(words[1] & PPE_FLOW_TBL_COPY_TO_CPU_EN);
+ 	entry->syn_toggle = !!(words[1] & PPE_FLOW_TBL_SYN_TOGGLE);
+--- a/drivers/net/ethernet/qualcomm/ppe/ppe_offload.c
++++ b/drivers/net/ethernet/qualcomm/ppe/ppe_offload.c
+@@ -296,7 +296,7 @@
+ 	struct flow_rule *rule = flow_cls_offload_flow_rule(cls);
+ 	struct ppe_offload_flow_entry *entry;
+ 	struct ppe_host_ipv4_entry host_ipv4;
+-	struct ppe_flow_ipv4_snat_entry flow_ipv4;
++	struct ppe_flow_ipv4_nat_entry flow_ipv4;
+ 	struct ppe_nexthop_entry nexthop;
+ 	struct edma_port_priv *port_priv;
+ 	struct net_device *odev = NULL;
+@@ -584,8 +584,9 @@
+ 	flow_ipv4.host_addr_is_dst = false;
+ 	flow_ipv4.host_addr_index = host_index;
+ 	flow_ipv4.protocol = ip_proto;
+-	flow_ipv4.snat_nexthop = nexthop_index;
+-	flow_ipv4.snat_src_port = be16_to_cpu(l4.source);
++	flow_ipv4.fwd_type = PPE_FLOW_FWD_SNAT;
++	flow_ipv4.nat_nexthop = nexthop_index;
++	flow_ipv4.nat_l4_port = be16_to_cpu(l4.source);
+ 	flow_ipv4.match_ip = match_dst;
+ 	flow_ipv4.match_sport = be16_to_cpu(match_sport);
+ 	flow_ipv4.match_dport = be16_to_cpu(match_dport);
+@@ -593,7 +594,7 @@
+ 	flow_ipv4.src_l3_if = ingress_l3_if;
+ 	flow_ipv4.pmtu = pmtu;
+ 	flow_ipv4.pmtu_check_l3 = true;
+-	ppe_flow_ipv4_snat_entry_encode(&flow_ipv4, flow_words);
++	ppe_flow_ipv4_nat_entry_encode(&flow_ipv4, flow_words);
+ 
+ 	flow_index = 0;
+ 	ret = ppe_flow_entry_add(priv->ppe_dev, PPE_FLOW_OP_MODE_HASH, flow_words, &flow_index);
+--- a/drivers/net/ethernet/qualcomm/ppe/ppe_l3_if.c
++++ b/drivers/net/ethernet/qualcomm/ppe/ppe_l3_if.c
+@@ -14,7 +14,7 @@
+  * and a flow/nexthop entry only ever references an already-populated
+  * index. Callers of this file are expected to follow the same pattern
+  * -- set up one entry per interface once, then reference its index
+- * from ppe_flow_ipv4_snat_entry.src_l3_if / ppe_nexthop_entry.post_l3_if.
++ * from ppe_flow_ipv4_nat_entry.src_l3_if / ppe_nexthop_entry.post_l3_if.
+  */
+ 
+ #include <linux/bitfield.h>
