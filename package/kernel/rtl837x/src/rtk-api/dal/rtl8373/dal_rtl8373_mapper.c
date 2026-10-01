@@ -559,6 +559,11 @@ static dal_mapper_t dal_rtl8373_mapper =
 	.rate_igrBwCtrlIfg_set = dal_rtl8373_rate_igrBwCtrlIfg_set,
     .rate_igrBwCtrlIfg_get = dal_rtl8373_rate_igrBwCtrlIfg_get,
 	.rate_igrBwCtrlCongestSts_get = dal_rtl8373_rate_igrBwCtrlCongestSts_get,
+	.rate_egrBwCtrlPortEn_set = dal_rtl8373_rate_egrBwCtrlPortEn_set,
+	.rate_egrBwCtrlPortEn_get = dal_rtl8373_rate_egrBwCtrlPortEn_get,
+	.rate_egrBwCtrlRate_set = dal_rtl8373_rate_egrBwCtrlRateOnly_set,
+	.rate_egrBwCtrlBurst_set = dal_rtl8373_rate_egrBwCtrlBurst_set,
+	.rate_egrBwCtrlBurst_get = dal_rtl8373_rate_egrBwCtrlBurst_get,
 	.rate_egrBandwidthCtrlRate_set = dal_rtl8373_rate_egrBwCtrlRate_set,
     .rate_egrBandwidthCtrlRate_get = dal_rtl8373_rate_egrBwCtrlRate_get,
     .rate_egrQueueBwCtrlEnable_set = dal_rtl8373_rate_egrQueueMaxBwEn_set,
@@ -805,4 +810,3 @@ dal_mapper_t *dal_rtl8373_mapper_get(void)
 
     return &dal_rtl8373_mapper;
 } /* end of dal_rtl8373_mapper_get */
-
