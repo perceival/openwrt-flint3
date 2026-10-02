@@ -1,0 +1,98 @@
+From: Benoit Masson <yahoo@perenite.com>
+Subject: [PATCH] net: ethernet: qualcomm: ppe: flow table depth per SoC
+
+The flow table bound was one constant for every part. The IPQ9574
+hashes indices well past it: a hash-mode add returned 3608 against a
+limit of 2048, and the resulting warning fired on every such flow.
+The qca-ssdk gives the family a 4096-entry table, and the IPQ5332 has
+only been observed to 1808.
+
+Move the depth into per-compatible match data: 2048 for the IPQ5332
+(observed maximum plus headroom, register-level confirmation still
+pending) and 4096 for the IPQ9574 (qca-ssdk IN_FLOW_TBL_MAX_ENTRY,
+observed to 3608).
+
+Measured on TP-Link Archer BE800 (IPQ9574): with 4096, eight parallel
+iperf3 streams all install and the warning is gone.
+
+Signed-off-by: Benoit Masson <yahoo@perenite.com>
+---
+--- a/drivers/net/ethernet/qualcomm/ppe/ppe.c	2026-10-02 08:00:46.550002523 +0000
++++ b/drivers/net/ethernet/qualcomm/ppe/ppe.c	2026-10-02 08:00:46.560002523 +0000
+@@ -202,6 +202,7 @@
+ 	const struct icc_bulk_data *ppe_icc_data;
+ 	struct device *dev = &pdev->dev;
+ 	int ret, num_icc, num_ports;
++	const struct ppe_of_data *of_data;
+ 	struct ppe_device *ppe_dev;
+ 	void __iomem *base;
+ 
+@@ -233,6 +234,11 @@
+ 	ppe_dev->clk_rate = PPE_CLK_RATE;
+ 	ppe_dev->num_ports = num_ports;
+ 	ppe_dev->num_icc_paths = num_icc;
++	of_data = of_device_get_match_data(dev);
++	if (!of_data)
++		return dev_err_probe(dev, -ENODEV, "no match data");
++	ppe_dev->flow_tbl_entries = of_data->flow_tbl_entries;
+ 	mutex_init(&ppe_dev->flow_tbl_lock);
+ 	mutex_init(&ppe_dev->host_tbl_lock);
+ 
+@@ -288,9 +294,21 @@
+ 	ppe_offload_destroy(ppe_dev);
+ }
+ 
++/* Flow table depth per SoC. The IPQ5332 value is the highest index
++ * observed on hardware (1808) rounded up, pending a register-level
++ * confirmation; the IPQ9574 value follows the qca-ssdk
++ * IN_FLOW_TBL_MAX_ENTRY, and indices up to 3608 have been observed.
++ */
++static const struct ppe_of_data ppe_ipq5332_of_data = {
++	.flow_tbl_entries = 2048,
++};
++
++static const struct ppe_of_data ppe_ipq9574_of_data = {
++	.flow_tbl_entries = 4096,
++};
++
+ static const struct of_device_id qcom_ppe_of_match[] = {
+-	{ .compatible = "qcom,ipq5332-ppe" },
+-	{ .compatible = "qcom,ipq9574-ppe" },
++	{ .compatible = "qcom,ipq5332-ppe", .data = &ppe_ipq5332_of_data },
++	{ .compatible = "qcom,ipq9574-ppe", .data = &ppe_ipq9574_of_data },
+ 	{}
+ };
+ MODULE_DEVICE_TABLE(of, qcom_ppe_of_match);
+--- a/drivers/net/ethernet/qualcomm/ppe/ppe.h	2026-10-02 08:00:46.540002523 +0000
++++ b/drivers/net/ethernet/qualcomm/ppe/ppe.h	2026-10-02 08:00:46.560002523 +0000
+@@ -12,6 +12,8 @@
+ #include <linux/mutex.h>
+ #include <linux/of.h>
+ 
++struct ppe_of_data;
++
+ struct device;
+ struct regmap;
+ struct dentry;
+@@ -54,6 +56,7 @@
+ 	struct mutex flow_tbl_lock;
+ 	struct mutex host_tbl_lock;
+ 	struct ppe_offload_priv *offload;
++	unsigned int flow_tbl_entries;
+ 	unsigned int num_icc_paths;
+ 	struct icc_bulk_data icc_paths[] __counted_by(num_icc_paths);
+ };
+--- a/drivers/net/ethernet/qualcomm/ppe/ppe_flow.c	2026-10-02 08:00:46.550002523 +0000
++++ b/drivers/net/ethernet/qualcomm/ppe/ppe_flow.c	2026-10-02 08:00:46.560002523 +0000
+@@ -87,9 +87,9 @@
+ 	 * op has already taken effect, and callers size their per-index
+ 	 * state by the field width, so the index stays usable.
+ 	 */
+-	if (*index >= PPE_IN_FLOW_TBL_ENTRIES)
++	if (*index >= ppe_dev->flow_tbl_entries)
+ 		dev_warn_once(ppe_dev->dev, "flow table op returned index %u beyond table size %u\n",
+-			      *index, PPE_IN_FLOW_TBL_ENTRIES);
++			      *index, ppe_dev->flow_tbl_entries);
+ 
+ 	return 0;
+ }
