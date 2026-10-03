@@ -4,8 +4,10 @@ Mainline **OpenWrt** support for the **GL.iNet Flint 3 (GL-BE9300)** — Qualcom
 **IPQ5332** (quad Cortex-A53) with tri-band Wi-Fi 7, a Realtek **RTL8372N** 10G
 switch and a **RTL8221B** 2.5G WAN PHY.
 
-> **This branch (`flint3-be9300`) is a complete, buildable OpenWrt tree.**
-> Clone it and build — there is nothing to drop into another checkout.
+> The `flint3-be9300` base is a complete OpenWrt tree. This RTL8372N
+> driver-replacement candidate is experimental: it has not passed a successful
+> package build or hardware test. Follow the [P0 first-test plan](package/kernel/rtl837x/FIRST-HARDWARE-TEST.md)
+> before building or installing this candidate.
 > (An earlier `main` branch held a target *overlay*; it is retired and
 > preserved at the tag `archive/main-overlay`.)
 
@@ -26,26 +28,28 @@ Target: **`qualcommbe/ipq53xx`**, kernel **6.18**.
 | SoC | Qualcomm IPQ5332, 4× Cortex-A53 |
 | Wi-Fi 2.4 GHz | on-SoC radio, ath12k over AHB |
 | Wi-Fi 5 / 6 GHz | 2× QCN9274, ath12k over PCIe |
-| Switch | RTL8372N, out-of-tree DSA driver (`realtek,rtl837x`); SoC↔switch link is 10GBASE-R |
+| Switch | RTL8372N, out-of-tree DSA candidate (`realtek,rtl8372n`); SoC↔switch link is 10GBASE-R |
 | WAN | RTL8221B 2.5G, USXGMII |
 | Storage | eMMC |
 
 ## Status
 
+This branch is being used to prepare a replacement RTL8372N DSA driver. The P0 candidate has not yet completed a successful OpenWrt build or a Flint 3 hardware run. See the [first-hardware test plan](package/kernel/rtl837x/FIRST-HARDWARE-TEST.md) before building or testing it.
+
 | Subsystem | State |
 |---|---|
-| Boot / procd / SSH | working |
-| LAN (RTL8372N via DSA + EDMA/PPE) | working |
-| WAN (2.5G, USXGMII) | working, links at 2.5 Gbps |
-| VLANs (bridge-vlan on DSA) | working |
-| PPE hardware flow offload | IPv4 LAN→WAN NAT (TCP/UDP, untagged or 802.1Q WAN) ~2.3 Gbit/s at ~1% CPU; opt-in via the firewall's hardware flow offloading. WAN→LAN and IPv6 in the next release |
+| Boot / procd / SSH | working on the previous known-good image; candidate image not hardware-tested |
+| LAN (RTL8372N via DSA + EDMA/PPE) | P0 replacement candidate; build and hardware validation pending |
+| WAN (2.5G, USXGMII) | working on the previous known-good image; candidate regression not checked |
+| VLANs (bridge-vlan on DSA) | P0 seeds VLAN 1/PVID only; general VLAN offload is not implemented |
+| PPE hardware flow offload | Previous-driver baseline: IPv4 LAN→WAN NAT reached ~2.3 Gbit/s at ~1% CPU. Candidate behavior is not yet validated. |
 | Wi-Fi 7, all three bands | working |
 | MLO (AP MLD across 2.4/5/6 GHz) | working |
 | DFS | working, including several BSSes per DFS radio started together |
 | 802.11k / 802.11v | working |
-| eMMC sysupgrade + return to stock | working |
+| eMMC sysupgrade + return to stock | established for the previous known-good image; candidate recovery path not tested |
 
-Throughput measured between two units over a 2.5G trunk: **~1.8–1.9 Gbit/s**.
+The **~1.8–1.9 Gbit/s** result was measured with the previous working switch-driver build. It is historical baseline data and does not validate this P0 candidate.
 
 ## Known issues
 
@@ -67,6 +71,8 @@ Throughput measured between two units over a 2.5G trunk: **~1.8–1.9 Gbit/s**.
   awareness — do not enable 11r on an MLO SSID. 11k/11v are fine.
 
 ## Building
+
+For the RTL8372N P0 package build and first-device test sequence, see [FIRST-HARDWARE-TEST.md](package/kernel/rtl837x/FIRST-HARDWARE-TEST.md). The package has not yet passed that build gate in this worktree.
 
 ```sh
 git clone -b flint3-be9300 https://github.com/perceival/openwrt-flint3.git
@@ -102,10 +108,17 @@ are on the device page:
 
 **https://openwrt.org/toh/gl.inet/gl-be9300**
 
-Short version: from stock firmware, use the **factory** image with
-`sysupgrade -F -n`. The stock image check requires a QSDK FIT, so `-F` is
-required and the "missing section" warnings for `u-boot`/`tz`/`sb11` are
-expected. Do **not** force the plain sysupgrade image from stock.
+> [!CAUTION]
+> The instructions below describe the established image path, not a validated
+> installation of the P0 switch-driver candidate. Do not flash the candidate
+> on your only router. Use a recoverable test unit, serial console, known-good
+> image, and the first-hardware test plan linked above.
+
+Short version for the established image: from stock firmware, use the
+**factory** image with `sysupgrade -F -n`. The stock image check requires a
+QSDK FIT, so `-F` is required and the "missing section" warnings for
+`u-boot`/`tz`/`sb11` are expected. Do **not** force the plain sysupgrade image
+from stock.
 
 Stock QSDK firmware may report `qcom,ipq5332-ap-mi01.6` as its board name.
 That is the generic Qualcomm MI01.6/RDP468 identity used by the vendor path,
