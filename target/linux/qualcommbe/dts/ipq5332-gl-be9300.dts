@@ -140,7 +140,10 @@
 			interrupt-parent = <&tlmm>;
 			interrupts = <36 IRQ_TYPE_EDGE_RISING>;
 			pulses-per-revolution = <2>;
-			cooling-levels = <36 128 192 255>;
+			/* 56 duty levels, ~4 pwm per step: with one step per polling
+			 * cycle the kernel's step_wise becomes a slow, inaudible ramp.
+			 */
+			cooling-levels = <36 40 44 48 52 56 60 64 68 72 76 80 84 88 92 96 100 104 108 112 116 120 124 128 132 136 140 144 148 152 156 160 164 168 172 176 180 184 188 192 196 200 204 208 212 216 220 224 228 232 236 240 244 248 252 255>;
 			#cooling-cells = <2>;
 		};
 
@@ -162,39 +165,28 @@
 			polling-delay = <1000>;
 
 			trips {
-				fan_trip_high: active-high {
-					temperature = <100000>;
-					hysteresis = <2000>;
-					type = "active";
-				};
-
-				fan_trip_med: active-med {
-					temperature = <75000>;
-					hysteresis = <2000>;
-					type = "active";
-				};
-
 				fan_trip_low: active-low {
-					temperature = <50000>;
+					temperature = <45000>;
+					hysteresis = <2000>;
+					type = "active";
+				};
+
+				fan_trip_main: active-main {
+					temperature = <52000>;
 					hysteresis = <2000>;
 					type = "active";
 				};
 			};
 
 			cooling-maps {
-				fan-active-high {
-					cooling-device = <&fan0 3 3>;
-					trip = <&fan_trip_high>;
-				};
-
-				fan-active-med {
-					cooling-device = <&fan0 2 2>;
-					trip = <&fan_trip_med>;
-				};
-
 				fan-active-low {
-					cooling-device = <&fan0 1 1>;
+					cooling-device = <&fan0 0 10>;
 					trip = <&fan_trip_low>;
+				};
+
+				fan-active-main {
+					cooling-device = <&fan0 0 55>;
+					trip = <&fan_trip_main>;
 				};
 			};
 		};
