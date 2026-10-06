@@ -1,5 +1,7 @@
 # OpenWrt for the GL.iNet Flint 3 (GL-BE9300)
 
+[![Support me on Ko-fi](https://img.shields.io/badge/SUPPORT%20ME%20ON%20KO--FI-FFDD00?style=for-the-badge&logo=ko-fi&logoColor=black)](https://ko-fi.com/perceival)
+
 Mainline **OpenWrt** support for the **GL.iNet Flint 3 (GL-BE9300)** — Qualcomm
 **IPQ5332** (quad Cortex-A53) with tri-band Wi-Fi 7, a Realtek **RTL8372N** 10G
 switch and a **RTL8221B** 2.5G WAN PHY.
