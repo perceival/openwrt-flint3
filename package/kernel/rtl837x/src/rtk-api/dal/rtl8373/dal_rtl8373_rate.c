@@ -25,6 +25,10 @@
 
 #include <dal/rtl8373/rtl8373_asicdrv.h>
 
+#define RTL8373_EGBW_PORT_BURST_ADDR(port) \
+	(RTL8373_EGBW_PORT_CTRL_ADDR(port) + RTL8373_REG_ADDR_STEP)
+#define RTL8373_EGBW_PORT_BURST_MASK (0xFFFF)
+
 
 /* Function Name:
  *      dal_rtl8373_rate_igrBwCtrlPortEn_set
@@ -294,6 +298,115 @@ rtk_api_ret_t dal_rtl8373_rate_igrBwCtrlCongestSts_get(rtk_port_t port, rtk_rate
 	*pCongestSts = (rtk_rate_igrBwCongestSts_t)regVal;
 	
 	return RT_ERR_OK;
+}
+
+/* Function Name:
+ *      dal_rtl8373_rate_egrBwCtrlRateOnly_set
+ * Description:
+ *      Set the per-port egress bandwidth rate without changing the
+ *      chip-global IFG accounting setting.
+ */
+rtk_api_ret_t dal_rtl8373_rate_egrBwCtrlRateOnly_set(rtk_port_t port,
+							    rtk_rate_t rate)
+{
+	rtk_uint32 retVal = 0, regData = 0;
+
+	/* Check initialization state */
+	RTK_CHK_INIT_STATE();
+
+	/* Check Port Valid */
+	RTK_CHK_PORT_VALID(port);
+	if (port > EBW_CTRL_MAX_PORT_ID)
+		return RT_ERR_QOS_EBW_PORT_ID;
+
+	if (rate > EBW_CTRL_RATE_MAX)
+		return RT_ERR_QOS_EBW_RATE;
+
+	regData = (rate >> 4);
+	retVal = rtl8373_setAsicRegBits(RTL8373_EGBW_PORT_CTRL_ADDR(port),
+						RTL8373_EGBW_PORT_CTRL_RATE_MASK, regData);
+	if (retVal != RT_ERR_OK)
+		return retVal;
+
+	return RT_ERR_OK;
+}
+
+/* Function Name:
+ *      dal_rtl8373_rate_egrBwCtrlBurst_set
+ * Description:
+ *      Set the per-port egress bandwidth burst in bytes
+ * Input:
+ *      port        - Port id
+ *      burst       - Egress bucket size in bytes
+ * Output:
+ *      None
+ * Return:
+ *      RT_ERR_OK           - OK
+ *      RT_ERR_INPUT        - Burst is outside the exact field or below 3*TKN
+ *      RT_ERR_SMI          - SMI access error
+ *      RT_ERR_PORT_ID      - Invalid port number
+ */
+rtk_api_ret_t dal_rtl8373_rate_egrBwCtrlBurst_set(rtk_port_t port,
+								   rtk_uint32 burst)
+{
+	rtk_uint32 retVal, tkn;
+
+	/* Check initialization state */
+	RTK_CHK_INIT_STATE();
+
+	/* Check Port Valid */
+	RTK_CHK_PORT_VALID(port);
+	if (port > EBW_CTRL_MAX_PORT_ID)
+		return RT_ERR_QOS_EBW_PORT_ID;
+
+	if (burst > EBW_CTRL_BURST_MAX)
+		return RT_ERR_INPUT;
+
+	retVal = rtl8373_getAsicRegBits(RTL8373_EGBW_LB_CTRL_ADDR,
+						RTL8373_EGBW_LB_CTRL_TKN_MASK, &tkn);
+	if (retVal != RT_ERR_OK)
+		return retVal;
+
+	if (burst < 3U * tkn)
+		return RT_ERR_INPUT;
+
+	/* BURST is bits 47:32 of the logical 64-bit port register. The
+	 * register access API operates on one 32-bit word at a time.
+	 */
+	return rtl8373_setAsicRegBits(RTL8373_EGBW_PORT_BURST_ADDR(port),
+						      RTL8373_EGBW_PORT_BURST_MASK, burst);
+}
+
+/* Function Name:
+ *      dal_rtl8373_rate_egrBwCtrlBurst_get
+ * Description:
+ *      Get the per-port egress bandwidth burst in bytes
+ * Input:
+ *      port        - Port id
+ * Output:
+ *      pBurst      - Egress bucket size in bytes
+ * Return:
+ *      RT_ERR_OK           - OK
+ *      RT_ERR_NULL_POINTER - Null output pointer
+ *      RT_ERR_SMI          - SMI access error
+ *      RT_ERR_PORT_ID      - Invalid port number
+ */
+rtk_api_ret_t dal_rtl8373_rate_egrBwCtrlBurst_get(rtk_port_t port,
+								   rtk_uint32 *pBurst)
+{
+	/* Check initialization state */
+	RTK_CHK_INIT_STATE();
+
+	/* Check Port Valid */
+	RTK_CHK_PORT_VALID(port);
+	if (port > EBW_CTRL_MAX_PORT_ID)
+		return RT_ERR_QOS_EBW_PORT_ID;
+
+	if (!pBurst)
+		return RT_ERR_NULL_POINTER;
+
+	return rtl8373_getAsicRegBits(RTL8373_EGBW_PORT_BURST_ADDR(port),
+						      RTL8373_EGBW_PORT_BURST_MASK, pBurst);
 }
 
 
@@ -641,7 +754,4 @@ rtk_api_ret_t dal_rtl8373_rate_egrQueueMaxBwRate_get(rtk_port_t port, rtk_qid_t 
 	
 	return RT_ERR_OK;	
 }
-
-
-
 
