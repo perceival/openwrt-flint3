@@ -1,0 +1,78 @@
+From: Benoit Masson <yahoo@perenite.com>
+Subject: [PATCH] net: ethernet: qualcomm: ppe: bridge aware path checks
+
+Two accept checks compare against the device a frame arrives on or
+leaves through, and both assume that device is also the one the FIB
+names. Behind a software bridge it is not: the FIB names the bridge,
+a bridge does not rewrite the source of frames it forwards, and routed
+traffic carries the bridge address out of a member port.
+
+The IPv6 source-route check then always failed (the FIB resolves the
+source through the bridge while the ingress is a member), declining
+every routed IPv6 flow; the egress source check rejected the correct
+bridge address the flowtable offered, declining routed IPv6 in the
+other direction as well. Both print once per reason, so the flows
+looked silently software.
+
+Compare against the bridge master in both places. DSA setups are
+unaffected: a conduit and its user ports share one address, so the
+master comparison was already true there.
+
+Measured on TP-Link Archer BE800 (IPQ9574, ports under a software
+bridge, no DSA): routed IPv6 offloads both directions at 2.32 Gbit/s
+with the CPU port seeing 226 packets per 15 s transfer, against the
+full line rate in software before; IPv4 NAT unchanged at 9 CPU packets
+per transfer.
+
+Signed-off-by: Benoit Masson <yahoo@perenite.com>
+---
+--- a/drivers/net/ethernet/qualcomm/ppe/ppe_offload.c	2026-10-02 08:00:46.550002523 +0000
++++ b/drivers/net/ethernet/qualcomm/ppe/ppe_offload.c	2026-10-02 08:00:46.560002523 +0000
+@@ -940,6 +940,29 @@
+ 	return true;
+ }
+ 
++/* Routed traffic egressing a bridge member keeps the bridge MAC as
++ * source (a bridge does not rewrite it), so the valid egress source MAC
++ * is the member address or that of its master. This runs from the
++ * nf_flow_table offload workqueue (no RTNL held), so the upper-device
++ * lookup must use the RCU variant.
++ */
++static bool ppe_offload_egress_mac_matches(const u8 *mac,
++					    struct net_device *dev)
++{
++	struct net_device *master;
++	bool match;
++
++	if (ether_addr_equal(mac, dev->dev_addr))
++		return true;
++
++	rcu_read_lock();
++	master = netdev_master_upper_dev_get_rcu(dev);
++	match = master && ether_addr_equal(mac, master->dev_addr);
++	rcu_read_unlock();
++
++	return match;
++}
++
+ static int ppe_offload_flow_replace(struct net_device *netdev,
+ 				     struct ppe_offload_priv *priv,
+ 				     struct flow_cls_offload *cls)
+@@ -1201,7 +1224,7 @@
+ 			dst_on_ingress = __ip_dev_find(dev_net(netdev), match_dst, false) == l3dev;
+ 		if (l3dev && ipv6)
+ 			src_via_ingress = ppe_offload_ipv6_reached_via(dev_net(netdev), &match_src6,
+-								       l3dev);
++				netdev_master_upper_dev_get_rcu(idev) ? : l3dev);
+ 	}
+ 	if (idev)
+ 		idev = ppe_offload_ingress_edma_dev(idev);
+@@ -1451,7 +1474,7 @@
+ 	 * Behind a DSA user port that is the conduit's MAC, which its
+ 	 * user ports and (by default) their bridge inherit.
+ 	 */
+-	if (!ether_addr_equal(eth.bytes + ETH_ALEN, egress.dev->dev_addr))
++	if (!ppe_offload_egress_mac_matches(eth.bytes + ETH_ALEN, egress.dev))
+ 		return ppe_offload_decline("eth mangle src %pM != egress %s mac %pM",
+ 					    eth.bytes + ETH_ALEN, netdev_name(egress.dev),
+ 					    egress.dev->dev_addr);
