@@ -140,7 +140,10 @@
 			interrupt-parent = <&tlmm>;
 			interrupts = <36 IRQ_TYPE_EDGE_RISING>;
 			pulses-per-revolution = <2>;
-			cooling-levels = <36 128 192 255>;
+			/* Spaced evenly in rpm (~450 rpm/step), not in duty: this fan
+			 * saturates past pwm 128 (128 -> 255 adds only ~9% airflow).
+			 */
+			cooling-levels = <36 49 63 82 102 122 255>;
 			#cooling-cells = <2>;
 		};
 
@@ -162,39 +165,72 @@
 			polling-delay = <1000>;
 
 			trips {
-				fan_trip_high: active-high {
-					temperature = <100000>;
+				fan_trip1: active-1 {
+					temperature = <58000>;
 					hysteresis = <2000>;
 					type = "active";
 				};
 
-				fan_trip_med: active-med {
-					temperature = <75000>;
+				fan_trip2: active-2 {
+					temperature = <65000>;
 					hysteresis = <2000>;
 					type = "active";
 				};
 
-				fan_trip_low: active-low {
-					temperature = <50000>;
+				fan_trip3: active-3 {
+					temperature = <72000>;
+					hysteresis = <2000>;
+					type = "active";
+				};
+
+				fan_trip4: active-4 {
+					temperature = <79000>;
+					hysteresis = <2000>;
+					type = "active";
+				};
+
+				fan_trip5: active-5 {
+					temperature = <86000>;
+					hysteresis = <2000>;
+					type = "active";
+				};
+
+				fan_trip6: active-6 {
+					temperature = <93000>;
 					hysteresis = <2000>;
 					type = "active";
 				};
 			};
 
 			cooling-maps {
-				fan-active-high {
-					cooling-device = <&fan0 3 3>;
-					trip = <&fan_trip_high>;
-				};
-
-				fan-active-med {
-					cooling-device = <&fan0 2 2>;
-					trip = <&fan_trip_med>;
-				};
-
-				fan-active-low {
+				fan-active-1 {
 					cooling-device = <&fan0 1 1>;
-					trip = <&fan_trip_low>;
+					trip = <&fan_trip1>;
+				};
+
+				fan-active-2 {
+					cooling-device = <&fan0 2 2>;
+					trip = <&fan_trip2>;
+				};
+
+				fan-active-3 {
+					cooling-device = <&fan0 3 3>;
+					trip = <&fan_trip3>;
+				};
+
+				fan-active-4 {
+					cooling-device = <&fan0 4 4>;
+					trip = <&fan_trip4>;
+				};
+
+				fan-active-5 {
+					cooling-device = <&fan0 5 5>;
+					trip = <&fan_trip5>;
+				};
+
+				fan-active-6 {
+					cooling-device = <&fan0 6 6>;
+					trip = <&fan_trip6>;
 				};
 			};
 		};
