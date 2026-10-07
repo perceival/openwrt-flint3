@@ -1,0 +1,106 @@
+From: Benoit Masson <yahoo@perenite.com>
+Subject: [PATCH] net: ethernet: qualcomm: ppe: flow table depth per SoC
+
+The flow table bound was one constant for every part. The IPQ9574
+hashes indices well past it: a hash-mode add returned 3608 against a
+limit of 2048, and the resulting warning fired on every such flow.
+The qca-ssdk gives the family a 4096-entry table, and the IPQ5332 has
+only been observed to 1808.
+
+Pick the depth in the existing per-SoC compatible branch in the probe:
+2048 for the IPQ5332 (observed maximum plus headroom, register-level
+confirmation still pending) and 4096 for the IPQ9574 (qca-ssdk table
+size, indices up to 3608 observed). The flow-table-full message printed
+the same constant, so it now prints the per-SoC depth too.
+
+Measured on TP-Link Archer BE800 (IPQ9574): with 4096, eight parallel
+iperf3 streams all install and the warning is gone.
+
+Signed-off-by: Benoit Masson <yahoo@perenite.com>
+---
+--- a/drivers/net/ethernet/qualcomm/ppe/ppe.c
++++ b/drivers/net/ethernet/qualcomm/ppe/ppe.c
+@@ -201,7 +201,7 @@
+ {
+ 	const struct icc_bulk_data *ppe_icc_data;
+ 	struct device *dev = &pdev->dev;
+-	int ret, num_icc, num_ports;
++	int ret, num_icc, num_ports, flow_tbl_entries;
+ 	struct ppe_device *ppe_dev;
+ 	void __iomem *base;
+ 
+@@ -209,11 +209,13 @@
+ 		ppe_icc_data = ipq5332_icc_data;
+ 		num_icc = ARRAY_SIZE(ipq5332_icc_data);
+ 		num_ports = 3;
++		flow_tbl_entries = 2048;
+ 	}
+ 	else {
+ 		ppe_icc_data = ipq9574_icc_data;
+ 		num_icc = ARRAY_SIZE(ipq9574_icc_data);
+ 		num_ports = PPE_PORT_MAX;
++		flow_tbl_entries = 4096;
+ 	}
+ 
+ 	ppe_dev = devm_kzalloc(dev, struct_size(ppe_dev, icc_paths, num_icc),
+@@ -233,6 +235,12 @@
+ 	ppe_dev->clk_rate = PPE_CLK_RATE;
+ 	ppe_dev->num_ports = num_ports;
+ 	ppe_dev->num_icc_paths = num_icc;
++	/* Flow table depth differs per SoC: the IPQ5332 value is the
++	 * highest index observed on hardware (1808) rounded up, the
++	 * IPQ9574 value follows the qca-ssdk table size and has hashed
++	 * indices up to 3608.
++	 */
++	ppe_dev->flow_tbl_entries = flow_tbl_entries;
+ 	mutex_init(&ppe_dev->flow_tbl_lock);
+ 	mutex_init(&ppe_dev->host_tbl_lock);
+ 
+--- a/drivers/net/ethernet/qualcomm/ppe/ppe.h
++++ b/drivers/net/ethernet/qualcomm/ppe/ppe.h
+@@ -37,6 +37,7 @@
+  * @offload: Hardware flow-offload state (see ppe_offload.c) -- flow
+  * table rhashtable, host/nexthop pools, and the mutex serializing
+  * offload add/remove. Allocated at probe.
++ * @flow_tbl_entries: Depth of the flow table, which differs per SoC.
+  * @num_icc_paths: Number of interconnect paths.
+  * @icc_paths: Interconnect path array.
+  *
+@@ -54,6 +55,7 @@
+ 	struct mutex flow_tbl_lock;
+ 	struct mutex host_tbl_lock;
+ 	struct ppe_offload_priv *offload;
++	unsigned int flow_tbl_entries;
+ 	unsigned int num_icc_paths;
+ 	struct icc_bulk_data icc_paths[] __counted_by(num_icc_paths);
+ };
+--- a/drivers/net/ethernet/qualcomm/ppe/ppe_flow.c
++++ b/drivers/net/ethernet/qualcomm/ppe/ppe_flow.c
+@@ -83,13 +83,13 @@
+ 	*index = FIELD_GET(PPE_IN_FLOW_TBL_OP_RSLT_ENTRY_INDEX, rslt);
+ 
+ 	/* The result field is 12 bits wide but the MPPE table only has
+-	 * PPE_IN_FLOW_TBL_ENTRIES slots. Report it rather than fail: the
++	 * ppe_dev->flow_tbl_entries slots. Report it rather than fail: the
+ 	 * op has already taken effect, and callers size their per-index
+ 	 * state by the field width, so the index stays usable.
+ 	 */
+-	if (*index >= PPE_IN_FLOW_TBL_ENTRIES)
++	if (*index >= ppe_dev->flow_tbl_entries)
+ 		dev_warn_once(ppe_dev->dev, "flow table op returned index %u beyond table size %u\n",
+-			      *index, PPE_IN_FLOW_TBL_ENTRIES);
++			      *index, ppe_dev->flow_tbl_entries);
+ 
+ 	return 0;
+ }
+--- a/drivers/net/ethernet/qualcomm/ppe/ppe_offload.c
++++ b/drivers/net/ethernet/qualcomm/ppe/ppe_offload.c
+@@ -891,7 +891,7 @@
+ 		if (priv->flow_owner[i])
+ 			used++;
+ 	pr_info("ppe_offload: flow table full: no free slot in the flow's hash bucket (%u of %u slots in use), flows hashing there stay in software\n",
+-		used, PPE_IN_FLOW_TBL_ENTRIES);
++		used, priv->ppe_dev->flow_tbl_entries);
+ }
+ 
+ static u64 ppe_offload_counter_delta(u64 now, u64 prev, u64 mask);
