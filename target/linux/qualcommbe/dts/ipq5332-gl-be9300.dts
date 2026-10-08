@@ -386,22 +386,19 @@
 
 	/*
 	 * RTL8372N switch (4x 2.5G LAN + 10G SerDes uplink to xgmac1).
-	 * No reset-gpios: U-Boot leaves the switch initialized with SDS0
-	 * in 10G mode and port 3 linked; the driver re-inits from there.
-	 * The four sdsN-rx/tx-swap flags are required on this board, same as
-	 * BE6500. Without them the 10G CPU link still reports up, but no
-	 * traffic crosses it in either direction (bench-verified 2026-07-27:
-	 * swap_cfg 0x0 = dead LAN path, swap_cfg 0xf = LAN path works).
+	 * The P0 DSA candidate resets the switch over MDIO and applies only
+	 * minimal SMI/SerDes setup; full post-reset PHY/SerDes initialization
+	 * still needs hardware validation. No reset GPIO is wired here.
+	 * The four polarity flags match the previous board-tested wiring
+	 * (2026-07-27: swap_cfg 0x0 had no traffic; 0xf passed traffic).
+	 * Keep all four enabled for the candidate's first test; repeat the
+	 * traffic check because the candidate changes reset/init behavior.
 	 */
 	rtl837x: rtl837x-dsa@29 {
-		compatible = "realtek,rtl837x";
+		compatible = "realtek,rtl8372n";
 		#address-cells = <1>;
 		#size-cells = <0>;
 		reg = <29>;
-		rtl837x,sds0mode = "10g-kr";
-		gpio-controller;
-		#gpio-cells = <2>;
-
 		sds0-rx-swap;
 		sds0-tx-swap;
 		sds1-rx-swap;

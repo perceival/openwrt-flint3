@@ -1,0 +1,60 @@
+name: RTL8372N module build
+
+on:
+  push:
+    branches: [rtl837x-dsa-port]
+    paths:
+      - .github/workflows/rtl8372n-module.yml
+      - package/kernel/rtl837x/src/**
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  arm64-module:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential gcc-aarch64-linux-gnu bison flex libssl-dev libelf-dev bc xz-utils
+      - name: Fetch pinned Linux 6.18.39
+        run: |
+          curl --fail --location --retry 3 -o linux.tar.xz https://cdn.kernel.org/pub/linux/kernel/v6.x/linux-6.18.39.tar.xz
+          echo 'a7a7e3d2ae9d95e74197223a8d4eb5f6be7aac21b6e6de27e9685d001c1f8cb0  linux.tar.xz' | sha256sum --check
+          tar -xf linux.tar.xz
+      - name: Configure minimal API build
+        working-directory: linux-6.18.39
+        run: |
+          make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- allnoconfig
+          scripts/config --enable MODULES --enable MODULE_UNLOAD --enable NET --enable NETDEVICES --enable INET --enable OF --enable PHYLIB --enable MDIO_DEVICE --enable BRIDGE --enable NET_DSA --enable GPIOLIB --enable KUNIT --enable REGMAP_BUILD --disable KUNIT_ALL_TESTS --module NET_DSA_TAG_RTL8_4
+          make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- olddefconfig
+          for symbol in MODULES OF PHYLIB OF_MDIO NET_DSA REGMAP; do
+            test "$(scripts/config --state "$symbol")" = y || { echo "Missing CONFIG_$symbol"; exit 1; }
+          done
+      - name: Build kernel exports and tagger
+        working-directory: linux-6.18.39
+        run: |
+          set -o pipefail
+          make -j2 ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- vmlinux modules 2>&1 | tee kernel-build.log
+      - name: Compile candidate and run modpost
+        working-directory: linux-6.18.39
+        run: |
+          set -o pipefail
+          make -j2 ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- M="$GITHUB_WORKSPACE/package/kernel/rtl837x/src" CONFIG_RTL837X_DSA=m W=1 modules 2>&1 | tee rtl8372n-module-build.log
+          aarch64-linux-gnu-readelf --file-header "$GITHUB_WORKSPACE/package/kernel/rtl837x/src/rtl8372n_dsa.ko"
+          sha256sum "$GITHUB_WORKSPACE/package/kernel/rtl837x/src/rtl8372n_dsa.ko"
+      - name: Save build evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: rtl8372n-arm64-module-${{ github.sha }}
+          path: |
+            linux-6.18.39/.config
+            linux-6.18.39/*build.log
+            package/kernel/rtl837x/src/rtl8372n_dsa.ko
+          if-no-files-found: warn
+          include-hidden-files: true
