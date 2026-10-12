@@ -1,0 +1,55 @@
+From: mecab <mecab@misosi.ru>
+Date: Sun, 11 Oct 2026 12:00:00 +0900
+Subject: [PATCH] wifi: ath12k: pin 4addr unicast to the WDS peer
+
+An AP vdev leaves unicast TX to the hardware address search: TCL looks up
+the AST entry for the destination MAC (ADDRX) and transmits to whichever
+peer owns it.  Commit 729cad3c3c9e ("wifi: ath12k: Add 4-address mode
+support for eth offload") overrides that lookup with the 4addr peer's own
+AST index, but only for multicast, which was the case it set out to fix.
+Unicast relies on the WDS AST entries that firmware learns for clients
+behind the peer.
+
+That breaks when a client roams from this AP to a WDS repeater without
+leaving.  Its direct peer stays on the pdev until hostapd removes it, and
+meanwhile the search keeps resolving the client's address to that peer.
+Frames that mac80211 hands down for the WDS peer (control->sta is the
+4addr peer, the Ethernet DA is the roamed client) are sent to the absent
+client, so DHCP and ARP replies never reach the repeater.  A stale peer
+on another radio does no harm because the search is per pdev.
+
+This patch pins unicast Ethernet frames for a 4addr peer on an AP vdev
+to the peer's AST entry as well, so they go where mac80211 sent them.
+The vendor driver does the same for any frame flagged as WDS extended:
+its TX enqueue sets the index lookup override to the peer's AST entry
+whether the destination is unicast or multicast [1][2].
+
+The change is limited to AP vdevs.  STA vdevs already send to the AP
+peer by index and are left as they were, as are frames to ordinary
+clients.
+
+[1] https://github.com/CodeLinaro-mirror/la_platform_vendor_qcom-opensource_wlan_qca-wifi-host-cmn-win/blob/57305a2d14c6c550206593edf29eb0d4804f608c/dp/wifi3.0/be/dp_be_tx.c#L1495-L1517
+[2] https://github.com/CodeLinaro-mirror/la_platform_vendor_qcom-opensource_wlan_qca-wifi-host-cmn-win/blob/57305a2d14c6c550206593edf29eb0d4804f608c/dp/wifi3.0/dp_tx.c#L1214-L1221
+
+Signed-off-by: mecab <mecab@misosi.ru>
+---
+--- a/drivers/net/wireless/ath/ath12k/wifi7/dp_tx.c
++++ b/drivers/net/wireless/ath/ath12k/wifi7/dp_tx.c
+@@ -177,7 +177,16 @@
+ 	ti.bss_ast_hash = dp_link_vif->ast_hash;
+ 	ti.bss_ast_idx = dp_link_vif->ast_idx;
+ 
+-	if (eth && is_multicast_ether_addr(eth->h_dest) && arsta) {
++	/* arsta is only set for 4-address (WDS) peers. On an AP, also pin
++	 * unicast for such a peer to its AST entry rather than letting the
++	 * hardware search by destination address: a client behind the WDS
++	 * peer may still have a stale direct peer on this pdev after roaming
++	 * away, and the DA search would deliver the frame to that absent
++	 * station instead.
++	 */
++	if (eth && arsta &&
++	    (ahvif->vdev_type == WMI_VDEV_TYPE_AP ||
++	     is_multicast_ether_addr(eth->h_dest))) {
+ 		ti.meta_data_flags = arsta->tcl_metadata;
+ 		ti.bss_ast_hash = arsta->ast_hash & ATH12K_AST_HASH_MASK;
+ 		ti.bss_ast_idx = arsta->ast_idx;
