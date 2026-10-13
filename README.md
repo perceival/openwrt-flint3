@@ -121,6 +121,48 @@ factory-image path instead (see [issue #9](https://github.com/perceival/openwrt-
 **Back up your eMMC first** — the ART partition holds this unit's radio
 calibration and MAC addresses and cannot be recovered from anywhere else.
 
+Record its SHA-256 alongside the copy. Both stock and this tree derive the Wi-Fi
+MACs from ART on every boot, so a change to that partition outlives reinstalling
+OpenWrt *and* restoring stock: the factory image writes only `0:HLOS` and
+`rootfs`, and leaves ART untouched. Without a known-good hash there is no way to
+notice afterwards that it changed.
+
+### If you end up in U-Boot's recovery server
+
+Holding the reset button for five seconds at power-on starts an HTTP server on
+`192.168.1.1`. It is a GL addition — stock U-Boot and the QCA vendor tree have
+no httpd — and it is the recovery path of last resort. It accepts whatever you
+upload with no authentication and no signature check, and will write `0:APPSBL`
+(U-Boot itself) or `0:ART` as readily as the firmware, so treat it as a tool for
+a device you are holding rather than one you leave reachable.
+
+Which image you hand it matters, because it picks its action from the FIT
+description string before it looks at anything else:
+
+| Image | Result |
+|---|---|
+| `…-squashfs-factory.bin` | flashed — its description starts `OpenWrt`, taking the same "source the embedded script" path every stock GL image uses |
+| `…-initramfs-uImage.itb` | **should do nothing** — its description starts `ARM64`, so it falls through to an `sf probe && sf update` branch, and this board has no SPI-NOR for the probe to find. That is read from the bootloader, not tested on hardware, so do not rely on it: RAM-boot the initramfs with `tftpboot` + `bootm` instead |
+| `…-squashfs-sysupgrade.bin` | rejected outright — it is for a running OpenWrt, not for U-Boot |
+
+This was read out of the factory bootloader, which identifies itself as
+`uboot2.0 version:24.11.28`. Worth knowing: GL's firmware images carry no
+bootloader section at all — every release from 4.7.11 to 4.10.1 ships only
+`script`, `wifi_fw`, `hlos` and `rootfs` — so no firmware update changes any of
+this, and the U-Boot on a given unit is whatever the factory installed.
+
+### What the boot chain does and does not guarantee
+
+Secure boot is fused **off** on the unit this was verified against, `0:APPSBL`
+carries no signature at all, and nothing in the chain verifies an image you
+flash. The pre-U-Boot stages are signed, but
+with Qualcomm's publicly distributed SecTools *test* keys, whose private halves
+ship inside the SDK — so those signatures establish integrity, not origin.
+
+None of this is a shortcoming of this port; it is the state the hardware ships
+in, and it is why flashing works at all. It does mean the device's trust story
+rests on controlling physical access rather than on verified boot.
+
 ## Other boards
 
 Only the GL-BE9300 is tested here. The tree is a `qualcommbe/ipq53xx` target, and anything that
