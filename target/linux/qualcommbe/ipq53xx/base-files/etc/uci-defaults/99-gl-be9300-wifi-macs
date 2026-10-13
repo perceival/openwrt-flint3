@@ -11,6 +11,24 @@
 base=$(mmc_get_mac_binary 0:ART 0x4)
 [ -n "$base" ] || exit 0
 
+# get_mac_binary is a bare hexdump with no validation, so a blank or clobbered
+# 0:ART yields 00:00:00:00:00:00 or ff:ff:ff:ff:ff:ff, both of which pass the
+# test above and would pin every BSS to an unusable BSSID. 802.11 requires the
+# BSSID to be an individual address. Fall back to ath12k's own addressing.
+case "$base" in
+00:00:00:00:00:00|ff:ff:ff:ff:ff:ff)
+	logger -t gl-be9300 -p daemon.warn \
+		"0:ART base MAC reads $base; leaving BSSIDs to ath12k"
+	exit 0
+	;;
+esac
+
+if [ $(( 0x${base%%:*} & 1 )) -ne 0 ]; then
+	logger -t gl-be9300 -p daemon.warn \
+		"0:ART base MAC $base is a group address; leaving BSSIDs to ath12k"
+	exit 0
+fi
+
 n=0
 set_wifi_mac() {
 	local section="$1"
