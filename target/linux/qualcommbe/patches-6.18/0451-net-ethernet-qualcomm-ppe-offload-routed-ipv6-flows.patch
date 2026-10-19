@@ -126,7 +126,7 @@ Signed-off-by: Kamil Bienkiewicz <perceivalpercy@gmail.com>
  #include "ppe_host_pool.h"
  #include "ppe_nexthop.h"
  #include "ppe_nexthop_pool.h"
-@@ -201,6 +223,12 @@
+@@ -201,6 +223,12 @@ struct ppe_offload_flow_entry {
  	struct rhash_head node;
  	unsigned long cookie;
  	u32 flow_index;
@@ -139,7 +139,7 @@ Signed-off-by: Kamil Bienkiewicz <perceivalpercy@gmail.com>
  	u32 host_index;
  	u32 nexthop_index;
  	u32 pub_ip_index;
-@@ -227,7 +255,10 @@
+@@ -227,7 +255,10 @@ struct ppe_offload_flow_entry {
  	unsigned int dsa_index;
  	u8 dmac[ETH_ALEN];
  	struct ppe_nexthop_entry nexthop;
@@ -151,7 +151,7 @@ Signed-off-by: Kamil Bienkiewicz <perceivalpercy@gmail.com>
  	/* Hardware counters are cumulative and not clear-on-read, so keep the
  	 * previous reading and report the difference. lastused is refreshed only
  	 * when the packet count actually moves, which is what tells the flowtable
-@@ -253,18 +284,22 @@
+@@ -253,18 +284,22 @@ static const struct rhashtable_params pp
   * @nexthop_pool: Refcounted nexthop table allocator.
   * @pub_ip_pool: Refcounted public IP address table allocator.
   * @flow_table: Offloaded flows, keyed by TC flow cookie.
@@ -180,7 +180,7 @@ Signed-off-by: Kamil Bienkiewicz <perceivalpercy@gmail.com>
   * @lock: Serializes the whole replace/destroy sequence -- looking up
   * @flow_table, allocating from the pools, and programming hardware --
   * against concurrent calls for different flows, mirroring
-@@ -289,6 +324,7 @@
+@@ -289,6 +324,7 @@ struct ppe_offload_priv {
  	struct rhashtable flow_table;
  	struct ppe_offload_flow_entry **flow_owner;
  	bool tcp_exceptions_ok;
@@ -188,7 +188,7 @@ Signed-off-by: Kamil Bienkiewicz <perceivalpercy@gmail.com>
  	struct mutex lock;
  	DECLARE_HASHTABLE(dsa_fixed_ht, 9);
  	spinlock_t dsa_fixed_lock; /* see @dsa_fixed_ht */
-@@ -671,6 +707,136 @@
+@@ -671,6 +707,136 @@ static struct net_device *ppe_offload_in
  	return dev;
  }
  
@@ -325,7 +325,7 @@ Signed-off-by: Kamil Bienkiewicz <perceivalpercy@gmail.com>
  static int ppe_offload_flow_replace(struct net_device *netdev,
  				     struct ppe_offload_priv *priv,
  				     struct flow_cls_offload *cls)
-@@ -681,28 +847,37 @@
+@@ -681,28 +847,37 @@ static int ppe_offload_flow_replace(stru
  	struct flow_rule *rule = flow_cls_offload_flow_rule(cls);
  	struct ppe_offload_flow_entry *entry;
  	struct ppe_host_ipv4_entry host_ipv4;
@@ -367,7 +367,7 @@ Signed-off-by: Kamil Bienkiewicz <perceivalpercy@gmail.com>
  	u8 ip_proto;
  	int action;
  	const char *stage = NULL;
-@@ -710,32 +885,71 @@
+@@ -710,32 +885,71 @@ static int ppe_offload_flow_replace(stru
  
  	if (!flow_rule_match_key(rule, FLOW_DISSECTOR_KEY_CONTROL) ||
  	    !flow_rule_match_key(rule, FLOW_DISSECTOR_KEY_BASIC) ||
@@ -452,7 +452,7 @@ Signed-off-by: Kamil Bienkiewicz <perceivalpercy@gmail.com>
  		switch (basic.key->ip_proto) {
  		case IPPROTO_TCP:
  			/* Fail closed. Keyed on the protocol, not on the presence of
-@@ -759,9 +973,8 @@
+@@ -759,9 +973,8 @@ static int ppe_offload_flow_replace(stru
  			return ppe_offload_decline("ip_proto=%d unsupported", basic.key->ip_proto);
  		}
  
@@ -464,7 +464,7 @@ Signed-off-by: Kamil Bienkiewicz <perceivalpercy@gmail.com>
  
  		flow_rule_match_ports(rule, &ports);
  		match_sport = ports.key->src;
-@@ -878,13 +1091,19 @@
+@@ -878,13 +1091,19 @@ static int ppe_offload_flow_replace(stru
  		 * otherwise be translated and delivered where software would
  		 * drop it.
  		 */
@@ -486,7 +486,7 @@ Signed-off-by: Kamil Bienkiewicz <perceivalpercy@gmail.com>
  	rcu_read_unlock();
  
  	if (ingress_vlan_bad)
-@@ -920,6 +1139,8 @@
+@@ -920,6 +1139,8 @@ static int ppe_offload_flow_replace(stru
  					return ret;
  				break;
  			case FLOW_ACT_MANGLE_HDR_TYPE_IP4:
@@ -495,7 +495,7 @@ Signed-off-by: Kamil Bienkiewicz <perceivalpercy@gmail.com>
  				if (act->mangle.offset == offsetof(struct iphdr, saddr))
  					new_src = ppe_offload_apply_ip4_mangle(new_src, act);
  				else if (act->mangle.offset == offsetof(struct iphdr, daddr))
-@@ -928,6 +1149,14 @@
+@@ -928,6 +1149,14 @@ static int ppe_offload_flow_replace(stru
  					return ppe_offload_decline("ip4 mangle offset=%u unsupported",
  								    act->mangle.offset);
  				break;
@@ -510,7 +510,7 @@ Signed-off-by: Kamil Bienkiewicz <perceivalpercy@gmail.com>
  			case FLOW_ACT_MANGLE_HDR_TYPE_TCP:
  			case FLOW_ACT_MANGLE_HDR_TYPE_UDP:
  				ret = ppe_offload_apply_l4_mangle(&l4, act);
-@@ -981,6 +1210,24 @@
+@@ -981,6 +1210,24 @@ static int ppe_offload_flow_replace(stru
  	if (!odev || !eth.seen)
  		return ppe_offload_decline("odev=%d eth.seen=%d", !!odev, eth.seen);
  
@@ -535,7 +535,7 @@ Signed-off-by: Kamil Bienkiewicz <perceivalpercy@gmail.com>
  	if (vlan_pops != !!ingress_vlan_vid)
  		return ppe_offload_decline("%u vlan pops for %s ingress tag", vlan_pops,
  					    ingress_vlan_vid ? "one" : "no");
-@@ -1072,9 +1319,11 @@
+@@ -1072,9 +1319,11 @@ static int ppe_offload_flow_replace(stru
  	 * a masquerade, DNAT its reply (and either direction of a port
  	 * forward, which is the same two shapes the other way round). Both
  	 * ends changing (hairpin NAT) or neither (plain routing) is declined
@@ -549,7 +549,7 @@ Signed-off-by: Kamil Bienkiewicz <perceivalpercy@gmail.com>
  		snat = true;
  	} else if (new_dst != match_dst && new_src == match_src && l4.source == match_sport) {
  		if (!dst_on_ingress)
-@@ -1131,11 +1380,12 @@
+@@ -1131,11 +1380,12 @@ static int ppe_offload_flow_replace(stru
  			stage = "pub_ip";
  			goto unlock;
  		}
@@ -563,7 +563,7 @@ Signed-off-by: Kamil Bienkiewicz <perceivalpercy@gmail.com>
  	 */
  	memset(&nexthop, 0, sizeof(nexthop));
  	nexthop.port_valid = true;
-@@ -1150,7 +1400,7 @@
+@@ -1150,7 +1400,7 @@ static int ppe_offload_flow_replace(stru
  	memcpy(nexthop.dmac, eth.bytes, ETH_ALEN);
  	if (snat)
  		nexthop.pub_addr_index = pub_ip_index;
@@ -572,7 +572,7 @@ Signed-off-by: Kamil Bienkiewicz <perceivalpercy@gmail.com>
  		nexthop.dnat_ip = new_dst;
  	nexthop.stag_fmt = egress.stag;
  	nexthop.svid = egress.svid;
-@@ -1177,58 +1427,100 @@
+@@ -1177,58 +1427,100 @@ static int ppe_offload_flow_replace(stru
  	 * stays on the software path (see the log note at the end). The
  	 * WAN mark is per address: an address that is the source of both
  	 * shapes (a routed segment that port-forwards without masquerade)
@@ -709,7 +709,7 @@ Signed-off-by: Kamil Bienkiewicz <perceivalpercy@gmail.com>
  	entry = kzalloc(sizeof(*entry), GFP_KERNEL);
  	if (!entry) {
  		ret = -ENOMEM;
-@@ -1238,10 +1527,12 @@
+@@ -1238,10 +1530,12 @@ static int ppe_offload_flow_replace(stru
  
  	entry->cookie = cls->cookie;
  	entry->flow_index = flow_index;
@@ -723,7 +723,7 @@ Signed-off-by: Kamil Bienkiewicz <perceivalpercy@gmail.com>
  	entry->flow_valid = true;
  
  	ret = rhashtable_insert_fast(&priv->flow_table, &entry->node, ppe_offload_flow_ht_params);
-@@ -1251,7 +1542,7 @@
+@@ -1251,7 +1545,7 @@ static int ppe_offload_flow_replace(stru
  	}
  
  	entry->lastused = jiffies;
@@ -732,7 +732,7 @@ Signed-off-by: Kamil Bienkiewicz <perceivalpercy@gmail.com>
  
  	/* An unbridged port has no FDB to move the client with. */
  	if (egress.dsa_fixed && egress.bridge_ifindex) {
-@@ -1262,7 +1553,10 @@
+@@ -1262,7 +1556,10 @@ static int ppe_offload_flow_replace(stru
  		entry->dsa_index = egress.dsa_index;
  		ether_addr_copy(entry->dmac, eth.bytes);
  		entry->nexthop = nexthop;
@@ -744,7 +744,7 @@ Signed-off-by: Kamil Bienkiewicz <perceivalpercy@gmail.com>
  		spin_lock_bh(&priv->dsa_fixed_lock);
  		hash_add(priv->dsa_fixed_ht, &entry->dsa_fixed_hnode,
  			 ether_addr_to_u64(entry->dmac));
-@@ -1271,10 +1565,16 @@
+@@ -1271,10 +1568,16 @@ static int ppe_offload_flow_replace(stru
  
  	mutex_unlock(&priv->lock);
  
@@ -765,7 +765,7 @@ Signed-off-by: Kamil Bienkiewicz <perceivalpercy@gmail.com>
  
  	return 0;
  
-@@ -1287,7 +1587,7 @@
+@@ -1287,7 +1590,7 @@ deref_host:
  deref_nexthop:
  	ppe_nexthop_pool_deref(priv->ppe_dev, &priv->nexthop_pool, nexthop_index);
  deref_pub_ip:
@@ -774,7 +774,7 @@ Signed-off-by: Kamil Bienkiewicz <perceivalpercy@gmail.com>
  		ppe_pub_ip_pool_deref(priv->ppe_dev, &priv->pub_ip_pool, pub_ip_index);
  unlock:
  	mutex_unlock(&priv->lock);
-@@ -1309,6 +1609,9 @@
+@@ -1309,6 +1612,9 @@ unlock:
  		 */
  		if (ret == -EIO && !strcmp(stage, "host"))
  			pr_info_once("ppe_offload: host table add failed (full?), flows stay in software\n");
@@ -784,7 +784,7 @@ Signed-off-by: Kamil Bienkiewicz <perceivalpercy@gmail.com>
  		else if (ret == -ENOSPC)
  			pr_info_once("ppe_offload: %s table full, flows stay in software\n",
  				     stage);
-@@ -1338,22 +1641,11 @@
+@@ -1338,22 +1644,11 @@ static int ppe_offload_flow_destroy(stru
  		spin_unlock_bh(&priv->dsa_fixed_lock);
  	}
  
@@ -811,7 +811,7 @@ Signed-off-by: Kamil Bienkiewicz <perceivalpercy@gmail.com>
  	if (entry->flow_valid)
  		ppe_flow_entry_del(priv->ppe_dev, entry->flow_index);
  	ppe_host_pool_deref(priv->ppe_dev, &priv->host_pool, entry->host_index);
-@@ -1438,8 +1730,7 @@
+@@ -1438,8 +1733,7 @@ static void ppe_offload_flow_forget(stru
  		hash_del(&entry->dsa_fixed_hnode);
  		spin_unlock_bh(&priv->dsa_fixed_lock);
  	}
@@ -821,7 +821,7 @@ Signed-off-by: Kamil Bienkiewicz <perceivalpercy@gmail.com>
  	ppe_host_pool_deref(priv->ppe_dev, &priv->host_pool, entry->host_index);
  	ppe_nexthop_pool_deref(priv->ppe_dev, &priv->nexthop_pool, entry->nexthop_index);
  	if (entry->pub_ip_valid)
-@@ -1467,10 +1758,12 @@
+@@ -1467,10 +1761,12 @@ static int ppe_offload_flow_repoint(stru
  				    struct ppe_offload_flow_entry *entry,
  				    const struct dsa_port *dp, const struct net_device *dev)
  {
@@ -836,7 +836,7 @@ Signed-off-by: Kamil Bienkiewicz <perceivalpercy@gmail.com>
  	u32 nexthop_index;
  	int ret;
  
-@@ -1480,20 +1773,29 @@
+@@ -1480,20 +1776,29 @@ static int ppe_offload_flow_repoint(stru
  	if (ret)
  		return ret;
  
@@ -872,7 +872,7 @@ Signed-off-by: Kamil Bienkiewicz <perceivalpercy@gmail.com>
  		entry->flow_valid = false;
  		ppe_nexthop_pool_deref(priv->ppe_dev, &priv->nexthop_pool, nexthop_index);
  		ppe_offload_flow_forget(priv, entry);
-@@ -1503,7 +1805,10 @@
+@@ -1503,7 +1808,10 @@ static int ppe_offload_flow_repoint(stru
  	ppe_nexthop_pool_deref(priv->ppe_dev, &priv->nexthop_pool, entry->nexthop_index);
  	entry->nexthop_index = nexthop_index;
  	entry->nexthop = nexthop;
@@ -884,7 +884,7 @@ Signed-off-by: Kamil Bienkiewicz <perceivalpercy@gmail.com>
  	/* The notifier reads this under dsa_fixed_lock only. */
  	WRITE_ONCE(entry->dsa_ifindex, dev->ifindex);
  	entry->dsa_index = dp->index;
-@@ -2079,18 +2384,18 @@
+@@ -2079,18 +2387,18 @@ static int ppe_offload_tcp_exception_slo
  	return regmap_update_bits(ppe_dev->regmap, addr, mask, val);
  }
  
@@ -909,7 +909,7 @@ Signed-off-by: Kamil Bienkiewicz <perceivalpercy@gmail.com>
  	int ret;
  
  	ret = regmap_update_bits(ppe_dev->regmap,
-@@ -2099,7 +2404,7 @@
+@@ -2099,7 +2407,7 @@ static int ppe_offload_tcp_exception_act
  				  PPE_L3_EXCEPTION_CMD_CMD | PPE_L3_EXCEPTION_CMD_DE_ACCE,
  				  FIELD_PREP(PPE_L3_EXCEPTION_CMD_CMD,
  					      PPE_L3_EXCEPTION_REDIRECT_TO_CPU) |
@@ -918,7 +918,7 @@ Signed-off-by: Kamil Bienkiewicz <perceivalpercy@gmail.com>
  	if (ret)
  		return ret;
  
-@@ -2132,6 +2437,78 @@
+@@ -2132,6 +2440,78 @@ static int ppe_offload_tcp_exception_act
  				   PPE_L3_FLOW_HIT_MISS_EXP_CTRL_EXCEP_EN, 0);
  }
  
@@ -997,7 +997,7 @@ Signed-off-by: Kamil Bienkiewicz <perceivalpercy@gmail.com>
  /**
   * ppe_offload_tcp_exception_init() - Program the TCP control-flag exceptions.
   * @ppe_dev: PPE device.
-@@ -2159,7 +2536,9 @@
+@@ -2159,7 +2539,9 @@ static bool ppe_offload_tcp_exception_in
  		ret = ppe_offload_tcp_exception_slot(ppe_dev, i,
  						      ppe_offload_tcp_exception_flags[i]);
  		if (!ret)
@@ -1008,7 +1008,7 @@ Signed-off-by: Kamil Bienkiewicz <perceivalpercy@gmail.com>
  		if (ret) {
  			dev_err(ppe_dev->dev,
  				"failed to program TCP exception slot %u: %d\n", i, ret);
-@@ -2208,64 +2587,91 @@
+@@ -2208,64 +2590,91 @@ static bool ppe_offload_tcp_exception_in
  			return false;
  		}
  
@@ -1144,7 +1144,7 @@ Signed-off-by: Kamil Bienkiewicz <perceivalpercy@gmail.com>
  }
  
  /**
-@@ -2341,6 +2747,7 @@
+@@ -2341,6 +2750,7 @@ void ppe_offload_hw_init(struct ppe_devi
  		return;
  
  	priv->tcp_exceptions_ok = ppe_offload_tcp_exception_init(ppe_dev);
@@ -1152,7 +1152,7 @@ Signed-off-by: Kamil Bienkiewicz <perceivalpercy@gmail.com>
  }
  
  /* Free one tracked flow during teardown, removing whatever it still owns in
-@@ -2354,8 +2761,7 @@
+@@ -2354,8 +2764,7 @@ static void ppe_offload_flow_free_fn(voi
  
  	if (entry->dsa_fixed)
  		hash_del(&entry->dsa_fixed_hnode);
@@ -1164,7 +1164,7 @@ Signed-off-by: Kamil Bienkiewicz <perceivalpercy@gmail.com>
  	ppe_host_pool_deref(priv->ppe_dev, &priv->host_pool, entry->host_index);
 --- a/drivers/net/ethernet/qualcomm/ppe/edma_port.c
 +++ b/drivers/net/ethernet/qualcomm/ppe/edma_port.c
-@@ -800,6 +800,7 @@
+@@ -800,6 +800,7 @@ static void edma_port_l3_if_update(struc
  	in.mtu_ipv6 = mtu;
  	in.mac_bitmap = BIT(my_mac);
  	in.ipv4_uc_route_en = true;
@@ -1174,7 +1174,7 @@ Signed-off-by: Kamil Bienkiewicz <perceivalpercy@gmail.com>
  	 */
 --- a/drivers/net/ethernet/qualcomm/ppe/ppe_flow.c
 +++ b/drivers/net/ethernet/qualcomm/ppe/ppe_flow.c
-@@ -187,7 +187,9 @@
+@@ -187,7 +187,9 @@ int ppe_flow_counter_clear(struct ppe_de
   * ppe_flow_entry_add() - Add (or overwrite) a PPE flow table entry.
   * @ppe_dev: PPE device.
   * @mode: Hash-based or caller-indexed entry placement.
@@ -1185,7 +1185,7 @@ Signed-off-by: Kamil Bienkiewicz <perceivalpercy@gmail.com>
   * @index: In PPE_FLOW_OP_MODE_INDEX, the entry index to write to (input).
   * On success, always holds the entry's final hardware index: unchanged
   * for PPE_FLOW_OP_MODE_INDEX, hardware-assigned for PPE_FLOW_OP_MODE_HASH.
-@@ -195,14 +197,17 @@
+@@ -195,14 +197,17 @@ int ppe_flow_counter_clear(struct ppe_de
   * Return: 0 on success, a negative error code on failure.
   */
  int ppe_flow_entry_add(struct ppe_device *ppe_dev, enum ppe_flow_op_mode mode,
@@ -1245,7 +1245,7 @@ Signed-off-by: Kamil Bienkiewicz <perceivalpercy@gmail.com>
  
  /**
   * enum ppe_flow_op_mode - PPE flow table addressing mode.
-@@ -36,7 +49,7 @@
+@@ -36,7 +49,7 @@ int ppe_flow_counter_get(struct ppe_devi
  			 u64 *packets, u64 *bytes);
  int ppe_flow_counter_clear(struct ppe_device *ppe_dev, u32 index);
  int ppe_flow_entry_add(struct ppe_device *ppe_dev, enum ppe_flow_op_mode mode,
@@ -1278,7 +1278,7 @@ Signed-off-by: Kamil Bienkiewicz <perceivalpercy@gmail.com>
  {
  	u32 ip = be32_to_cpu(entry->match_ip);
  
-@@ -73,15 +73,15 @@
+@@ -73,15 +73,15 @@ void ppe_flow_ipv4_nat_entry_encode(cons
  
  /**
   * ppe_flow_ipv4_nat_entry_decode() - Unpack an IPv4 SNAT or DNAT flow entry.
@@ -1299,7 +1299,7 @@ Signed-off-by: Kamil Bienkiewicz <perceivalpercy@gmail.com>
  
 --- a/drivers/net/ethernet/qualcomm/ppe/ppe_flow_ipv4.h
 +++ b/drivers/net/ethernet/qualcomm/ppe/ppe_flow_ipv4.h
-@@ -25,10 +25,9 @@
+@@ -25,10 +25,9 @@ enum ppe_flow_protocol {
   * Hardware field width is 3 bits. The SNAT and DNAT overlays are
   * bit-for-bit identical (the vendor's in_flow_tbl_0 and in_flow_tbl_3
   * differ only in the names of the nexthop and L4 port fields), so one
@@ -1313,7 +1313,7 @@ Signed-off-by: Kamil Bienkiewicz <perceivalpercy@gmail.com>
   */
  enum ppe_flow_fwd_type {
  	PPE_FLOW_FWD_FORWARD = 0,
-@@ -104,8 +103,8 @@
+@@ -104,8 +103,8 @@ struct ppe_flow_ipv4_nat_entry {
  };
  
  void ppe_flow_ipv4_nat_entry_encode(const struct ppe_flow_ipv4_nat_entry *entry,
@@ -1775,7 +1775,7 @@ Signed-off-by: Kamil Bienkiewicz <perceivalpercy@gmail.com>
 +#endif
 --- a/drivers/net/ethernet/qualcomm/Kconfig
 +++ b/drivers/net/ethernet/qualcomm/Kconfig
-@@ -66,6 +66,7 @@
+@@ -66,6 +66,7 @@ config QCOM_PPE
  	depends on NET_DSA || NET_DSA=n
  	depends on BRIDGE || BRIDGE=n
  	depends on VLAN_8021Q || VLAN_8021Q=n

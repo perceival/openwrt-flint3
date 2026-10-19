@@ -14,7 +14,7 @@ Signed-off-by: Kamil Bienkiewicz <perceivalpercy@gmail.com>
 ---
 --- a/drivers/net/ethernet/qualcomm/ppe/ppe_offload.c
 +++ b/drivers/net/ethernet/qualcomm/ppe/ppe_offload.c
-@@ -259,6 +259,7 @@
+@@ -259,6 +259,7 @@ static int ppe_offload_flow_replace(stru
  	unsigned int pmtu;
  	u8 ip_proto;
  	int action;
@@ -22,7 +22,7 @@ Signed-off-by: Kamil Bienkiewicz <perceivalpercy@gmail.com>
  	int ret;
  
  	if (!flow_rule_match_key(rule, FLOW_DISSECTOR_KEY_CONTROL) ||
-@@ -419,14 +420,17 @@
+@@ -419,14 +420,17 @@ static int ppe_offload_flow_replace(stru
  
  	if (rhashtable_lookup_fast(&priv->flow_table, &cls->cookie, ppe_offload_flow_ht_params)) {
  		ret = -EEXIST;
@@ -41,7 +41,7 @@ Signed-off-by: Kamil Bienkiewicz <perceivalpercy@gmail.com>
  
  	/* Nexthop: egress port + resolved next-hop MAC + the public IP
  	 * entry just obtained.
-@@ -450,8 +454,10 @@
+@@ -450,8 +454,10 @@ static int ppe_offload_flow_replace(stru
  
  	ret = ppe_nexthop_pool_get_and_ref(priv->ppe_dev, &priv->nexthop_pool, &nexthop,
  					    &nexthop_index);
@@ -53,7 +53,7 @@ Signed-off-by: Kamil Bienkiewicz <perceivalpercy@gmail.com>
  
  	/* Host entry for the original (pre-NAT) source address -- the
  	 * LAN client, shared across every flow through it.
-@@ -464,8 +470,10 @@
+@@ -464,8 +470,10 @@ static int ppe_offload_flow_replace(stru
  
  	ret = ppe_host_pool_get_and_ref(priv->ppe_dev, &priv->host_pool, PPE_FLOW_OP_MODE_HASH,
  					 host_words, PPE_HOST_TBL_IPV4_ENTRY_WORDS, &host_index);
@@ -65,7 +65,7 @@ Signed-off-by: Kamil Bienkiewicz <perceivalpercy@gmail.com>
  
  	memset(&flow_ipv4, 0, sizeof(flow_ipv4));
  	flow_ipv4.valid = true;
-@@ -483,8 +491,10 @@
+@@ -483,8 +491,10 @@ static int ppe_offload_flow_replace(stru
  
  	flow_index = 0;
  	ret = ppe_flow_entry_add(priv->ppe_dev, PPE_FLOW_OP_MODE_HASH, flow_words, &flow_index);
@@ -77,7 +77,7 @@ Signed-off-by: Kamil Bienkiewicz <perceivalpercy@gmail.com>
  
  	/* HASH mode places this entry purely by hashing its match key, so
  	 * an identical key (e.g. a same-5-tuple reconnect) always lands on
-@@ -503,6 +513,7 @@
+@@ -503,6 +513,7 @@ static int ppe_offload_flow_replace(stru
  	entry = kzalloc(sizeof(*entry), GFP_KERNEL);
  	if (!entry) {
  		ret = -ENOMEM;
@@ -85,7 +85,7 @@ Signed-off-by: Kamil Bienkiewicz <perceivalpercy@gmail.com>
  		goto del_flow;
  	}
  
-@@ -514,8 +525,10 @@
+@@ -514,8 +525,10 @@ static int ppe_offload_flow_replace(stru
  	entry->flow_valid = true;
  
  	ret = rhashtable_insert_fast(&priv->flow_table, &entry->node, ppe_offload_flow_ht_params);
@@ -97,7 +97,7 @@ Signed-off-by: Kamil Bienkiewicz <perceivalpercy@gmail.com>
  
  	priv->flow_owner[flow_index] = entry;
  
-@@ -540,6 +553,9 @@
+@@ -540,6 +553,9 @@ deref_pub_ip:
  unlock:
  	mutex_unlock(&priv->lock);
  

@@ -45,8 +45,8 @@ as a claim that the feature works end-to-end.
 
 Signed-off-by: Kamil Bienkiewicz <perceivalpercy@gmail.com>
 ---
---- a/drivers/net/ethernet/qualcomm/ppe/ppe_offload.c	2026-09-19 12:01:31.317872855 +0200
-+++ b/drivers/net/ethernet/qualcomm/ppe/ppe_offload.c	2026-09-19 12:01:31.318787305 +0200
+--- a/drivers/net/ethernet/qualcomm/ppe/ppe_offload.c
++++ b/drivers/net/ethernet/qualcomm/ppe/ppe_offload.c
 @@ -21,12 +21,20 @@
   *   inbound, which is a real, known limitation of this milestone, not
   *   an oversight.
@@ -74,7 +74,7 @@ Signed-off-by: Kamil Bienkiewicz <perceivalpercy@gmail.com>
   *   mtk_flow_get_dsa_port()) is follow-up work.
   * - The flow must carry a FLOW_ACTION_MANGLE for the Ethernet header:
   *   this is the *only* source this code uses for the nexthop's
-@@ -218,6 +226,8 @@
+@@ -218,6 +226,8 @@ static int ppe_offload_flow_replace(stru
  	u32 host_words[PPE_HOST_TBL_IPV4_ENTRY_WORDS];
  	u32 host_index, nexthop_index, pub_ip_index, flow_index;
  	const struct flow_action_entry *act;
@@ -83,7 +83,7 @@ Signed-off-by: Kamil Bienkiewicz <perceivalpercy@gmail.com>
  	u8 ip_proto;
  	int action;
  	int ret;
-@@ -307,6 +317,15 @@
+@@ -307,6 +317,15 @@ static int ppe_offload_flow_replace(stru
  		case FLOW_ACTION_CSUM:
  			/* Hardware recomputes checksums on rewrite. */
  			break;
@@ -99,7 +99,7 @@ Signed-off-by: Kamil Bienkiewicz <perceivalpercy@gmail.com>
  		default:
  			return ppe_offload_decline("action id=%d unsupported", act->id);
  		}
-@@ -315,6 +334,23 @@
+@@ -315,6 +334,23 @@ static int ppe_offload_flow_replace(stru
  	if (!odev || !eth.seen)
  		return ppe_offload_decline("odev=%d eth.seen=%d", !!odev, eth.seen);
  
@@ -123,7 +123,7 @@ Signed-off-by: Kamil Bienkiewicz <perceivalpercy@gmail.com>
  	if (!edma_port_is_edma_netdev(odev))
  		return ppe_offload_decline("odev=%s not an edma netdev", netdev_name(odev));
  
-@@ -366,6 +402,10 @@
+@@ -366,6 +402,10 @@ static int ppe_offload_flow_replace(stru
  	nexthop.post_l3_if = port_priv->l3_if_index;
  	nexthop.pub_addr_index = pub_ip_index;
  	memcpy(nexthop.dmac, eth.bytes, ETH_ALEN);

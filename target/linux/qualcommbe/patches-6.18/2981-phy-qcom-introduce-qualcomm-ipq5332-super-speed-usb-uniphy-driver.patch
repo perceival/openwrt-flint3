@@ -24,8 +24,6 @@ Signed-off-by: George Moussalem <george.moussalem@outlook.com>
  .../phy/qualcomm/phy-qcom-uniphy-usb-ss-22ull.c    | 275 +++++++++++++++++++++
  3 files changed, 286 insertions(+)
 
-diff --git a/drivers/phy/qualcomm/Kconfig b/drivers/phy/qualcomm/Kconfig
-index 60a0ead127fa..a1b9bbe412aa 100644
 --- a/drivers/phy/qualcomm/Kconfig
 +++ b/drivers/phy/qualcomm/Kconfig
 @@ -168,6 +168,16 @@ config PHY_QCOM_M31_EUSB
@@ -45,11 +43,9 @@ index 60a0ead127fa..a1b9bbe412aa 100644
  config PHY_QCOM_USB_HS
  	tristate "Qualcomm USB HS PHY module"
  	depends on USB_ULPI_BUS
-diff --git a/drivers/phy/qualcomm/Makefile b/drivers/phy/qualcomm/Makefile
-index b71a6a0bed3f..295e8042e3f4 100644
 --- a/drivers/phy/qualcomm/Makefile
 +++ b/drivers/phy/qualcomm/Makefile
-@@ -18,6 +18,7 @@ obj-$(CONFIG_PHY_QCOM_QMP_USB_LEGACY)	+= phy-qcom-qmp-usb-legacy.o
+@@ -18,6 +18,7 @@ obj-$(CONFIG_PHY_QCOM_QMP_USB_LEGACY)	+=
  obj-$(CONFIG_PHY_QCOM_QUSB2)		+= phy-qcom-qusb2.o
  obj-$(CONFIG_PHY_QCOM_EUSB2_REPEATER)	+= phy-qcom-eusb2-repeater.o
  obj-$(CONFIG_PHY_QCOM_UNIPHY_PCIE_28LP)	+= phy-qcom-uniphy-pcie-28lp.o
@@ -57,9 +53,6 @@ index b71a6a0bed3f..295e8042e3f4 100644
  obj-$(CONFIG_PHY_QCOM_USB_HS) 		+= phy-qcom-usb-hs.o
  obj-$(CONFIG_PHY_QCOM_USB_HSIC) 	+= phy-qcom-usb-hsic.o
  obj-$(CONFIG_PHY_QCOM_USB_HS_28NM)	+= phy-qcom-usb-hs-28nm.o
-diff --git a/drivers/phy/qualcomm/phy-qcom-uniphy-usb-ss-22ull.c b/drivers/phy/qualcomm/phy-qcom-uniphy-usb-ss-22ull.c
-new file mode 100644
-index 000000000000..779617193aaf
 --- /dev/null
 +++ b/drivers/phy/qualcomm/phy-qcom-uniphy-usb-ss-22ull.c
 @@ -0,0 +1,275 @@
@@ -338,6 +331,3 @@ index 000000000000..779617193aaf
 +
 +MODULE_DESCRIPTION("Qualcomm UNIPHY Super-Speed USB PHY driver");
 +MODULE_LICENSE("GPL");
-
--- 
-2.53.0

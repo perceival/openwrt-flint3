@@ -28,7 +28,7 @@ Signed-off-by: Francois Guerraz <kubrick@fgv6.net>
 ---
 --- a/drivers/net/ethernet/qualcomm/ppe/edma_cfg_rx.c
 +++ b/drivers/net/ethernet/qualcomm/ppe/edma_cfg_rx.c
-@@ -922,7 +922,6 @@ void edma_cfg_rx_napi_delete(void)
+@@ -927,7 +927,6 @@ void edma_cfg_rx_napi_delete(void)
  		if (!rxdesc_ring->napi_added)
  			continue;
  

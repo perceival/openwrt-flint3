@@ -23,7 +23,7 @@ Signed-off-by: Kamil Bienkiewicz <perceivalpercy@gmail.com>
 ---
 --- a/drivers/net/ethernet/qualcomm/ppe/ppe_offload.c
 +++ b/drivers/net/ethernet/qualcomm/ppe/ppe_offload.c
-@@ -273,6 +273,11 @@
+@@ -273,6 +273,11 @@ struct ppe_offload_flow_entry {
  	 */
  	u64 refresh_packets;
  	bool refresh_seen;
@@ -35,7 +35,7 @@ Signed-off-by: Kamil Bienkiewicz <perceivalpercy@gmail.com>
  };
  
  static const struct rhashtable_params ppe_offload_flow_ht_params = {
-@@ -1769,6 +1774,11 @@
+@@ -1769,6 +1774,11 @@ static int ppe_offload_flow_destroy(stru
   * dropped, and the next learn of the address re-arms it.
   */
  #define PPE_OFFLOAD_FDB_MOVES_MAX	64
@@ -47,7 +47,7 @@ Signed-off-by: Kamil Bienkiewicz <perceivalpercy@gmail.com>
  
  struct ppe_offload_fdb_move {
  	struct work_struct work;
-@@ -1889,7 +1899,7 @@
+@@ -1889,7 +1899,7 @@ static void ppe_offload_fdb_move_work(st
  	struct ppe_offload_fdb_move *move = container_of(work, struct ppe_offload_fdb_move, work);
  	struct ppe_offload_priv *priv = move->priv;
  	struct ppe_offload_flow_entry *entry;
@@ -56,7 +56,7 @@ Signed-off-by: Kamil Bienkiewicz <perceivalpercy@gmail.com>
  	struct edma_port_priv *port_priv;
  	struct net_device *bridge;
  	struct net_device *conduit;
-@@ -1940,6 +1950,26 @@
+@@ -1940,6 +1950,26 @@ static void ppe_offload_fdb_move_work(st
  		    !ether_addr_equal(entry->dmac, move->addr))
  			continue;
  
@@ -83,7 +83,7 @@ Signed-off-by: Kamil Bienkiewicz <perceivalpercy@gmail.com>
  		if (ppe_offload_flow_repoint(priv, entry, dp, move->dev))
  			failed++;
  		else
-@@ -1951,9 +1981,9 @@
+@@ -1951,9 +1981,9 @@ static void ppe_offload_fdb_move_work(st
  	/* A MAC flapping between two ports (a loop, a misbehaving client)
  	 * would otherwise turn this into a log storm.
  	 */

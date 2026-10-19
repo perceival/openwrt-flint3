@@ -31,7 +31,7 @@ Signed-off-by: Kamil Bienkiewicz <perceivalpercy@gmail.com>
  #define PPE_L3_VP_PORT_TBL_L3_IF_VALID		BIT(0)
 --- a/drivers/net/ethernet/qualcomm/ppe/ppe_l3_if.c
 +++ b/drivers/net/ethernet/qualcomm/ppe/ppe_l3_if.c
-@@ -247,19 +247,37 @@
+@@ -247,19 +247,37 @@ int ppe_my_mac_entry_set(struct ppe_devi
  int ppe_l3_if_port_bind(struct ppe_device *ppe_dev, u32 port_id,
  			 u32 l3_if_index, bool valid)
  {

@@ -53,11 +53,9 @@ Signed-off-by: Daniel Golle <daniel@makrotopia.org>
  drivers/net/ethernet/mediatek/mtk_eth_soc.c | 56 ++++++++++++++++++++-
  drivers/net/ethernet/mediatek/mtk_eth_soc.h | 10 ++++
  2 files changed, 65 insertions(+), 1 deletion(-)
-diff --git a/drivers/net/ethernet/mediatek/mtk_eth_soc.c b/drivers/net/ethernet/mediatek/mtk_eth_soc.c
-index 0ae3dae..67b75af 100644
 --- a/drivers/net/ethernet/mediatek/mtk_eth_soc.c
 +++ b/drivers/net/ethernet/mediatek/mtk_eth_soc.c
-@@ -3773,6 +3773,48 @@ static bool mtk_uses_dsa(struct net_device *dev)
+@@ -3773,6 +3773,48 @@ static bool mtk_uses_dsa(struct net_devi
  #endif
  }
  
@@ -106,7 +104,7 @@ index 0ae3dae..67b75af 100644
  static int mtk_device_event(struct notifier_block *n, unsigned long event, void *ptr)
  {
  	struct mtk_mac *mac = container_of(n, struct mtk_mac, device_notifier);
-@@ -3797,6 +3839,8 @@ static int mtk_device_event(struct notifier_block *n, unsigned long event, void
+@@ -3797,6 +3839,8 @@ found:
  	if (!dsa_user_dev_check(dev))
  		return NOTIFY_DONE;
  
@@ -115,7 +113,7 @@ index 0ae3dae..67b75af 100644
  	if (__ethtool_get_link_ksettings(dev, &s))
  		return NOTIFY_DONE;
  
-@@ -5116,6 +5160,16 @@ static int mtk_add_mac(struct mtk_eth *eth, struct device_node *np)
+@@ -5116,6 +5160,16 @@ static int mtk_add_mac(struct mtk_eth *e
  	mac->hw = eth;
  	mac->of_node = np;
  
@@ -132,8 +130,6 @@ index 0ae3dae..67b75af 100644
  	memset(mac->hwlro_ip, 0, sizeof(mac->hwlro_ip));
  	mac->hwlro_ip_cnt = 0;
  
-diff --git a/drivers/net/ethernet/mediatek/mtk_eth_soc.h b/drivers/net/ethernet/mediatek/mtk_eth_soc.h
-index 7920a9f..f6b4fec 100644
 --- a/drivers/net/ethernet/mediatek/mtk_eth_soc.h
 +++ b/drivers/net/ethernet/mediatek/mtk_eth_soc.h
 @@ -25,6 +25,14 @@

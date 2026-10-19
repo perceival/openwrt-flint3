@@ -27,11 +27,9 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
  net/bridge/br_multicast.c | 23 ++++++++++++++++++-----
  1 file changed, 18 insertions(+), 5 deletions(-)
 
-diff --git a/net/bridge/br_multicast.c b/net/bridge/br_multicast.c
-index fda1f89ee22ae..78682aace574e 100644
 --- a/net/bridge/br_multicast.c
 +++ b/net/bridge/br_multicast.c
-@@ -81,6 +81,10 @@ __br_multicast_add_group(struct net_bridge_mcast *brmctx,
+@@ -81,6 +81,10 @@ __br_multicast_add_group(struct net_brid
  			 bool blocked);
  static void br_multicast_find_del_pg(struct net_bridge *br,
  				     struct net_bridge_port_group *pg);
@@ -42,7 +40,7 @@ index fda1f89ee22ae..78682aace574e 100644
  static void __br_multicast_stop(struct net_bridge_mcast *brmctx);
  
  static int br_mc_disabled_update(struct net_device *dev, bool value,
-@@ -458,7 +462,7 @@ static void br_multicast_sg_del_exclude_ports(struct net_bridge_mdb_entry *sgmp)
+@@ -458,7 +462,7 @@ static void br_multicast_sg_del_exclude_
  	for (pp = &sgmp->ports;
  	     (p = mlock_dereference(*pp, sgmp->br)) != NULL;) {
  		if (!(p->flags & MDB_PG_FLAGS_PERMANENT))
@@ -51,7 +49,7 @@ index fda1f89ee22ae..78682aace574e 100644
  		else
  			pp = &p->next;
  	}
-@@ -799,9 +803,10 @@ static void br_multicast_destroy_port_group(struct net_bridge_mcast_gc *gc)
+@@ -799,9 +803,10 @@ static void br_multicast_destroy_port_gr
  	kfree_rcu(pg, rcu);
  }
  
@@ -65,7 +63,7 @@ index fda1f89ee22ae..78682aace574e 100644
  {
  	struct net_bridge *br = pg->key.port->br;
  	struct net_bridge_group_src *ent;
-@@ -816,7 +821,8 @@ void br_multicast_del_pg(struct net_bridge_mdb_entry *mp,
+@@ -816,7 +821,8 @@ void br_multicast_del_pg(struct net_brid
  	if (!br_multicast_is_star_g(&mp->addr)) {
  		rhashtable_remove_fast(&br->sg_port_tbl, &pg->rhnode,
  				       br_sg_port_rht_params);
@@ -75,7 +73,7 @@ index fda1f89ee22ae..78682aace574e 100644
  	} else {
  		br_multicast_star_g_handle_mode(pg, MCAST_INCLUDE);
  	}
-@@ -828,6 +834,13 @@ void br_multicast_del_pg(struct net_bridge_mdb_entry *mp,
+@@ -828,6 +834,13 @@ void br_multicast_del_pg(struct net_brid
  		mod_timer(&mp->timer, jiffies);
  }
  

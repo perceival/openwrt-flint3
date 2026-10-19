@@ -28,7 +28,7 @@ Signed-off-by: Francois Guerraz <kubrick@fgv6.net>
 ---
 --- a/drivers/net/ethernet/qualcomm/ppe/edma_cfg_rx.c
 +++ b/drivers/net/ethernet/qualcomm/ppe/edma_cfg_rx.c
-@@ -581,7 +581,7 @@ static int edma_cfg_rx_rings_setup(void)
+@@ -586,7 +586,7 @@ static int edma_cfg_rx_rings_setup(void)
  		if (ret) {
  			pr_err("Error in setting up %d rxfill ring. ret: %d",
  			       rxfill_ring->ring_id, ret);
@@ -37,7 +37,7 @@ Signed-off-by: Francois Guerraz <kubrick@fgv6.net>
  				edma_cfg_rx_fill_ring_cleanup(&edma_ctx->rxfill_rings[ring_idx]);
  
  			return -ENOMEM;
-@@ -600,7 +600,7 @@ static int edma_cfg_rx_rings_setup(void)
+@@ -605,7 +605,7 @@ static int edma_cfg_rx_rings_setup(void)
  
  		if (queue_id > EDMA_CPU_PORT_QUEUE_MAX(EDMA_RX_QUEUE_START)) {
  			pr_err("Invalid queue_id: %d\n", queue_id);
@@ -46,7 +46,7 @@ Signed-off-by: Francois Guerraz <kubrick@fgv6.net>
  				edma_cfg_rx_desc_ring_cleanup(&edma_ctx->rx_rings[ring_idx]);
  
  			goto rxdesc_mem_alloc_fail;
-@@ -619,7 +619,7 @@ static int edma_cfg_rx_rings_setup(void)
+@@ -624,7 +624,7 @@ static int edma_cfg_rx_rings_setup(void)
  		if (ret) {
  			pr_err("Error in setting up %d rxdesc ring. ret: %d",
  			       rxdesc_ring->ring_id, ret);

@@ -19,7 +19,7 @@ Signed-off-by: Kamil Bienkiewicz <perceivalpercy@gmail.com>
 ---
 --- a/drivers/net/ethernet/qualcomm/ppe/ppe_offload.c
 +++ b/drivers/net/ethernet/qualcomm/ppe/ppe_offload.c
-@@ -743,7 +743,15 @@
+@@ -743,7 +743,15 @@ deref_pub_ip:
  unlock:
  	mutex_unlock(&priv->lock);
  

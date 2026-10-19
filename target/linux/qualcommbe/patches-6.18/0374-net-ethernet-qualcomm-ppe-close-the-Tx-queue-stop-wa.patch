@@ -34,7 +34,7 @@ Signed-off-by: Kamil Bienkiewicz <perceivalpercy@gmail.com>
 ---
 --- a/drivers/net/ethernet/qualcomm/ppe/edma_port.c
 +++ b/drivers/net/ethernet/qualcomm/ppe/edma_port.c
-@@ -220,12 +220,30 @@
+@@ -220,12 +220,30 @@ static netdev_tx_t edma_port_xmit(struct
  
  		if (unlikely(ret == EDMA_TX_FAIL_NO_DESC)) {
  			if (likely(!edma_ctx->tx_requeue_stop)) {
@@ -68,7 +68,7 @@ Signed-off-by: Kamil Bienkiewicz <perceivalpercy@gmail.com>
  		}
 --- a/drivers/net/ethernet/qualcomm/ppe/edma_tx.c
 +++ b/drivers/net/ethernet/qualcomm/ppe/edma_tx.c
-@@ -220,6 +220,13 @@
+@@ -220,6 +220,13 @@ u32 edma_tx_complete(u32 work_to_do, str
  	 * other stopped queue stopped forever once its ring fills.
  	 */
  	if (unlikely(!edma_ctx->tx_requeue_stop)) {
@@ -82,7 +82,7 @@ Signed-off-by: Kamil Bienkiewicz <perceivalpercy@gmail.com>
  		queue_id = (txcmpl_ring->id - edma_ctx->hw_info->txcmpl->ring_start) %
  			   num_possible_cpus();
  		nq = netdev_get_tx_queue(txcmpl_ring->napi.dev, queue_id);
-@@ -666,6 +673,24 @@
+@@ -666,6 +673,24 @@ static u32 edma_tx_avail_desc(struct edm
  }
  
  /**
@@ -109,7 +109,7 @@ Signed-off-by: Kamil Bienkiewicz <perceivalpercy@gmail.com>
   * @skb: Socket Buffer.
 --- a/drivers/net/ethernet/qualcomm/ppe/edma_tx.h
 +++ b/drivers/net/ethernet/qualcomm/ppe/edma_tx.h
-@@ -296,6 +296,7 @@
+@@ -296,6 +296,7 @@ enum edma_tx_status edma_tx_ring_xmit(st
  				      struct sk_buff *skb,
  			       struct edma_txdesc_ring *txdesc_ring,
  			       struct edma_port_tx_stats *stats);

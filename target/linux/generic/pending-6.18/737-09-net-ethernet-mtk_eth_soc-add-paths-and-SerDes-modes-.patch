@@ -16,11 +16,9 @@ Signed-off-by: Daniel Golle <daniel@makrotopia.org>
  drivers/net/ethernet/mediatek/mtk_eth_soc.c  | 165 +++++++++++++++----
  drivers/net/ethernet/mediatek/mtk_eth_soc.h  |  49 +++++-
  3 files changed, 252 insertions(+), 43 deletions(-)
-diff --git a/drivers/net/ethernet/mediatek/mtk_eth_path.c b/drivers/net/ethernet/mediatek/mtk_eth_path.c
-index b4c01e287..249b2fe7c 100644
 --- a/drivers/net/ethernet/mediatek/mtk_eth_path.c
 +++ b/drivers/net/ethernet/mediatek/mtk_eth_path.c
-@@ -35,8 +35,16 @@ static const char *mtk_eth_path_name(u64 path)
+@@ -35,8 +35,16 @@ static const char *mtk_eth_path_name(u64
  		return "gmac2_2p5gphy";
  	case MTK_ETH_PATH_GMAC2_GEPHY:
  		return "gmac2_gephy";
@@ -37,7 +35,7 @@ index b4c01e287..249b2fe7c 100644
  	default:
  		return "unknown path";
  	}
-@@ -190,7 +198,48 @@ static int set_mux_gmac1_gmac2_to_sgmii_rgmii(struct mtk_eth *eth, u64 path)
+@@ -190,7 +198,48 @@ static int set_mux_gmac1_gmac2_to_sgmii_
  	return 0;
  }
  
@@ -87,7 +85,7 @@ index b4c01e287..249b2fe7c 100644
  {
  	unsigned int val = 0;
  	bool updated = true;
-@@ -207,6 +256,9 @@ static int set_mux_gmac12_to_gephy_sgmii(struct mtk_eth *eth, u64 path)
+@@ -207,6 +256,9 @@ static int set_mux_gmac12_to_gephy_sgmii
  	case MTK_ETH_PATH_GMAC2_SGMII:
  		val |= SYSCFG0_SGMII_GMAC2_V2;
  		break;
@@ -97,7 +95,7 @@ index b4c01e287..249b2fe7c 100644
  	default:
  		updated = false;
  	}
-@@ -245,7 +297,15 @@ static const struct mtk_eth_muxc mtk_eth_muxc[] = {
+@@ -245,7 +297,15 @@ static const struct mtk_eth_muxc mtk_eth
  	}, {
  		.name = "mux_gmac12_to_gephy_sgmii",
  		.cap_bit = MTK_ETH_MUX_GMAC12_TO_GEPHY_SGMII,
@@ -114,7 +112,7 @@ index b4c01e287..249b2fe7c 100644
  	},
  };
  
-@@ -278,12 +338,25 @@ static int mtk_eth_mux_setup(struct mtk_eth *eth, u64 path)
+@@ -278,12 +338,25 @@ out:
  	return err;
  }
  
@@ -142,8 +140,6 @@ index b4c01e287..249b2fe7c 100644
  
  	/* Setup proper MUXes along the path */
  	return mtk_eth_mux_setup(eth, path);
-diff --git a/drivers/net/ethernet/mediatek/mtk_eth_soc.c b/drivers/net/ethernet/mediatek/mtk_eth_soc.c
-index f2a066c54..c287c9708 100644
 --- a/drivers/net/ethernet/mediatek/mtk_eth_soc.c
 +++ b/drivers/net/ethernet/mediatek/mtk_eth_soc.c
 @@ -24,6 +24,8 @@
@@ -155,7 +151,7 @@ index f2a066c54..c287c9708 100644
  #include <linux/jhash.h>
  #include <linux/bitfield.h>
  #include <net/dsa.h>
-@@ -523,23 +525,28 @@ static void mtk_setup_bridge_switch(struct mtk_eth *eth)
+@@ -523,23 +525,28 @@ static void mtk_setup_bridge_switch(stru
  		MTK_GSW_CFG);
  }
  
@@ -197,7 +193,7 @@ index f2a066c54..c287c9708 100644
  }
  
  static int mtk_mac_prepare(struct phylink_config *config, unsigned int mode,
-@@ -600,6 +607,15 @@ static void mtk_mac_config(struct phylink_config *config, unsigned int mode,
+@@ -600,6 +607,15 @@ static void mtk_mac_config(struct phylin
  					goto init_err;
  			}
  			break;
@@ -213,7 +209,7 @@ index f2a066c54..c287c9708 100644
  		case PHY_INTERFACE_MODE_INTERNAL:
  			if (mac->id == MTK_GMAC2_ID &&
  			    MTK_HAS_CAPS(eth->soc->caps, MTK_2P5GPHY)) {
-@@ -653,8 +669,6 @@ static void mtk_mac_config(struct phylink_config *config, unsigned int mode,
+@@ -653,8 +669,6 @@ static void mtk_mac_config(struct phylin
  		val &= ~SYSCFG0_GE_MODE(SYSCFG0_GE_MASK, mac->id);
  		val |= SYSCFG0_GE_MODE(ge_mode, mac->id);
  		regmap_write(eth->ethsys, ETHSYS_SYSCFG0, val);
@@ -222,7 +218,7 @@ index f2a066c54..c287c9708 100644
  	}
  
  	/* SGMII */
-@@ -671,9 +685,12 @@ static void mtk_mac_config(struct phylink_config *config, unsigned int mode,
+@@ -671,9 +685,12 @@ static void mtk_mac_config(struct phylin
  
  		/* Save the syscfg0 value for mac_finish */
  		mac->syscfg0 = val;
@@ -237,7 +233,7 @@ index f2a066c54..c287c9708 100644
  		return;
  	}
  
-@@ -684,8 +701,22 @@ static void mtk_mac_config(struct phylink_config *config, unsigned int mode,
+@@ -684,8 +701,22 @@ static void mtk_mac_config(struct phylin
  
  		if (mac->id == MTK_GMAC1_ID)
  			mtk_setup_bridge_switch(eth);
@@ -260,7 +256,7 @@ index f2a066c54..c287c9708 100644
  	return;
  
  err_phy:
-@@ -736,6 +767,9 @@ static void mtk_mac_link_down(struct phylink_config *config, unsigned int mode,
+@@ -736,6 +767,9 @@ static void mtk_mac_link_down(struct phy
  		mtk_m32(mac->hw,
  			MAC_MCR_TX_EN | MAC_MCR_RX_EN | MAC_MCR_FORCE_LINK, 0,
  			MTK_MAC_MCR(mac->id));
@@ -270,7 +266,7 @@ index f2a066c54..c287c9708 100644
  	} else if (mac->id != MTK_GMAC1_ID) {
  		/* XGMAC except for built-in switch */
  		mtk_m32(mac->hw, XMAC_MCR_TRX_DISABLE, XMAC_MCR_TRX_DISABLE,
-@@ -954,7 +988,6 @@ static int mtk_mac_enable_tx_lpi(struct phylink_config *config, u32 timer,
+@@ -954,7 +988,6 @@ static int mtk_mac_enable_tx_lpi(struct
  
  static const struct phylink_mac_ops mtk_phylink_ops = {
  	.mac_prepare = mtk_mac_prepare,
@@ -278,7 +274,7 @@ index f2a066c54..c287c9708 100644
  	.mac_config = mtk_mac_config,
  	.mac_finish = mtk_mac_finish,
  	.mac_link_down = mtk_mac_link_down,
-@@ -5011,6 +5044,31 @@ static const struct net_device_ops mtk_netdev_ops = {
+@@ -5011,6 +5044,31 @@ static const struct net_device_ops mtk_n
  	.ndo_select_queue	= mtk_select_queue,
  };
  
@@ -310,7 +306,7 @@ index f2a066c54..c287c9708 100644
  static int mtk_add_mac(struct mtk_eth *eth, struct device_node *np)
  {
  	const struct phylink_mac_ops *mac_ops = &mtk_phylink_ops;
-@@ -5018,7 +5076,7 @@ static int mtk_add_mac(struct mtk_eth *eth, struct device_node *np)
+@@ -5018,7 +5076,7 @@ static int mtk_add_mac(struct mtk_eth *e
  	phy_interface_t phy_mode;
  	struct phylink *phylink;
  	struct mtk_mac *mac;
@@ -319,7 +315,7 @@ index f2a066c54..c287c9708 100644
  	int txqs = 1;
  	u32 val;
  
-@@ -5089,6 +5147,8 @@ static int mtk_add_mac(struct mtk_eth *eth, struct device_node *np)
+@@ -5089,6 +5147,8 @@ static int mtk_add_mac(struct mtk_eth *e
  	/* LPI above 1 Gbps is not supported */
  	mac->phylink_config.lpi_capabilities = MAC_100FD | MAC_1000FD;
  	mac->phylink_config.lpi_timer_default = 1000;
@@ -328,7 +324,7 @@ index f2a066c54..c287c9708 100644
  
  	/* MT7623 gmac0 is now missing its speed-specific PLL configuration
  	 * in its .mac_config method (since state->speed is not valid there.
-@@ -5119,13 +5179,53 @@ static int mtk_add_mac(struct mtk_eth *eth, struct device_node *np)
+@@ -5119,13 +5179,53 @@ static int mtk_add_mac(struct mtk_eth *e
  
  	if (MTK_HAS_CAPS(mac->hw->soc->caps, MTK_SGMII)) {
  		__set_bit(PHY_INTERFACE_MODE_SGMII,
@@ -385,7 +381,7 @@ index f2a066c54..c287c9708 100644
  	if (mtk_is_netsys_v3_or_greater(mac->hw) &&
  	    MTK_HAS_CAPS(mac->hw->soc->caps, MTK_ESW) &&
  	    id == MTK_GMAC1_ID) {
-@@ -5135,6 +5235,14 @@ static int mtk_add_mac(struct mtk_eth *eth, struct device_node *np)
+@@ -5135,6 +5235,14 @@ static int mtk_add_mac(struct mtk_eth *e
  		phy_interface_zero(mac->phylink_config.supported_interfaces);
  		__set_bit(PHY_INTERFACE_MODE_INTERNAL,
  			  mac->phylink_config.supported_interfaces);
@@ -400,7 +396,7 @@ index f2a066c54..c287c9708 100644
  	}
  
  	if (MTK_HAS_CAPS(eth->soc->caps, MTK_SOC_MT7628))
-@@ -5157,16 +5265,6 @@ static int mtk_add_mac(struct mtk_eth *eth, struct device_node *np)
+@@ -5157,16 +5265,6 @@ static int mtk_add_mac(struct mtk_eth *e
  					    mac->phylink_config.lpi_interfaces);
  	}
  
@@ -417,7 +413,7 @@ index f2a066c54..c287c9708 100644
  	SET_NETDEV_DEV(eth->netdev[id], eth->dev);
  	eth->netdev[id]->watchdog_timeo = 5 * HZ;
  	eth->netdev[id]->netdev_ops = &mtk_netdev_ops;
-@@ -5184,6 +5282,16 @@ static int mtk_add_mac(struct mtk_eth *eth, struct device_node *np)
+@@ -5184,6 +5282,16 @@ static int mtk_add_mac(struct mtk_eth *e
  	eth->netdev[id]->irq = eth->irq[MTK_FE_IRQ_SHARED];
  	eth->netdev[id]->dev.of_node = np;
  
@@ -434,7 +430,7 @@ index f2a066c54..c287c9708 100644
  	if (MTK_HAS_CAPS(eth->soc->caps, MTK_SOC_MT7628))
  		eth->netdev[id]->max_mtu = MTK_MAX_RX_LENGTH - MTK_RX_ETH_HLEN;
  	else
-@@ -5377,7 +5485,8 @@ static int mtk_probe(struct platform_device *pdev)
+@@ -5377,7 +5485,8 @@ static int mtk_probe(struct platform_dev
  			regmap_write(cci, 0, 3);
  	}
  
@@ -444,8 +440,6 @@ index f2a066c54..c287c9708 100644
  		err = mtk_sgmii_init(eth);
  
  		if (err)
-diff --git a/drivers/net/ethernet/mediatek/mtk_eth_soc.h b/drivers/net/ethernet/mediatek/mtk_eth_soc.h
-index 0614a9269..c262c9a72 100644
 --- a/drivers/net/ethernet/mediatek/mtk_eth_soc.h
 +++ b/drivers/net/ethernet/mediatek/mtk_eth_soc.h
 @@ -570,6 +570,7 @@
@@ -602,7 +596,7 @@ index 0614a9269..c262c9a72 100644
  	struct mtk_eth			*hw;
  	struct mtk_hw_stats		*hw_stats;
  	__be32				hwlro_ip[MTK_MAX_LRO_IP_CNT];
-@@ -1519,6 +1560,7 @@ int mtk_gmac_sgmii_path_setup(struct mtk_eth *eth, int mac_id);
+@@ -1519,6 +1560,7 @@ int mtk_gmac_sgmii_path_setup(struct mtk
  int mtk_gmac_2p5gphy_path_setup(struct mtk_eth *eth, int mac_id);
  int mtk_gmac_gephy_path_setup(struct mtk_eth *eth, int mac_id);
  int mtk_gmac_rgmii_path_setup(struct mtk_eth *eth, int mac_id);

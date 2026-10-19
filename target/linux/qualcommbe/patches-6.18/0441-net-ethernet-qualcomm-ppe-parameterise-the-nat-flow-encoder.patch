@@ -31,7 +31,7 @@ Claude-Session: https://claude.ai/code/session_01TwrzKNAPLwfKWiBDhPePU3
 ---
 --- a/drivers/net/ethernet/qualcomm/ppe/ppe_flow_ipv4.h
 +++ b/drivers/net/ethernet/qualcomm/ppe/ppe_flow_ipv4.h
-@@ -22,7 +22,10 @@
+@@ -22,7 +22,10 @@ enum ppe_flow_protocol {
  
  /**
   * enum ppe_flow_fwd_type - Forwarding action performed by a flow entry.
@@ -43,7 +43,7 @@ Claude-Session: https://claude.ai/code/session_01TwrzKNAPLwfKWiBDhPePU3
   * (struct in_flow_tbl_0 in the vendor SDK) has been implemented so far
   * -- DNAT/ROUTE/BRIDGE each reuse the same word 1 bit range for
   * different fields and need their own entry struct/encode function.
-@@ -38,7 +41,7 @@
+@@ -38,7 +41,7 @@ enum ppe_flow_fwd_type {
  };
  
  /**
@@ -52,7 +52,7 @@ Claude-Session: https://claude.ai/code/session_01TwrzKNAPLwfKWiBDhPePU3
   * @valid: Whether this entry is active.
   * @host_addr_is_dst: @host_addr_index refers to the destination IP's host
   * table entry when true, the source IP's when false. The endpoint this
-@@ -50,9 +53,13 @@
+@@ -50,9 +53,13 @@ enum ppe_flow_fwd_type {
   * updates it as traffic hits the entry.
   * @src_l3_if_valid: Whether @src_l3_if should be matched.
   * @src_l3_if: Source L3 interface index to match, when @src_l3_if_valid.
@@ -68,7 +68,7 @@ Claude-Session: https://claude.ai/code/session_01TwrzKNAPLwfKWiBDhPePU3
   * @deacclr_en: Whether to de-accelerate (stop hardware-offloading) this
   * flow under hardware-defined conditions (e.g. a TCP control flag).
   * @copy_to_cpu: Whether to also copy matched packets to the CPU path.
-@@ -69,16 +76,17 @@
+@@ -69,16 +76,17 @@ enum ppe_flow_fwd_type {
   * @pmtu_check_l3: Compare @pmtu against the L3 packet length (true) or
   * the length including the L2 header (false).
   */
@@ -89,7 +89,7 @@ Claude-Session: https://claude.ai/code/session_01TwrzKNAPLwfKWiBDhPePU3
  	bool deacclr_en;
  	bool copy_to_cpu;
  	u8 syn_toggle;
-@@ -91,9 +99,9 @@
+@@ -91,9 +99,9 @@ struct ppe_flow_ipv4_snat_entry {
  	bool pmtu_check_l3;
  };
  
@@ -127,7 +127,7 @@ Claude-Session: https://claude.ai/code/session_01TwrzKNAPLwfKWiBDhPePU3
  				      u32 words[PPE_FLOW_TBL_ENTRY_WORDS])
  {
  	u32 ip = be32_to_cpu(entry->match_ip);
-@@ -48,10 +48,10 @@
+@@ -48,10 +48,10 @@ void ppe_flow_ipv4_snat_entry_encode(con
  	words[0] |= FIELD_PREP(PPE_FLOW_TBL_AGE, entry->age);
  	words[0] |= entry->src_l3_if_valid ? PPE_FLOW_TBL_SRC_L3_IF_VALID : 0;
  	words[0] |= FIELD_PREP(PPE_FLOW_TBL_SRC_L3_IF, entry->src_l3_if);
@@ -141,7 +141,7 @@ Claude-Session: https://claude.ai/code/session_01TwrzKNAPLwfKWiBDhPePU3
  	words[1] |= entry->deacclr_en ? PPE_FLOW_TBL_DE_ACCE : 0;
  	words[1] |= entry->copy_to_cpu ? PPE_FLOW_TBL_COPY_TO_CPU_EN : 0;
  	words[1] |= entry->syn_toggle ? PPE_FLOW_TBL_SYN_TOGGLE : 0;
-@@ -72,20 +72,21 @@
+@@ -72,20 +72,21 @@ void ppe_flow_ipv4_snat_entry_encode(con
  }
  
  /**
@@ -169,7 +169,7 @@ Claude-Session: https://claude.ai/code/session_01TwrzKNAPLwfKWiBDhPePU3
  	entry->host_addr_is_dst = !!(words[0] & PPE_FLOW_TBL_HOST_ADDR_INDEX_TYPE);
  	entry->host_addr_index = FIELD_GET(PPE_FLOW_TBL_HOST_ADDR_INDEX, words[0]);
  	entry->protocol = FIELD_GET(PPE_FLOW_TBL_PROTOCOL_TYPE, words[0]);
-@@ -93,8 +94,8 @@
+@@ -93,8 +94,8 @@ void ppe_flow_ipv4_snat_entry_decode(con
  	entry->src_l3_if_valid = !!(words[0] & PPE_FLOW_TBL_SRC_L3_IF_VALID);
  	entry->src_l3_if = FIELD_GET(PPE_FLOW_TBL_SRC_L3_IF, words[0]);
  
@@ -182,7 +182,7 @@ Claude-Session: https://claude.ai/code/session_01TwrzKNAPLwfKWiBDhPePU3
  	entry->syn_toggle = !!(words[1] & PPE_FLOW_TBL_SYN_TOGGLE);
 --- a/drivers/net/ethernet/qualcomm/ppe/ppe_offload.c
 +++ b/drivers/net/ethernet/qualcomm/ppe/ppe_offload.c
-@@ -296,7 +296,7 @@
+@@ -296,7 +296,7 @@ static int ppe_offload_flow_replace(stru
  	struct flow_rule *rule = flow_cls_offload_flow_rule(cls);
  	struct ppe_offload_flow_entry *entry;
  	struct ppe_host_ipv4_entry host_ipv4;
@@ -191,7 +191,7 @@ Claude-Session: https://claude.ai/code/session_01TwrzKNAPLwfKWiBDhPePU3
  	struct ppe_nexthop_entry nexthop;
  	struct edma_port_priv *port_priv;
  	struct net_device *odev = NULL;
-@@ -584,8 +584,9 @@
+@@ -584,8 +584,9 @@ static int ppe_offload_flow_replace(stru
  	flow_ipv4.host_addr_is_dst = false;
  	flow_ipv4.host_addr_index = host_index;
  	flow_ipv4.protocol = ip_proto;
@@ -203,7 +203,7 @@ Claude-Session: https://claude.ai/code/session_01TwrzKNAPLwfKWiBDhPePU3
  	flow_ipv4.match_ip = match_dst;
  	flow_ipv4.match_sport = be16_to_cpu(match_sport);
  	flow_ipv4.match_dport = be16_to_cpu(match_dport);
-@@ -593,7 +594,7 @@
+@@ -593,7 +594,7 @@ static int ppe_offload_flow_replace(stru
  	flow_ipv4.src_l3_if = ingress_l3_if;
  	flow_ipv4.pmtu = pmtu;
  	flow_ipv4.pmtu_check_l3 = true;

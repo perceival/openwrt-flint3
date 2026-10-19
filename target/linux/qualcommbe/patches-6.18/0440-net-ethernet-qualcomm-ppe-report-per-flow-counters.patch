@@ -66,7 +66,7 @@ Claude-Session: https://claude.ai/code/session_01TwrzKNAPLwfKWiBDhPePU3
  #define PPE_IN_FLOW_TBL_OP_BYP_RSLT_EN		BIT(4)
 --- a/drivers/net/ethernet/qualcomm/ppe/ppe_flow.h
 +++ b/drivers/net/ethernet/qualcomm/ppe/ppe_flow.h
-@@ -32,6 +32,9 @@
+@@ -32,6 +32,9 @@ enum ppe_flow_op_mode {
  	PPE_FLOW_OP_MODE_INDEX,
  };
  
@@ -78,7 +78,7 @@ Claude-Session: https://claude.ai/code/session_01TwrzKNAPLwfKWiBDhPePU3
  int ppe_flow_entry_del(struct ppe_device *ppe_dev, u32 index);
 --- a/drivers/net/ethernet/qualcomm/ppe/ppe_flow.c
 +++ b/drivers/net/ethernet/qualcomm/ppe/ppe_flow.c
-@@ -90,6 +90,100 @@
+@@ -90,6 +90,100 @@ static int ppe_flow_tbl_op_wait(struct p
  }
  
  /**
@@ -179,7 +179,7 @@ Claude-Session: https://claude.ai/code/session_01TwrzKNAPLwfKWiBDhPePU3
   * ppe_flow_entry_add() - Add (or overwrite) a PPE flow table entry.
   * @ppe_dev: PPE device.
   * @mode: Hash-based or caller-indexed entry placement.
-@@ -117,6 +211,16 @@
+@@ -117,6 +211,16 @@ int ppe_flow_entry_add(struct ppe_device
  	}
  
  	ret = ppe_flow_tbl_op_wait(ppe_dev, PPE_FLOW_TBL_OP_ADD, mode, index);
@@ -220,7 +220,7 @@ Claude-Session: https://claude.ai/code/session_01TwrzKNAPLwfKWiBDhPePU3
   *
   * Hardware itself may also not consult the flow table at all yet for
   * genuinely external ingress traffic -- ppe_servcode_init() bypasses
-@@ -121,6 +120,15 @@
+@@ -121,6 +120,15 @@ struct ppe_offload_flow_entry {
  	u32 nexthop_index;
  	u32 pub_ip_index;
  	bool flow_valid;
@@ -236,7 +236,7 @@ Claude-Session: https://claude.ai/code/session_01TwrzKNAPLwfKWiBDhPePU3
  };
  
  static const struct rhashtable_params ppe_offload_flow_ht_params = {
-@@ -627,6 +635,7 @@
+@@ -627,6 +635,7 @@ static int ppe_offload_flow_replace(stru
  		goto free_entry;
  	}
  
@@ -244,7 +244,7 @@ Claude-Session: https://claude.ai/code/session_01TwrzKNAPLwfKWiBDhPePU3
  	priv->flow_owner[flow_index] = entry;
  
  	mutex_unlock(&priv->lock);
-@@ -699,6 +708,74 @@
+@@ -699,6 +708,74 @@ static int ppe_offload_flow_destroy(stru
  	return 0;
  }
  
@@ -319,7 +319,7 @@ Claude-Session: https://claude.ai/code/session_01TwrzKNAPLwfKWiBDhPePU3
  static int ppe_offload_flow_cmd(struct net_device *netdev, struct ppe_offload_priv *priv,
  				 struct flow_cls_offload *cls)
  {
-@@ -714,8 +791,7 @@
+@@ -714,8 +791,7 @@ static int ppe_offload_flow_cmd(struct n
  	case FLOW_CLS_DESTROY:
  		return ppe_offload_flow_destroy(priv, cls);
  	case FLOW_CLS_STATS:
