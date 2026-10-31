@@ -1,0 +1,110 @@
+From: Kamil Bienkiewicz <perceivalpercy@gmail.com>
+Subject: [PATCH] net: ethernet: qualcomm: ppe: delete the hardware entry when forgetting a flow
+
+ppe_offload_flow_forget() released a flow's host, nexthop and public IP
+slots and freed the entry, but left its flow-table entry valid in the
+PPE. The orphan kept forwarding and translating packets with no
+conntrack entry behind it, and the released slots could be reused by
+other flows, which mixes up NAT between clients (the same class of
+problem as the L4 port mangle fix, 0448). Two callers reach it with the
+hardware entry still live: the stale re-arm path (0452) and the
+flapping-address drop (0453). A LAN host can trigger the second by
+spoofing a MAC.
+
+Delete the hardware entry inside forget() before anything is released.
+A superseded entry (flow_valid false), and the failed re-point path
+that clears flow_valid itself, are skipped as before. If the delete
+fails the entry stays tracked with its references and the error is
+returned: the re-arm path then gives up without re-offering the flow,
+and the flap path counts it as failed.
+
+Reported privately by CoolFreeze23.
+
+Signed-off-by: Kamil Bienkiewicz <perceivalpercy@gmail.com>
+---
+--- a/drivers/net/ethernet/qualcomm/ppe/ppe_offload.c
++++ b/drivers/net/ethernet/qualcomm/ppe/ppe_offload.c
+@@ -895,8 +895,8 @@
+ }
+ 
+ static u64 ppe_offload_counter_delta(u64 now, u64 prev, u64 mask);
+-static void ppe_offload_flow_forget(struct ppe_offload_priv *priv,
+-				    struct ppe_offload_flow_entry *entry);
++static int ppe_offload_flow_forget(struct ppe_offload_priv *priv,
++				   struct ppe_offload_flow_entry *entry);
+ 
+ /* Whether a flow the flowtable re-offers (flow_offload_refresh(), about
+  * once a second for as long as its packets cross the software path) has
+@@ -1490,7 +1490,11 @@
+ 		else
+ 			pr_info_ratelimited("ppe_offload: flow entry %u re-armed: no hardware hits across refreshes\n",
+ 					    entry->flow_index);
+-		ppe_offload_flow_forget(priv, entry);
++		ret = ppe_offload_flow_forget(priv, entry);
++		if (ret) {
++			stage = "forget";
++			goto unlock;
++		}
+ 	}
+ 
+ 	/* Public IP entry for the translated (post-SNAT) source address.
+@@ -1853,13 +1857,33 @@
+ 	u8 addr[ETH_ALEN];
+ };
+ 
+-/* Drop a tracked flow whose hardware entry is already gone: release its
+- * table entries and forget its cookie, so that a later refresh from the
++/* Drop a tracked flow: delete its hardware entry, release its table
++ * entries and forget its cookie, so that a later refresh from the
+  * flowtable re-offers it as a new flow. Called under priv->lock.
++ *
++ * The hardware entry must go first. Left valid it would keep forwarding and
++ * translating with no flow behind it, and the host, nexthop and public IP
++ * slots released below can be handed to another flow, so the orphan would
++ * apply the old flow's translation to the new one's slot contents. As in
++ * ppe_offload_flow_destroy(), a superseded entry (flow_valid false)
++ * is skipped: its slot already belongs to the flow that overwrote it.
++ *
++ * Return: 0 once the flow is dropped. If the hardware delete fails the entry
++ * is left tracked, with its references, and the error is returned, so that
++ * nothing it still points at can be reused.
+  */
+-static void ppe_offload_flow_forget(struct ppe_offload_priv *priv,
+-				    struct ppe_offload_flow_entry *entry)
++static int ppe_offload_flow_forget(struct ppe_offload_priv *priv,
++				   struct ppe_offload_flow_entry *entry)
+ {
++	int ret;
++
++	if (entry->flow_valid) {
++		ret = ppe_flow_entry_del(priv->ppe_dev, entry->flow_index);
++		if (ret)
++			return ret;
++		entry->flow_valid = false;
++	}
++
+ 	rhashtable_remove_fast(&priv->flow_table, &entry->node, ppe_offload_flow_ht_params);
+ 	if (entry->dsa_fixed) {
+ 		spin_lock_bh(&priv->dsa_fixed_lock);
+@@ -1872,6 +1896,8 @@
+ 	if (entry->pub_ip_valid)
+ 		ppe_pub_ip_pool_deref(priv->ppe_dev, &priv->pub_ip_pool, entry->pub_ip_index);
+ 	kfree(entry);
++
++	return 0;
+ }
+ 
+ /* Re-point one fixed-port flow at @dp. Called under priv->lock.
+@@ -2030,8 +2056,10 @@
+ 			entry->move_count = 0;
+ 		}
+ 		if (++entry->move_count > PPE_OFFLOAD_FDB_FLAP_MAX) {
+-			ppe_offload_flow_forget(priv, entry);
+-			dropped++;
++			if (ppe_offload_flow_forget(priv, entry))
++				failed++;
++			else
++				dropped++;
+ 			continue;
+ 		}
+ 
