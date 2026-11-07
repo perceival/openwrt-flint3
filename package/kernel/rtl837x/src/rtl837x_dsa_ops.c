@@ -62,7 +62,7 @@ MODULE_PARM_DESC(jumbo,
 static bool rebind_phy;
 module_param(rebind_phy, bool, 0444);
 MODULE_PARM_DESC(rebind_phy,
-		 "Move internal PHYs claimed by another PHY driver to the private RTL837x PHY driver");
+		 "Bind internal PHYs to the private RTL837x PHY driver, moving them from any other PHY driver");
 
 static bool rtl837x_vlan_passthrough(struct rtk_gsw *gsw)
 {
@@ -446,6 +446,14 @@ static int rtl837x_port_fid_apply(struct rtk_gsw *gsw, int port,
 
 	BUILD_BUG_ON(RTL837X_FID_BRIDGE(DSA_TAG_8021Q_MAX_NUM_BRIDGES) >
 		     RTL8373_FIDMAX);
+
+	/* The parameter, not rtl837x_per_bridge_fid(): a tagger change has to
+	 * be able to turn the port-based FID off again. Without the parameter
+	 * nothing ever turned it on, so leave the registers alone, and do not
+	 * let a bridge join depend on a write it has no use for.
+	 */
+	if (!per_bridge_fid)
+		return 0;
 
 	if (!rtl837x_user_port(gsw, port) ||
 	    bridge_num > DSA_TAG_8021Q_MAX_NUM_BRIDGES)
@@ -1376,6 +1384,25 @@ static int rtl837x_set_transparent(struct rtk_gsw *gsw, int igr_port,
 	return 0;
 }
 
+/* Undo what vlan_passthrough sets on a port. The parameter, not
+ * rtl837x_vlan_passthrough(): a port has to return to this when the tagger
+ * changes. Without the parameter nothing ever set these registers.
+ */
+static int rtl837x_clear_passthrough(struct rtk_gsw *gsw, int port)
+{
+	int ret;
+
+	if (!vlan_passthrough)
+		return 0;
+
+	ret = rtl837x_set_transparent(gsw, port, false);
+	if (ret)
+		return ret;
+
+	return rtl837x_to_errno(rtk_vlan_tagMode_set(port,
+						     VLAN_EGRESS_TAG_MODE_ORIGINAL));
+}
+
 static int rtl837x_set_ingress_policy(struct rtk_gsw *gsw, int port,
 				      bool vlan_filtering)
 {
@@ -1388,13 +1415,9 @@ static int rtl837x_set_ingress_policy(struct rtk_gsw *gsw, int port,
 			return rtl837x_to_errno(ret);
 
 		/* VLAN-aware: egress follows the VLAN table again. */
-		ret = rtl837x_set_transparent(gsw, port, false);
+		ret = rtl837x_clear_passthrough(gsw, port);
 		if (ret)
 			return ret;
-
-		ret = rtk_vlan_tagMode_set(port, VLAN_EGRESS_TAG_MODE_ORIGINAL);
-		if (ret)
-			return rtl837x_to_errno(ret);
 
 		ret = rtk_vlan_portAcceptFrameType_set(port, ACCEPT_FRAME_TYPE_ALL);
 		if (ret)
@@ -1445,13 +1468,9 @@ static int rtl837x_set_ingress_policy(struct rtk_gsw *gsw, int port,
 	if (ret)
 		return rtl837x_to_errno(ret);
 
-	ret = rtl837x_set_transparent(gsw, port, false);
+	ret = rtl837x_clear_passthrough(gsw, port);
 	if (ret)
 		return ret;
-
-	ret = rtk_vlan_tagMode_set(port, VLAN_EGRESS_TAG_MODE_ORIGINAL);
-	if (ret)
-		return rtl837x_to_errno(ret);
 
 	ret = rtk_vlan_portIgrFilterEnable_set(port, DISABLED);
 	if (ret)
@@ -1690,12 +1709,16 @@ static void rtl837x_conduit_csum_offload(struct dsa_switch *ds, bool enable)
 }
 
 /* Bring every per-port setting that depends on the tag protocol in line
- * with gsw->tag_proto. Caller holds rtnl.
+ * with gsw->tag_proto. Caller holds rtnl. Only the opt-in modes make any of
+ * it depend on the tagger, so without them there is nothing to do.
  */
 static int rtl837x_tag_protocol_resync(struct dsa_switch *ds)
 {
 	struct rtk_gsw *gsw = ds->priv;
 	int port, ret;
+
+	if (!vlan_passthrough && !per_bridge_fid)
+		return 0;
 
 	ret = rtl837x_set_transparent(gsw, gsw->cpu_port,
 				      rtl837x_vlan_passthrough(gsw));
@@ -2048,11 +2071,11 @@ static int rtl837x_setup(struct dsa_switch *ds)
 	if (ret)
 		return ret;
 
-	ret = rtl837x_save_boot_max_len(gsw);
-	if (ret)
-		return ret;
-
 	if (jumbo) {
+		ret = rtl837x_save_boot_max_len(gsw);
+		if (ret)
+			return ret;
+
 		ret = rtl837x_open_tx_max_len(gsw);
 		if (ret)
 			return ret;
@@ -2356,14 +2379,19 @@ static int rtl837x_phy_bind_private(struct rtk_gsw *gsw, struct mii_bus *bus)
 		if (dev->driver == drv)
 			continue;
 
-		if (dev->driver) {
-			if (!rebind_phy) {
+		/* Without rebind_phy the outcome of the bus scan stands; a PHY
+		 * that stayed unbound gets phylib's generic driver at connect
+		 * time.
+		 */
+		if (!rebind_phy) {
+			if (dev->driver)
 				dev_info(gsw->dev,
 					 "port %d: PHY 0x%08x is bound to \"%s\" (rebind_phy=0: left as is)\n",
 					 addr, phydev->phy_id, dev->driver->name);
-				continue;
-			}
+			continue;
+		}
 
+		if (dev->driver) {
 			dev_info(gsw->dev,
 				 "port %d: PHY 0x%08x was bound to \"%s\", rebinding to \"%s\"\n",
 				 addr, phydev->phy_id, dev->driver->name, drv->name);
@@ -3336,15 +3364,19 @@ static int rtl837x_port_change_mtu(struct dsa_switch *ds, int port,
 	u32 len;
 	int ret;
 
+	/* Without jumbo the port MTU is not implemented at all: DSA gets the
+	 * same answer as without this op, nothing reads or writes the frame
+	 * limits, and hosts that already exchange jumbo frames through the
+	 * switch keep doing so.
+	 */
+	if (!jumbo)
+		return -EOPNOTSUPP;
+
 	if (!rtl837x_valid_port(gsw, port) || new_mtu < ETH_MIN_MTU ||
 	    new_mtu > rtl837x_port_max_mtu(ds, port))
 		return -EINVAL;
 
-	/* Up to the standard MTU the bootloader's limits stay exactly as they
-	 * were (the 8ea847fe90 behaviour): nothing new is written on the
-	 * default configuration, and hosts that already exchange jumbo frames
-	 * through the switch keep doing so.
-	 */
+	/* Back at the standard MTU a port returns to the bootloader's limits. */
 	if (new_mtu <= ETH_DATA_LEN)
 		return port == gsw->cpu_port ? 0 :
 		       rtl837x_restore_boot_max_len(gsw, port);
@@ -3435,7 +3467,7 @@ int rtl837x_dsa_register(struct rtk_gsw *gsw)
 	/* The MTU is an RX length limit per port (rtl837x_port_change_mtu());
 	 * have DSA keep the ports of a bridge at a common MTU.
 	 */
-	ds->mtu_enforcement_ingress = true;
+	ds->mtu_enforcement_ingress = jumbo;
 
 	ret = dsa_register_switch(ds);
 	if (ret)
