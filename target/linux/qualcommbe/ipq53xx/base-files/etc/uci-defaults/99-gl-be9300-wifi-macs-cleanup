@@ -1,0 +1,50 @@
+#!/bin/sh
+# Older images ran 99-gl-be9300-wifi-macs, which pinned every AP to an address
+# derived from ART@0x4, and a settings-keeping sysupgrade carries those macaddr
+# options along. They hold on to the old addresses instead
+# of the per-radio defaults, and from the fourth AP on they are outside this
+# unit's address block.
+#
+# Remove exactly what that script wrote: walking the AP sections in order, ART@0x4
+# first and then the locally administered form of ART@0x4 + 1, + 2, ... A section
+# holding anything else is the user's and is skipped, as the script skipped it.
+# A single match proves nothing, since someone may have set ART@0x4 by hand, so at
+# least the first two addresses have to be there before anything is removed.
+. /lib/functions.sh
+. /lib/functions/system.sh
+
+[ "$(board_name)" = "gl.inet,gl-be9300" ] || exit 0
+[ -f /etc/config/wireless ] || exit 0
+
+base=$(mmc_get_mac_binary 0:ART 0x4)
+[ -n "$base" ] || exit 0
+
+n=0
+next=$base
+pinned=
+
+find_pinned() {
+	local section="$1"
+	local mode mac
+
+	config_get mode "$section" mode
+	[ "$mode" = "ap" ] || return 0
+	config_get mac "$section" macaddr
+	[ "$mac" = "$next" ] || return 0
+
+	pinned="$pinned $section"
+	n=$((n + 1))
+	next=$(macaddr_setbit_la "$(macaddr_add "$base" $n)")
+}
+
+config_load wireless
+config_foreach find_pinned wifi-iface
+
+[ "$n" -ge 2 ] || exit 0
+
+for section in $pinned; do
+	uci delete "wireless.$section.macaddr"
+done
+uci commit wireless
+
+exit 0
