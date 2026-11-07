@@ -1,0 +1,98 @@
+From: CoolFreeze23 <34906576+CoolFreeze23@users.noreply.github.com>
+Date: Sat, 7 Nov 2026 12:00:00 +0900
+Subject: [PATCH] wifi: ath12k: queue reset work from one place
+
+A reset work that finds no ATH12K_FLAG_RESET_REQUESTED returns at once,
+so a site that queued it without setting the flag would be ignored.
+All three sites set it today, each with its own set_bit() and
+queue_work() pair (group recovery in core.c, the rootPD/userPD path in
+ahb.c, the RDDM callback in mhi.c). Add ath12k_core_request_reset() and
+use it everywhere, so that this is the only queue_work() of reset_work
+in the driver. No functional change.
+
+Signed-off-by: CoolFreeze23 <34906576+CoolFreeze23@users.noreply.github.com>
+---
+diff --git a/drivers/net/wireless/ath/ath12k/ahb.c b/drivers/net/wireless/ath/ath12k/ahb.c
+--- a/drivers/net/wireless/ath/ath12k/ahb.c
++++ b/drivers/net/wireless/ath/ath12k/ahb.c
+@@ -998,12 +998,10 @@ static void ath12k_ahb_queue_group_recov
+ 		set_bit(ATH12K_FLAG_RECOVERY, &partner_ab->dev_flags);
+ 
+ 		/*
+-		 * queue_work() also when the work is busy: its ordered PENDING
+-		 * test-and-set makes the run that follows see the request, and
+-		 * a queued work may be a stale run that would return without it.
++		 * Also when the work is busy: a queued work may be a stale run
++		 * that would return without the request.
+ 		 */
+-		set_bit(ATH12K_FLAG_RESET_REQUESTED, &partner_ab->dev_flags);
+-		queue_work(partner_ab->workqueue_aux, &partner_ab->reset_work);
++		ath12k_core_request_reset(partner_ab);
+ 	}
+ out:
+ 	mutex_unlock(&ag->mutex);
+diff --git a/drivers/net/wireless/ath/ath12k/core.c b/drivers/net/wireless/ath/ath12k/core.c
+--- a/drivers/net/wireless/ath/ath12k/core.c
++++ b/drivers/net/wireless/ath/ath12k/core.c
+@@ -1717,6 +1717,18 @@ exit_restart:
+ 	complete(&ab->restart_completed);
+ }
+ 
++/*
++ * The only place that queues reset_work: ath12k_core_reset() ignores a run
++ * that finds no request. Request first: the ordered PENDING test-and-set in
++ * queue_work() makes the run that follows see the request, also when the work
++ * is busy.
++ */
++void ath12k_core_request_reset(struct ath12k_base *ab)
++{
++	set_bit(ATH12K_FLAG_RESET_REQUESTED, &ab->dev_flags);
++	queue_work(ab->workqueue_aux, &ab->reset_work);
++}
++
+ /* Queue a reset of @ab on behalf of the group recovery; the group is not
+  * powered up again until that reset work has run.
+  */
+@@ -1727,8 +1739,7 @@ static void ath12k_core_queue_reset_lock
+ 	set_bit(ATH12K_FLAG_CRASH_FLUSH, &ab->dev_flags);
+ 	set_bit(ATH12K_FLAG_RECOVERY, &ab->dev_flags);
+ 	WRITE_ONCE(ab->recovery_wait_power_down, true);
+-	set_bit(ATH12K_FLAG_RESET_REQUESTED, &ab->dev_flags);
+-	queue_work(ab->workqueue_aux, &ab->reset_work);
++	ath12k_core_request_reset(ab);
+ }
+ 
+ static bool ath12k_core_reset_queueable(struct ath12k_base *ab)
+@@ -1907,7 +1918,7 @@ static void ath12k_core_reset(struct wor
+ 	long time_left;
+ 
+ 	/*
+-	 * Every path that queues this work requests the reset first. A run
++	 * This work is only queued by ath12k_core_request_reset(). A run
+ 	 * that finds no request is stale: a second queueing for the same
+ 	 * crash, or one answered by a group power-up that booted the device
+ 	 * since. Resetting the device again would tear down a recovery in
+diff --git a/drivers/net/wireless/ath/ath12k/core.h b/drivers/net/wireless/ath/ath12k/core.h
+--- a/drivers/net/wireless/ath/ath12k/core.h
++++ b/drivers/net/wireless/ath/ath12k/core.h
+@@ -1325,6 +1325,7 @@ struct ath12k_fw_stats_pdev {
+ };
+ 
+ int ath12k_core_qmi_firmware_ready(struct ath12k_base *ab);
++void ath12k_core_request_reset(struct ath12k_base *ab);
+ void ath12k_core_hw_group_cleanup(struct ath12k_hw_group *ag);
+ int ath12k_core_pre_init(struct ath12k_base *ab);
+ int ath12k_core_init(struct ath12k_base *ath12k);
+diff --git a/drivers/net/wireless/ath/ath12k/mhi.c b/drivers/net/wireless/ath/ath12k/mhi.c
+--- a/drivers/net/wireless/ath/ath12k/mhi.c
++++ b/drivers/net/wireless/ath/ath12k/mhi.c
+@@ -160,8 +160,7 @@ static void ath12k_mhi_op_status_cb(stru
+ 		if (!(test_bit(ATH12K_FLAG_UNREGISTERING, &ab->dev_flags))) {
+ 			set_bit(ATH12K_FLAG_CRASH_FLUSH, &ab->dev_flags);
+ 			set_bit(ATH12K_FLAG_RECOVERY, &ab->dev_flags);
+-			set_bit(ATH12K_FLAG_RESET_REQUESTED, &ab->dev_flags);
+-			queue_work(ab->workqueue_aux, &ab->reset_work);
++			ath12k_core_request_reset(ab);
+ 		}
+ 		break;
+ 	default:
