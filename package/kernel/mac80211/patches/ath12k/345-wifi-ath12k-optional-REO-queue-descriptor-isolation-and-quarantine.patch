@@ -8,9 +8,11 @@ ath12k module parameter reoq_debug=1 (read-only after load).
 
 When enabled, REO queue descriptors come from a dedicated non-mergeable
 slab, so a late hardware write can no longer hit another object. Freed
-descriptors are poisoned, cleaned to DRAM and held for 10 s; on release
-any byte the hardware changed after the free is reported with a
-hexdump (the 0x?DBEEF header magic identifies REO descriptors).
+descriptors are poisoned, cleaned to DRAM and held for at least 10 s
+(there is no timer: they are released by a later free on the device, or
+when it is cleaned up or removed); on release any byte the hardware
+changed after the free is reported with a hexdump (the 0x?DBEEF header
+magic identifies REO descriptors).
 
 The quarantine is kept per device (struct ath12k_dp), and only that
 device's own paths release its entries. They are all released, with
