@@ -662,7 +662,10 @@ int rtl8372n_hw_init(struct rtk_gsw *gsw, rtl837x_pnswap_cfg_t swap_cfg)
 }
 
 /* The conduit the CPU-port work closed is up again: end the reset and reopen
- * the user ports that closing it took down. Caller holds rtnl.
+ * the user ports that closing it took down. A port that fails stays in
+ * cpu_reset_users for the next run. Does nothing while the conduit is down,
+ * so it never reopens a conduit an administrator closed afterwards. Caller
+ * holds rtnl.
  */
 static void rtl837x_cpu_reset_finish(struct rtk_gsw *gsw)
 {
@@ -674,15 +677,20 @@ static void rtl837x_cpu_reset_finish(struct rtk_gsw *gsw)
 
 	gsw->cpu_reset_pending = false;
 	dsa_switch_for_each_user_port(dp, &gsw->ds) {
-		if (!(gsw->cpu_reset_users & BIT(dp->index)) ||
-		    !dp->user || netif_running(dp->user))
+		if (!(gsw->cpu_reset_users & BIT(dp->index)))
 			continue;
 
-		ret = dev_open(dp->user, NULL);
-		if (ret)
-			dev_warn(gsw->dev,
-				 "failed to reopen %s after CPU SerDes reset: %d\n",
-				 netdev_name(dp->user), ret);
+		if (dp->user && !netif_running(dp->user)) {
+			ret = dev_open(dp->user, NULL);
+			if (ret) {
+				dev_warn_ratelimited(gsw->dev,
+						     "failed to reopen %s after CPU SerDes reset: %d\n",
+						     netdev_name(dp->user), ret);
+				continue;
+			}
+		}
+
+		gsw->cpu_reset_users &= ~BIT(dp->index);
 	}
 }
 
@@ -705,14 +713,16 @@ static void rtl837x_status_check_work_func(struct work_struct *work)
 
 	/* Only this work item touches cpu_reset_pending. The link coming back
 	 * does not end a reset by itself: the conduit may have failed to
-	 * reopen, and the user ports are still waiting either way.
+	 * reopen, and user ports may still be waiting either way.
 	 */
-	if (port_status.link && gsw->cpu_reset_pending) {
+	if (port_status.link && (gsw->cpu_reset_pending || gsw->cpu_reset_users)) {
 		rtnl_lock();
-		ret = dev_open(gsw->ethernet_master, NULL);
-		if (ret)
-			dev_warn_ratelimited(gsw->dev,
-					     "failed to reopen ethernet master: %d\n", ret);
+		if (gsw->cpu_reset_pending) {
+			ret = dev_open(gsw->ethernet_master, NULL);
+			if (ret)
+				dev_warn_ratelimited(gsw->dev,
+						     "failed to reopen ethernet master: %d\n", ret);
+		}
 		rtl837x_cpu_reset_finish(gsw);
 		rtnl_unlock();
 	}
@@ -747,10 +757,10 @@ static void rtl837x_status_check_work_func(struct work_struct *work)
 		/* Closing the conduit makes DSA close every user port, and
 		 * opening it again does not reopen them: remember which ones
 		 * were running so the LAN does not stay down afterwards. Kept
-		 * across retries.
+		 * across retries, along with any port still waiting from an
+		 * earlier reset.
 		 */
 		if (!gsw->cpu_reset_pending) {
-			gsw->cpu_reset_users = 0;
 			dsa_switch_for_each_user_port(dp, &gsw->ds)
 				if (dp->user && netif_running(dp->user))
 					gsw->cpu_reset_users |= BIT(dp->index);
