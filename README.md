@@ -165,9 +165,12 @@ calibration and MAC addresses and cannot be recovered from anywhere else.
 AP to an address derived from ART in `/etc/config/wireless`. On the first boot,
 `99-gl-be9300-wifi-macs-cleanup` removes those `macaddr` options, but only the
 exact values that script wrote, in the order it wrote them, and only if at least
-the first two are there. Anything else is taken for your own and stays, including
-a single AP pinned to the ART address, or pinned addresses after you added,
-removed or reordered APs. To go back to the defaults for such an interface:
+the first two are there. Each removal is logged in `dmesg`. Anything else is taken
+for your own and stays, including a single AP pinned to the ART address, or pinned
+addresses after you added, removed or reordered APs. This runs once:
+`/etc/gl-be9300-wifi-macs-cleaned` is kept over later upgrades and stops it from
+running again, so addresses you set afterwards stay. To go back to the defaults
+for an interface that kept one:
 
 ```sh
 uci delete wireless.<iface>.macaddr
