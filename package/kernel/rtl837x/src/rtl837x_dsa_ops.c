@@ -1716,9 +1716,11 @@ static void rtl837x_conduit_csum_offload(struct dsa_switch *ds, bool enable)
 		 enable ? "enabled" : "disabled", netdev_name(conduit));
 }
 
-/* Bring every per-port setting that depends on the tag protocol in line
- * with gsw->tag_proto. Caller holds rtnl. Only the opt-in modes make any of
- * it depend on the tagger, so without them there is nothing to do.
+/* Bring what the opt-in modes program in line with gsw->tag_proto. Caller
+ * holds rtnl. With both modes off this does nothing, which leaves one thing
+ * tagger-dependent: going from tag_8021q to rtl8_4 reseeds the VLAN table
+ * (rtl837x_tag_protocol_unapply()), which resets the ingress policy of every
+ * user port, VLAN-aware ones included, and nothing restores it.
  */
 static int rtl837x_tag_protocol_resync(struct dsa_switch *ds)
 {
@@ -1728,13 +1730,15 @@ static int rtl837x_tag_protocol_resync(struct dsa_switch *ds)
 	if (!vlan_passthrough && !per_bridge_fid)
 		return 0;
 
-	ret = rtl837x_set_transparent(gsw, gsw->cpu_port,
-				      rtl837x_vlan_passthrough(gsw));
-	if (ret)
-		return ret;
+	if (vlan_passthrough) {
+		ret = rtl837x_set_transparent(gsw, gsw->cpu_port,
+					      rtl837x_vlan_passthrough(gsw));
+		if (ret)
+			return ret;
+	}
 
 	/* IVL/SVL of the base VLAN depends on the tagger. */
-	if (gsw->vlan_table[RTL837X_BASE_VID].valid) {
+	if (per_bridge_fid && gsw->vlan_table[RTL837X_BASE_VID].valid) {
 		ret = rtl837x_write_vlan(gsw, RTL837X_BASE_VID);
 		if (ret)
 			return ret;
@@ -1746,10 +1750,12 @@ static int rtl837x_tag_protocol_resync(struct dsa_switch *ds)
 		if (!rtl837x_user_port(gsw, port))
 			continue;
 
-		ret = rtl837x_set_ingress_policy(gsw, port,
-						 dsa_port_is_vlan_filtering(dp));
-		if (ret)
-			return ret;
+		if (vlan_passthrough) {
+			ret = rtl837x_set_ingress_policy(gsw, port,
+							 dsa_port_is_vlan_filtering(dp));
+			if (ret)
+				return ret;
+		}
 
 		ret = rtl837x_port_fid_apply(gsw, port,
 					     dsa_port_bridge_num_get(dp),
