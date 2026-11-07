@@ -98,7 +98,6 @@ define Device/glinet_gl-be9300
 		gl-be9300-factory | append-gl-metadata
 	DEVICE_PACKAGES := kmod-ath12k ath12k-firmware-ipq5332 \
 		ath12k-firmware-qcn9274 ipq-wifi-glinet_gl-be9300 \
-		ipq-wifi-glinet_gl-be9300-bdf-test \
 		kmod-hwmon-pwmfan kmod-qrtr-smd kmod-rtl837x-dsa \
 		kmod-phy-realtek ethtool e2fsprogs f2fsck mkf2fs dumpimage \
 		kmod-usb-core kmod-usb2 kmod-usb3 kmod-usb-dwc3 \

@@ -330,15 +330,17 @@ $(eval $(call generate-ipq-wifi-package,zyxel_scr50axe,Zyxel SCR50AXE))
 
 $(foreach PACKAGE,$(ALLWIFIPACKAGES),$(eval $(call BuildPackage,$(PACKAGE))))
 
-# GL-BE9300 A/B test copy, not used unless selected at run time.
-# IPQ5332 board-2.bin whose qmi-board-id=18 BDF is stock 4.10.1 bdwlan.b12
-# (the file the vendor driver loads for board id 0x12) instead of bdwlan.bin.
+# GL-BE9300 A/B test copy, optional and not part of the image.
+# IPQ5332 board-2.bin container, built from board-glinet_gl-be9300.ipq5332 by
+# replacing its qmi-board-id=18 BDF (stock bdwlan.bin) with stock bdwlan.b12,
+# the file the vendor driver loads for board id 0x12. Same board name and regdb.
 # It has not been tried with the ath12k 1.6 firmware yet, so it is installed
 # under /lib/firmware/ath12k-test, which the firmware loader searches only
 # after "echo -n /lib/firmware/ath12k-test >
 # /sys/module/firmware_class/parameters/path" and a driver reload.
 define Package/ipq-wifi-glinet_gl-be9300-bdf-test
   $(call Package/ipq-wifi-default)
+  DEPENDS:=@TARGET_qualcommbe_ipq53xx
   TITLE:=GL.iNet GL-BE9300 IPQ5332 board-id 0x12 BDF (test copy)
 endef
 

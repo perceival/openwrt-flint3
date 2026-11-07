@@ -71,11 +71,16 @@ Throughput measured between two units over a 2.5G trunk: **~1.8–1.9 Gbit/s**.
 
 ## Testing the stock 2.4 GHz board file
 
-The image uses 2.4 GHz board data that is known to work with this firmware. It
-also carries an unused test copy, `/lib/firmware/ath12k-test/ath12k/IPQ5332/hw1.0/board-2.bin`,
-with the board file that GL's own firmware loads for this board (stock 4.10.1
-`bdwlan.b12`), which has not yet been tried with the ath12k firmware. To try it
-until the next reboot:
+The image uses 2.4 GHz board data that is known to work with this firmware. GL's
+own firmware loads another board file for this board (`bdwlan.b12`), which has
+not yet been tried with the ath12k firmware. To try it, install the optional
+package `ipq-wifi-glinet_gl-be9300-bdf-test`: select it in `make menuconfig`
+(Firmware, ath10k Board-Specific Overrides), or copy the `.apk` from your build's
+`packages` directory to the unit and run `apk add --allow-untrusted` on it. It is
+not in the default image. It installs a `board-2.bin` container holding that board
+file, with the board name and regdb of the normal one, as
+`/lib/firmware/ath12k-test/ath12k/IPQ5332/hw1.0/board-2.bin`, which nothing loads
+unless selected. To select it until the next reboot:
 
 ```sh
 wifi down
