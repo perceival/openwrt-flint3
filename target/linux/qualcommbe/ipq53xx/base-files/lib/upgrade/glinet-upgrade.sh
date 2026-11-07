@@ -1,5 +1,32 @@
 . /lib/upgrade/common.sh
 
+# Kept free in RAM on top of what an upgrade stages in /tmp, for the tools doing
+# the upgrade and whatever is still running.
+GLINET_RAM_MARGIN_KB=32768
+
+# /tmp is RAM. Say no before staging anything that does not fit, rather than
+# fail or get something killed halfway. An input image in /tmp is already gone
+# from MemAvailable and from the free space of /tmp, so only new bytes count.
+# A failed df is no reason to refuse: extraction checks its own result.
+glinet_emmc_fits_ram() {
+	local bytes="$1"
+	local what="$2"
+	local need_kb=$(( (bytes + 1023) / 1024 ))
+	local avail_kb tmp_kb
+
+	avail_kb=$(awk '$1 == "MemAvailable:" { print $2 }' /proc/meminfo)
+	[ "${avail_kb:-0}" -ge $((need_kb + GLINET_RAM_MARGIN_KB)) ] || {
+		v "Not enough free RAM for $what: $need_kb KiB + $GLINET_RAM_MARGIN_KB KiB margin needed, ${avail_kb:-0} KiB available."
+		return 1
+	}
+
+	tmp_kb=$(df -k /tmp 2>/dev/null | awk 'NR == 2 { print $4 }')
+	[ -z "$tmp_kb" ] || [ "$tmp_kb" -ge "$need_kb" ] || {
+		v "Not enough room in /tmp for $what: $need_kb KiB needed, $tmp_kb KiB free."
+		return 1
+	}
+}
+
 glinet_get_fit_part() {
 	local image="$1"
 	local name="$2"
@@ -16,8 +43,7 @@ glinet_get_fit_part() {
 # ("Config not available", e.g. an image built from an older tree).
 glinet_emmc_check_tar() {
 	local image="$1"
-	local kernel=/tmp/glinet-check-kernel.bin
-	local gz board_dir size limit hlos_dev ret=1
+	local gz board_dir kernel size limit hlos_dev ret=1
 
 	[ "$(identify_magic_long "$(get_magic_long "$image" cat)")" = "gzip" ] && gz=z
 	board_dir=$(tar t${gz}f "$image" 2>/dev/null | grep -m 1 '^sysupgrade-.*/$')
@@ -27,9 +53,8 @@ glinet_emmc_check_tar() {
 		return 1
 	}
 
-	rm -f "$kernel"
-	tar x${gz}f "$image" "$board_dir/kernel" -O > "$kernel" 2>/dev/null
-	size=$(wc -c < "$kernel" 2>/dev/null)
+	# Measured without storing it: it may be too large to store.
+	size=$(tar x${gz}f "$image" "$board_dir/kernel" -O 2>/dev/null | wc -c)
 	hlos_dev=$(find_mmc_part "0:HLOS")
 	limit=$(( $(cat "/sys/class/block/${hlos_dev##*/}/size" 2>/dev/null || echo 0) * 512 ))
 
@@ -37,14 +62,21 @@ glinet_emmc_check_tar() {
 		v "The sysupgrade image has no kernel."
 	elif [ -z "$hlos_dev" ] || [ "$size" -gt "$limit" ]; then
 		v "The kernel ($size bytes) does not fit 0:HLOS ($limit bytes)."
-	elif command -v dumpimage >/dev/null &&
-	     ! dumpimage -l "$kernel" 2>/dev/null | grep -q "^ *Configuration [0-9]* (config-1)$"; then
-		v "The kernel has no FIT configuration \"config-1\"; stock U-Boot cannot boot it."
+	elif ! glinet_emmc_fits_ram "$size" "the kernel"; then
+		:
+	elif ! kernel=$(mktemp /tmp/glinet-check-kernel.XXXXXX); then
+		v "Unable to create a temporary file in /tmp."
 	else
-		ret=0
+		tar x${gz}f "$image" "$board_dir/kernel" -O > "$kernel" 2>/dev/null
+		if ! command -v dumpimage >/dev/null ||
+		   dumpimage -l "$kernel" 2>/dev/null | grep -q "^ *Configuration [0-9]* (config-1)$"; then
+			ret=0
+		else
+			v "The kernel has no FIT configuration \"config-1\"; stock U-Boot cannot boot it."
+		fi
+		rm -f "$kernel"
 	fi
 
-	rm -f "$kernel"
 	return $ret
 }
 
@@ -70,11 +102,12 @@ glinet_emmc_check_image() {
 		return 1
 	}
 
-	return 0
+	# Every section is inside the image, so its size bounds their sum.
+	glinet_emmc_fits_ram "$(wc -c < "$1")" "the image sections"
 }
 
 glinet_emmc_staged() {
-	echo "/tmp/glinet-emmc-$1.bin"
+	echo "$GLINET_STAGE_DIR/$1.bin"
 }
 
 # Extract one FIT section to /tmp and check that it fits its partition.
@@ -112,8 +145,7 @@ glinet_emmc_write_staged() {
 }
 
 glinet_emmc_cleanup_staged() {
-	rm -f "$(glinet_emmc_staged hlos)" "$(glinet_emmc_staged rootfs)" \
-		"$(glinet_emmc_staged wifi_fw)"
+	rm -rf "$GLINET_STAGE_DIR"
 }
 
 glinet_emmc_do_fit_upgrade() {
@@ -134,6 +166,14 @@ glinet_emmc_do_fit_upgrade() {
 	}
 	[ -z "$wifi_fw" ] || [ -n "$wifi_fw_dev" ] || {
 		v "Unable to find the GL.iNet Wi-Fi firmware partition."
+		return 1
+	}
+
+	# Checked here too: sysupgrade -F goes past the image check.
+	glinet_emmc_fits_ram "$(wc -c < "$image")" "the image sections" || return 1
+
+	GLINET_STAGE_DIR=$(mktemp -d /tmp/glinet-emmc.XXXXXX) || {
+		v "Unable to create a temporary directory in /tmp."
 		return 1
 	}
 
