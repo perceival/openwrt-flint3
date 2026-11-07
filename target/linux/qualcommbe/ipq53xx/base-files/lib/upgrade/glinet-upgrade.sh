@@ -4,6 +4,34 @@
 # the upgrade and whatever is still running.
 GLINET_RAM_MARGIN_KB=32768
 
+# Once the upgrade proper has begun, ssh and logd are gone and a failure means an
+# immediate reboot, so a message only reaches the serial console. Put it in the
+# kernel log as well, where ramoops can keep it across that reboot.
+glinet_emmc_err() {
+	v "$*"
+	[ -n "$GLINET_EMMC_STAGE2" ] || return 0
+	{ echo "<3>sysupgrade: $*" > /dev/kmsg; } 2>/dev/null
+	return 0
+}
+
+# What writing and verifying need. Checked with the image, where the message can
+# be seen, and again before the first write, since sysupgrade -F goes past that.
+glinet_emmc_check_tools() {
+	local tool
+
+	for tool in "$@"; do
+		command -v "$tool" >/dev/null || {
+			glinet_emmc_err "$tool is missing, so the upgrade cannot be checked and written safely."
+			return 1
+		}
+	done
+
+	[ -w /proc/sys/vm/drop_caches ] || {
+		glinet_emmc_err "The page cache cannot be dropped, so nothing written could be verified."
+		return 1
+	}
+}
+
 # /tmp is RAM. Say no before staging anything that does not fit, rather than
 # fail or get something killed halfway. An input image in /tmp is already gone
 # from MemAvailable and from the free space of /tmp, so only new bytes count.
@@ -16,13 +44,13 @@ glinet_emmc_fits_ram() {
 
 	avail_kb=$(awk '$1 == "MemAvailable:" { print $2 }' /proc/meminfo)
 	[ "${avail_kb:-0}" -ge $((need_kb + GLINET_RAM_MARGIN_KB)) ] || {
-		v "Not enough free RAM for $what: $need_kb KiB + $GLINET_RAM_MARGIN_KB KiB margin needed, ${avail_kb:-0} KiB available."
+		glinet_emmc_err "Not enough free RAM for $what: $need_kb KiB + $GLINET_RAM_MARGIN_KB KiB margin needed, ${avail_kb:-0} KiB available."
 		return 1
 	}
 
 	tmp_kb=$(df -k /tmp 2>/dev/null | awk 'NR == 2 { print $4 }')
 	[ -z "$tmp_kb" ] || [ "$tmp_kb" -ge "$need_kb" ] || {
-		v "Not enough room in /tmp for $what: $need_kb KiB needed, $tmp_kb KiB free."
+		glinet_emmc_err "Not enough room in /tmp for $what: $need_kb KiB needed, $tmp_kb KiB free."
 		return 1
 	}
 }
@@ -44,11 +72,6 @@ glinet_get_fit_part() {
 glinet_emmc_check_tar() {
 	local image="$1"
 	local gz board_dir kernel size limit hlos_dev ret=1
-
-	command -v dumpimage >/dev/null || {
-		v "dumpimage is missing, so the kernel cannot be checked for FIT configuration \"config-1\"."
-		return 1
-	}
 
 	[ "$(identify_magic_long "$(get_magic_long "$image" cat)")" = "gzip" ] && gz=z
 	board_dir=$(tar t${gz}f "$image" 2>/dev/null | grep -m 1 '^sysupgrade-.*/$')
@@ -85,6 +108,8 @@ glinet_emmc_check_tar() {
 }
 
 glinet_emmc_check_image() {
+	glinet_emmc_check_tools dumpimage mktemp sha256sum || return 1
+
 	[ "$(identify_magic_long "$(get_magic_long "$1")")" != "fit" ] && {
 		glinet_emmc_check_tar "$1"
 		return
@@ -128,14 +153,14 @@ glinet_emmc_stage_fit_part() {
 	rm -f "$output"
 	dumpimage -T flat_dt -p "$part" -o "$output" "$image" >/dev/null 2>&1 &&
 		[ -s "$output" ] || {
-		v "Unable to extract $name from the image."
+		glinet_emmc_err "Unable to extract $name from the image."
 		return 1
 	}
 
 	size=$(wc -c < "$output")
 	limit=$(( $(cat "/sys/class/block/${device##*/}/size" 2>/dev/null || echo 0) * 512 ))
 	[ "$size" -le "$limit" ] || {
-		v "$name ($size bytes) does not fit $device ($limit bytes)."
+		glinet_emmc_err "$name ($size bytes) does not fit $device ($limit bytes)."
 		return 1
 	}
 }
@@ -150,7 +175,7 @@ glinet_emmc_verify() {
 	local got
 
 	sync
-	{ echo 3 > /proc/sys/vm/drop_caches; } 2>/dev/null
+	{ echo 3 > /proc/sys/vm/drop_caches; } 2>/dev/null || return 1
 
 	got=$( { dd bs=1048576 count=$((size / 1048576))
 		dd bs=512 count=$((size % 1048576 / 512))
@@ -170,10 +195,10 @@ glinet_emmc_write_staged() {
 		v "Writing $name to $device"
 		dd if="$staged" of="$device" bs=1M conv=fsync &&
 			glinet_emmc_verify "$want" "$device" "$size" && return 0
-		v "$name does not read back correctly from $device."
+		glinet_emmc_err "$name does not read back correctly from $device."
 	done
 
-	v "Giving up on $name. The eMMC may be failing; use the U-Boot recovery."
+	glinet_emmc_err "Giving up on $name. The eMMC may be failing; use the U-Boot recovery."
 	return 1
 }
 
@@ -194,12 +219,12 @@ glinet_emmc_verify_tar_kernel() {
 	want=$(tar x${gz}f "$image" "$board_dir/kernel" -O 2>/dev/null | sha256sum)
 	glinet_emmc_verify "$want" "$hlos_dev" "$size" && return 0
 
-	v "The kernel does not read back correctly from $hlos_dev, writing it again."
+	glinet_emmc_err "The kernel does not read back correctly from $hlos_dev, writing it again."
 	tar x${gz}f "$image" "$board_dir/kernel" -O 2>/dev/null |
 		dd of="$hlos_dev" bs=1M conv=fsync
 	glinet_emmc_verify "$want" "$hlos_dev" "$size" && return 0
 
-	v "Giving up on the kernel. The eMMC may be failing; use the U-Boot recovery."
+	glinet_emmc_err "Giving up on the kernel. The eMMC may be failing; use the U-Boot recovery."
 	return 1
 }
 
@@ -218,18 +243,13 @@ glinet_emmc_do_fit_upgrade() {
 	local rootfs_size
 
 	[ -n "$wifi_fw" ] && wifi_fw_dev=$(find_mmc_part "0:WIFIFW" "$CI_ROOTDEV")
-	command -v sha256sum >/dev/null || {
-		v "sha256sum is missing, so nothing written could be verified."
-		return 1
-	}
-
 	[ -n "$hlos" ] && [ -n "$rootfs" ] && \
 		[ -n "$hlos_dev" ] && [ -n "$rootfs_dev" ] || {
-		v "Unable to find the required GL.iNet image sections or eMMC partitions."
+		glinet_emmc_err "Unable to find the required GL.iNet image sections or eMMC partitions."
 		return 1
 	}
 	[ -z "$wifi_fw" ] || [ -n "$wifi_fw_dev" ] || {
-		v "Unable to find the GL.iNet Wi-Fi firmware partition."
+		glinet_emmc_err "Unable to find the GL.iNet Wi-Fi firmware partition."
 		return 1
 	}
 
@@ -237,7 +257,7 @@ glinet_emmc_do_fit_upgrade() {
 	glinet_emmc_fits_ram "$(wc -c < "$image")" "the image sections" || return 1
 
 	GLINET_STAGE_DIR=$(mktemp -d /tmp/glinet-emmc.XXXXXX) || {
-		v "Unable to create a temporary directory in /tmp."
+		glinet_emmc_err "Unable to create a temporary directory in /tmp."
 		return 1
 	}
 
@@ -253,7 +273,10 @@ glinet_emmc_do_fit_upgrade() {
 
 	# Point of no return. Invalidate the kernel first and write it last, so
 	# an interrupted upgrade cannot boot a kernel against a partial rootfs.
-	dd if=/dev/zero of="$hlos_dev" bs=512 count=8 conv=fsync || return 1
+	dd if=/dev/zero of="$hlos_dev" bs=512 count=8 conv=fsync || {
+		glinet_emmc_err "Unable to write to $hlos_dev."
+		return 1
+	}
 	glinet_emmc_write_staged rootfs "$rootfs_dev" || return 1
 
 	# The firmware just written looks for its overlay right behind its
@@ -272,16 +295,20 @@ glinet_emmc_do_fit_upgrade() {
 }
 
 glinet_emmc_do_upgrade() {
+	GLINET_EMMC_STAGE2=1
+
 	case "$(identify_magic_long "$(get_magic_long "$1")")" in
 	fit)
+		glinet_emmc_check_tools dumpimage mktemp sha256sum || return 1
 		glinet_emmc_do_fit_upgrade "$1"
 		;;
 	*)
-		command -v sha256sum >/dev/null || {
-			v "sha256sum is missing, so nothing written could be verified."
+		glinet_emmc_check_tools sha256sum || return 1
+		emmc_do_upgrade "$1" || {
+			glinet_emmc_err "Writing the sysupgrade image failed."
 			return 1
 		}
-		emmc_do_upgrade "$1" && glinet_emmc_verify_tar_kernel "$1"
+		glinet_emmc_verify_tar_kernel "$1"
 		;;
 	esac
 }
