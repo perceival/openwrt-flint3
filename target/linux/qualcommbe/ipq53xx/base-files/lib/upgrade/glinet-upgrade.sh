@@ -213,8 +213,21 @@ glinet_emmc_verify_tar_kernel() {
 	board_dir=$(tar t${gz}f "$image" 2>/dev/null | grep -m 1 '^sysupgrade-.*/$')
 	board_dir=${board_dir%/}
 
+	# The same test emmc_upgrade_tar() uses: with no kernel it wrote none.
+	tar t${gz}f "$image" "$board_dir/kernel" >/dev/null 2>&1 || return 0
+
+	# A pipe hides a tar failure, and a kernel read short would look like a
+	# mismatch and get a good kernel overwritten: first read it all.
+	tar x${gz}f "$image" "$board_dir/kernel" -O >/dev/null 2>&1 || {
+		glinet_emmc_err "The kernel cannot be read from the image, so it cannot be verified."
+		return 1
+	}
+
 	size=$(tar x${gz}f "$image" "$board_dir/kernel" -O 2>/dev/null | wc -c)
-	[ "$size" -gt 0 ] || return 0
+	[ "$size" -gt 0 ] || {
+		glinet_emmc_err "The kernel in the image is empty."
+		return 1
+	}
 
 	want=$(tar x${gz}f "$image" "$board_dir/kernel" -O 2>/dev/null | sha256sum)
 	glinet_emmc_verify "$want" "$hlos_dev" "$size" && return 0
