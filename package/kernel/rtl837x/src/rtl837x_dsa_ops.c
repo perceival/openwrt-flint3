@@ -1767,9 +1767,6 @@ static int rtl837x_tag_protocol_resync(struct dsa_switch *ds)
 	return 0;
 }
 
-static void rtl837x_tag_protocol_unapply(struct dsa_switch *ds,
-					  enum dsa_tag_protocol proto);
-
 /* Apply the chip-side configuration a tagger needs. Caller holds rtnl. */
 static int rtl837x_tag_protocol_apply(struct dsa_switch *ds,
 				       enum dsa_tag_protocol proto)
@@ -1801,8 +1798,13 @@ static int rtl837x_tag_protocol_apply(struct dsa_switch *ds,
 			return rtl837x_to_errno(ret);
 
 		ret = dsa_tag_8021q_register(ds, htons(ETH_P_8021Q));
-		if (ret)
+		if (ret) {
+			/* A failed register frees the context but leaves the
+			 * pointer to it.
+			 */
+			ds->tag_8021q_ctx = NULL;
 			return ret;
+		}
 
 		/* A standard 802.1Q tag is something the PPE parser handles,
 		 * so hardware checksumming is safe again.
@@ -1855,15 +1857,19 @@ static int rtl837x_tag_protocol_apply(struct dsa_switch *ds,
 	ret = rtl837x_tag_protocol_resync(ds);
 	if (ret && proto != old) {
 		/* DSA keeps the old tagger when a change fails, so tag_proto
-		 * has to keep naming it. Take back what was set up above,
-		 * tag_8021q's VLANs above all, so that the caller can apply
-		 * the old tagger on a clean slate. When proto is the tagger
-		 * already in place (setup, or that restore itself), there is
-		 * nothing better to fall back to and it stays.
+		 * has to keep naming it, and the caller applies that tagger
+		 * next. Remove tag_8021q's own VLANs and PVIDs, but do not
+		 * reseed the VLAN table as a regular unapply does: a
+		 * VLAN-aware bridge's VLANs and PVIDs are still valid for the
+		 * tagger being restored. When proto is the tagger already in
+		 * place (setup, or that restore itself), there is nothing
+		 * better to fall back to and it stays.
 		 */
-		gsw->tag_proto_changing = true;
-		rtl837x_tag_protocol_unapply(ds, proto);
-		gsw->tag_proto_changing = false;
+		if (proto == DSA_TAG_PROTO_VSC73XX_8021Q) {
+			gsw->tag_proto_changing = true;
+			dsa_tag_8021q_unregister(ds);
+			gsw->tag_proto_changing = false;
+		}
 		gsw->tag_proto = old;
 	}
 
@@ -1880,7 +1886,11 @@ static void rtl837x_tag_protocol_unapply(struct dsa_switch *ds,
 	if (proto == DSA_TAG_PROTO_VSC73XX_8021Q) {
 		int port;
 
-		dsa_tag_8021q_unregister(ds);
+		/* No context if restoring this tagger failed after a failed
+		 * change away from it.
+		 */
+		if (ds->tag_8021q_ctx)
+			dsa_tag_8021q_unregister(ds);
 
 		/* Unregistering drops tag_8021q's VLANs, but the ports are
 		 * still classifying by the PVIDs it installed. Forget that
