@@ -23,20 +23,26 @@ address is from the device tree and all are distinct.
 
 Read the address at the start of the bus probe instead of from the QMI
 event work that starts the hardware group. of_get_mac_address() returns
--EPROBE_DEFER while the nvmem provider is not ready (since 6.18.45 also
-until the nvmem fixed-layout driver has bound), and that work runs long
-after probe, where the only option left was the firmware placeholder.
-At the start of the probe nothing is set up yet, on AHB or on PCI, and
-the device has not joined its hardware group, so a deferral needs no
-unwinding and only delays the group, which waits for all of its devices
-anyway.
+-EPROBE_DEFER while the nvmem provider is not ready, since Linux
+b5be879519 ("nvmem: layouts: Add fixed-layout driver", 6.18.45 as
+9dbe1d0111) also until the fixed-layout driver has bound, and that work
+runs long after probe, where the only option left was the firmware
+placeholder. At the start of the probe nothing is set up yet, on AHB or
+on PCI, and the device has not joined its hardware group, so a deferral
+needs no unwinding and only delays the group, which waits for all of its
+devices anyway.
+
+nvmem_register() adds the provider before it populates the layout, so
+for a moment a real cell returns -ENOENT. A node that names a
+"mac-address" cell treats that as not ready. A node that names none
+never defers.
 
 The deferral is bounded by the driver core's deferred probe timeout: a
 cell whose provider never appears ends with a warning and the firmware
-address, not with a device that never probes. A node without a cell
-never defers. While a device is deferred the devices behind it wait too,
-because the probe order sets device_id and with it the radio indices and
-the parent device of the wiphy.
+address, not with a device that never probes. While a device is deferred
+the devices behind it wait too, until it has joined its group or failed,
+because the order of joining sets device_id and with it the radio indices
+and the parent device of the wiphy.
 
 Log the device tree address, and a failure to read one other than "no
 address in the node", so the source of the MAC shows in dmesg.
@@ -60,15 +66,26 @@ diff --git a/drivers/net/wireless/ath/ath12k/ahb.c b/drivers/net/wireless/ath/at
 diff --git a/drivers/net/wireless/ath/ath12k/core.c b/drivers/net/wireless/ath/ath12k/core.c
 --- a/drivers/net/wireless/ath/ath12k/core.c
 +++ b/drivers/net/wireless/ath/ath12k/core.c
-@@ -1206,17 +1206,75 @@ err_mlo_teardown:
+@@ -1206,17 +1206,91 @@ err_mlo_teardown:
  	return ret;
  }
  
 -static void ath12k_core_get_mac_address(struct ath12k_base *ab)
-+/* First device that deferred its probe for its address and has not come back
-+ * yet. Protected with ath12k_hw_group_mutex.
++/* First device that deferred its probe for its address and has not taken its
++ * place in the hardware group yet. Protected with ath12k_hw_group_mutex.
 + */
 +static const struct device *ath12k_mac_deferred_dev;
++
++static void ath12k_core_release_mac_guard(struct ath12k_base *ab)
+ {
+-	u8 mac_addr[ETH_ALEN];
++	lockdep_assert_held(&ath12k_hw_group_mutex);
+ 
+-	if (!ab->dev->of_node)
+-		return;
++	if (ath12k_mac_deferred_dev == ab->dev)
++		ath12k_mac_deferred_dev = NULL;
++}
 +
 +/* Read the device tree address at the very start of the bus probe: nothing has
 + * been set up yet that a deferral would have to undo, and the device has not
@@ -82,38 +99,44 @@ diff --git a/drivers/net/wireless/ath/ath12k/core.c b/drivers/net/wireless/ath/a
 + * the driver core, because a provider that never appears (the partition is
 + * gone, the eMMC has failed) must not cost the device its radios: from then on
 + * the device goes on with the firmware address, as it does with a blank cell.
-+ * A node without such a cell returns -ENOENT or -ENODEV and never defers.
++ * A node that names no "mac-address" cell returns -ENOENT or -ENODEV and never
++ * defers. A node that does name one can get -ENOENT too: nvmem_register() adds
++ * the provider before it populates the layout, so for a moment the provider
++ * can be found and the cell cannot. That counts as not ready yet.
 + *
-+ * The order in which the devices of a group finish probing sets their
-+ * device_id, and through it the radio indices and the parent device of the
-+ * wiphy, which is what /etc/config/wireless refers to. Hold back the devices
-+ * behind one that deferred, or a provider coming up between the two probes
-+ * would swap them.
++ * The order in which the devices of a group join it sets their device_id, and
++ * through it the radio indices and the parent device of the wiphy, which is
++ * what /etc/config/wireless refers to. Hold back the devices behind one that
++ * deferred until it has joined, or a provider coming up between the two probes
++ * would swap them. ath12k_core_init() releases them, and ath12k_core_free() if
++ * the probe fails on the way there.
 + */
 +int ath12k_core_read_dt_mac_address(struct ath12k_base *ab)
- {
--	u8 mac_addr[ETH_ALEN];
++{
 +	struct device *dev = ab->dev;
 +	int ret;
- 
--	if (!ab->dev->of_node)
--		return;
++
 +	if (!dev->of_node)
 +		return 0;
 +
 +	ret = of_get_mac_address(dev->of_node, ab->dt_mac_addr);
-+
++	if (ret == -ENOENT &&
++	    of_property_match_string(dev->of_node, "nvmem-cell-names",
++				     "mac-address") >= 0)
++		ret = -EPROBE_DEFER;
+ 
+-	if (of_get_mac_address(ab->dev->of_node, mac_addr))
 +	mutex_lock(&ath12k_hw_group_mutex);
 +	if ((ret == -EPROBE_DEFER ||
 +	     (ath12k_mac_deferred_dev && ath12k_mac_deferred_dev != dev)) &&
 +	    driver_deferred_probe_check_state(dev) == -EPROBE_DEFER) {
 +		if (!ath12k_mac_deferred_dev)
 +			ath12k_mac_deferred_dev = dev;
++		ab->mac_addr_deferred = true;
 +		mutex_unlock(&ath12k_hw_group_mutex);
 +		return dev_err_probe(dev, -EPROBE_DEFER,
 +				     "waiting for the device tree MAC address\n");
 +	}
-+	ath12k_mac_deferred_dev = NULL;
 +	mutex_unlock(&ath12k_hw_group_mutex);
 +
 +	if (ret) {
@@ -123,8 +146,7 @@ diff --git a/drivers/net/wireless/ath/ath12k/core.c b/drivers/net/wireless/ath/a
 +				    ret);
 +		return 0;
 +	}
- 
--	if (of_get_mac_address(ab->dev->of_node, mac_addr))
++
 +	ab->mac_addr_from_dt = true;
 +	ath12k_info(ab, "MAC address %pM from device tree\n", ab->dt_mac_addr);
 +
@@ -142,7 +164,7 @@ diff --git a/drivers/net/wireless/ath/ath12k/core.c b/drivers/net/wireless/ath/a
  	ab->pdevs_macaddr_valid = false;
  }
  
-@@ -1239,7 +1297,7 @@ static int ath12k_core_hw_group_start(struct ath12k_hw_group *ag)
+@@ -1239,7 +1313,7 @@ static int ath12k_core_hw_group_start(struct ath12k_hw_group *ag)
  	for (i = 0; i < ag->num_devices; i++) {
  		ab = ag->ab[i];
  		if (ab)
@@ -151,6 +173,28 @@ diff --git a/drivers/net/wireless/ath/ath12k/core.c b/drivers/net/wireless/ath/a
  	}
  
  	ret = ath12k_mac_allocate(ag);
+@@ -2345,6 +2419,7 @@ int ath12k_core_init(struct ath12k_base *ab)
+ 	mutex_lock(&ath12k_hw_group_mutex);
+ 
+ 	ag = ath12k_core_hw_group_assign(ab);
++	ath12k_core_release_mac_guard(ab);
+ 	if (!ag) {
+ 		mutex_unlock(&ath12k_hw_group_mutex);
+ 		ath12k_warn(ab, "unable to get hw group\n");
+@@ -2389,6 +2464,13 @@ void ath12k_core_deinit(struct ath12k_base *ab)
+ 
+ void ath12k_core_free(struct ath12k_base *ab)
+ {
++	/* A device deferring for its address stays first in line */
++	if (!ab->mac_addr_deferred) {
++		mutex_lock(&ath12k_hw_group_mutex);
++		ath12k_core_release_mac_guard(ab);
++		mutex_unlock(&ath12k_hw_group_mutex);
++	}
++
+ 	timer_delete_sync(&ab->rx_replenish_retry);
+ 	ath12k_wmi_free();
+ 	destroy_workqueue(ab->workqueue_aux);
 diff --git a/drivers/net/wireless/ath/ath12k/core.h b/drivers/net/wireless/ath/ath12k/core.h
 --- a/drivers/net/wireless/ath/ath12k/core.h
 +++ b/drivers/net/wireless/ath/ath12k/core.h
@@ -164,17 +208,19 @@ diff --git a/drivers/net/wireless/ath/ath12k/core.h b/drivers/net/wireless/ath/a
  	/* Keep last */
  	struct ath12k radio[] __aligned(sizeof(void *));
  };
-@@ -1048,6 +1051,9 @@ struct ath12k_base {
+@@ -1048,6 +1051,11 @@ struct ath12k_base {
  	struct ath12k_wmi_target_cap_arg target_caps;
  	u32 ext_service_bitmap[WMI_SERVICE_EXT_BM_SIZE];
  	bool pdevs_macaddr_valid;
 +	/* mac_addr is taken from the device tree, not from firmware */
 +	bool mac_addr_from_dt;
++	/* this probe is being deferred until the address can be read */
++	bool mac_addr_deferred;
 +	u8 dt_mac_addr[ETH_ALEN] __aligned(2);
  
  	const struct ath12k_hw_params *hw_params;
  
-@@ -1288,6 +1294,7 @@ void ath12k_core_deinit(struct ath12k_base *ath12k);
+@@ -1288,6 +1296,7 @@ void ath12k_core_deinit(struct ath12k_base *ath12k);
  struct ath12k_base *ath12k_core_alloc(struct device *dev, size_t priv_size,
  				      enum ath12k_bus bus);
  void ath12k_core_free(struct ath12k_base *ath12k);
