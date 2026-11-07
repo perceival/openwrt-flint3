@@ -661,6 +661,31 @@ int rtl8372n_hw_init(struct rtk_gsw *gsw, rtl837x_pnswap_cfg_t swap_cfg)
 	return 0;
 }
 
+/* The conduit the CPU-port work closed is up again: end the reset and reopen
+ * the user ports that closing it took down. Caller holds rtnl.
+ */
+static void rtl837x_cpu_reset_finish(struct rtk_gsw *gsw)
+{
+	struct dsa_port *dp;
+	int ret;
+
+	if (!(gsw->ethernet_master->flags & IFF_UP))
+		return;
+
+	gsw->cpu_reset_pending = false;
+	dsa_switch_for_each_user_port(dp, &gsw->ds) {
+		if (!(gsw->cpu_reset_users & BIT(dp->index)) ||
+		    !dp->user || netif_running(dp->user))
+			continue;
+
+		ret = dev_open(dp->user, NULL);
+		if (ret)
+			dev_warn(gsw->dev,
+				 "failed to reopen %s after CPU SerDes reset: %d\n",
+				 netdev_name(dp->user), ret);
+	}
+}
+
 static void rtl837x_status_check_work_func(struct work_struct *work)
 {
 	struct rtk_gsw *gsw = container_of(work, struct rtk_gsw, status_check_work.work);
@@ -678,9 +703,19 @@ static void rtl837x_status_check_work_func(struct work_struct *work)
 		goto reschedule;
 	}
 
-	/* Only this work item touches cpu_reset_pending. */
-	if (port_status.link)
-		gsw->cpu_reset_pending = false;
+	/* Only this work item touches cpu_reset_pending. The link coming back
+	 * does not end a reset by itself: the conduit may have failed to
+	 * reopen, and the user ports are still waiting either way.
+	 */
+	if (port_status.link && gsw->cpu_reset_pending) {
+		rtnl_lock();
+		ret = dev_open(gsw->ethernet_master, NULL);
+		if (ret)
+			dev_warn_ratelimited(gsw->dev,
+					     "failed to reopen ethernet master: %d\n", ret);
+		rtl837x_cpu_reset_finish(gsw);
+		rtnl_unlock();
+	}
 
 	if (!port_status.link)
 	{
@@ -747,20 +782,7 @@ static void rtl837x_status_check_work_func(struct work_struct *work)
 					     "failed to restore CPU SerDes mode: %d\n", ret);
 
 		rtnl_lock();
-		if (gsw->ethernet_master->flags & IFF_UP) {
-			gsw->cpu_reset_pending = false;
-			dsa_switch_for_each_user_port(dp, &gsw->ds) {
-				if (!(gsw->cpu_reset_users & BIT(dp->index)) ||
-				    !dp->user || netif_running(dp->user))
-					continue;
-
-				ret = dev_open(dp->user, NULL);
-				if (ret)
-					dev_warn(gsw->dev,
-						 "failed to reopen %s after CPU SerDes reset: %d\n",
-						 netdev_name(dp->user), ret);
-			}
-		}
+		rtl837x_cpu_reset_finish(gsw);
 		rtnl_unlock();
 
 		msleep(2000);
