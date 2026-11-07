@@ -48,7 +48,8 @@
  * Nothing at setup clears what these modes program, and the GL-BE9300 has no
  * switch reset line. Unloading the module undoes it, see
  * rtl837x_clear_opt_in_state(); a reboot does not run that and may not clear
- * it, so after turning a mode off, unload the module or power-cycle.
+ * it. To turn a mode off, unload the module while it is still loaded with the
+ * mode on, or power-cycle after the change.
  */
 static bool vlan_passthrough;
 module_param(vlan_passthrough, bool, 0444);
