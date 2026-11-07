@@ -3152,34 +3152,73 @@ pvid:
 	return 0;
 }
 
-/* DSA counts host addresses per {MAC, VID, database}, but several of those
+/* DSA keeps one host address per {MAC, VID, database}, but several of those
  * can share one LUT key. The user ports normally all have the same MAC, so
  * under rtl8_4 every port's standalone entry and the bridge's own entries
  * (VID 0 and VID 1) all land on {MAC, VID 1}, and with per_bridge_fid the
- * standalone entries of all ports share one FID. Without counting, taking
- * one port down, or the last port leaving the bridge, would remove the LUT
- * entry from under the others. Caller holds rtl837x_ind_lock.
+ * standalone entries of all ports share one FID. The LUT entry has to stay
+ * until the last of them is gone, or taking one port down, or the last port
+ * leaving the bridge, would remove it from under the others.
+ *
+ * Each address remembers the key it was added with: the key depends on the
+ * tagger, and DSA keeps host addresses across a tagger change without
+ * replaying them. Callers hold rtl837x_ind_lock.
  */
 struct rtl837x_host_fdb {
 	struct list_head list;
 	u8 addr[ETH_ALEN];
+	u16 vid;
+	struct dsa_db db;
 	u32 ivl;
 	u16 vid_fid;
-	unsigned int refcount;
 };
 
+static bool rtl837x_db_equal(const struct dsa_db *a, const struct dsa_db *b)
+{
+	if (a->type != b->type)
+		return false;
+
+	switch (a->type) {
+	case DSA_DB_PORT:
+		return a->dp == b->dp;
+	case DSA_DB_BRIDGE:
+		return a->bridge.num == b->bridge.num;
+	case DSA_DB_LAG:
+		return a->lag.dev == b->lag.dev;
+	default:
+		return false;
+	}
+}
+
 static struct rtl837x_host_fdb *
-rtl837x_host_fdb_find(struct rtk_gsw *gsw, const unsigned char *addr, u32 ivl,
-		      u16 vid_fid)
+rtl837x_host_fdb_find(struct rtk_gsw *gsw, const unsigned char *addr, u16 vid,
+		      const struct dsa_db *db)
 {
 	struct rtl837x_host_fdb *host;
 
 	list_for_each_entry(host, &gsw->host_fdb, list)
-		if (host->ivl == ivl && host->vid_fid == vid_fid &&
-		    ether_addr_equal(host->addr, addr))
+		if (host->vid == vid && ether_addr_equal(host->addr, addr) &&
+		    rtl837x_db_equal(&host->db, db))
 			return host;
 
 	return NULL;
+}
+
+/* Does an address other than @skip hold this LUT key? */
+static bool rtl837x_host_fdb_key_used(struct rtk_gsw *gsw,
+				      const struct rtl837x_host_fdb *skip,
+				      const unsigned char *addr, u32 ivl,
+				      u16 vid_fid)
+{
+	struct rtl837x_host_fdb *host;
+
+	list_for_each_entry(host, &gsw->host_fdb, list)
+		if (host != skip && host->ivl == ivl &&
+		    host->vid_fid == vid_fid &&
+		    ether_addr_equal(host->addr, addr))
+			return true;
+
+	return false;
 }
 
 static void rtl837x_host_fdb_flush(struct rtk_gsw *gsw)
@@ -3198,7 +3237,7 @@ static int rtl837x_port_fdb_add(struct dsa_switch *ds, int port,
 				const unsigned char *addr, u16 vid,
 				struct dsa_db db)
 {
-	struct rtl837x_host_fdb *host = NULL, *new_host = NULL;
+	struct rtl837x_host_fdb *new_host = NULL;
 	struct rtk_gsw *gsw = ds->priv;
 	rtk_l2_ucastAddr_t l2 = { 0 };
 	rtk_mac_t mac = { 0 };
@@ -3232,21 +3271,18 @@ static int rtl837x_port_fdb_add(struct dsa_switch *ds, int port,
 	}
 
 	mutex_lock(&rtl837x_ind_lock);
-	if (new_host)
-		host = rtl837x_host_fdb_find(gsw, addr, ivl, vid_fid);
-	if (host) {
-		host->refcount++;
+	if (new_host && rtl837x_host_fdb_key_used(gsw, NULL, addr, ivl, vid_fid))
 		ret = RT_ERR_OK;
-	} else {
+	else
 		ret = rtk_l2_addr_add(&mac, &l2);
-		if (new_host && ret == RT_ERR_OK) {
-			ether_addr_copy(new_host->addr, addr);
-			new_host->ivl = ivl;
-			new_host->vid_fid = vid_fid;
-			new_host->refcount = 1;
-			list_add_tail(&new_host->list, &gsw->host_fdb);
-			new_host = NULL;
-		}
+	if (new_host && ret == RT_ERR_OK) {
+		ether_addr_copy(new_host->addr, addr);
+		new_host->vid = vid;
+		new_host->db = db;
+		new_host->ivl = ivl;
+		new_host->vid_fid = vid_fid;
+		list_add_tail(&new_host->list, &gsw->host_fdb);
+		new_host = NULL;
 	}
 	mutex_unlock(&rtl837x_ind_lock);
 	kfree(new_host);
@@ -3277,24 +3313,28 @@ static int rtl837x_port_fdb_del(struct dsa_switch *ds, int port,
 
 	memcpy(mac.octet, addr, ETH_ALEN);
 	memcpy(l2.mac.octet, addr, ETH_ALEN);
-	l2.ivl = ivl;
-	l2.vid_fid = vid_fid;
 	l2.port = port;
 	l2.is_static = 1;
 
 	mutex_lock(&rtl837x_ind_lock);
-	if (port == gsw->cpu_port)
-		host = rtl837x_host_fdb_find(gsw, addr, ivl, vid_fid);
-	if (host && host->refcount > 1) {
-		host->refcount--;
+	if (port == gsw->cpu_port) {
+		host = rtl837x_host_fdb_find(gsw, addr, vid, &db);
+		if (host) {
+			ivl = host->ivl;
+			vid_fid = host->vid_fid;
+		}
+	}
+	if (port == gsw->cpu_port &&
+	    rtl837x_host_fdb_key_used(gsw, host, addr, ivl, vid_fid)) {
 		ret = RT_ERR_OK;
 	} else {
+		l2.ivl = ivl;
+		l2.vid_fid = vid_fid;
 		ret = rtk_l2_addr_del(&mac, &l2);
-		if (host && (ret == RT_ERR_OK ||
-			     ret == RT_ERR_L2_ENTRY_NOTFOUND)) {
-			list_del(&host->list);
-			kfree(host);
-		}
+	}
+	if (host && (ret == RT_ERR_OK || ret == RT_ERR_L2_ENTRY_NOTFOUND)) {
+		list_del(&host->list);
+		kfree(host);
 	}
 	mutex_unlock(&rtl837x_ind_lock);
 	if (ret == RT_ERR_L2_ENTRY_NOTFOUND)
