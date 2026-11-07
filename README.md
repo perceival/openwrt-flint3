@@ -73,11 +73,12 @@ Throughput measured between two units over a 2.5G trunk: **~1.8–1.9 Gbit/s**.
 
 The image uses 2.4 GHz board data that is known to work with this firmware. GL's
 own firmware loads another board file for this board (`bdwlan.b12`), which has
-not yet been tried with the ath12k firmware. To try it, install the optional
-package `ipq-wifi-glinet_gl-be9300-bdf-test`: select it in `make menuconfig`
-(Firmware, ath10k Board-Specific Overrides), or copy the `.apk` from your build's
-`packages` directory to the unit and run `apk add --allow-untrusted` on it. It is
-not in the default image. It installs a `board-2.bin` container holding that board
+not yet been tried with the ath12k firmware. To try it, you need the optional
+package `ipq-wifi-glinet_gl-be9300-bdf-test`. A default build neither includes nor
+builds it, so select it first in `make menuconfig` (Firmware, ath10k Board-Specific
+Overrides): as `<*>` to put it in the image, or as `<M>` to build only the package,
+then copy the `.apk` from the build's `packages` directory to the unit and run
+`apk add --allow-untrusted` on it. It installs a `board-2.bin` container holding that board
 file, with the board name and regdb of the normal one, as
 `/lib/firmware/ath12k-test/ath12k/IPQ5332/hw1.0/board-2.bin`, which nothing loads
 unless selected. To select it until the next reboot:
@@ -246,6 +247,16 @@ default environment".** `fw_setenv` would then write the tools' generic
 default environment (`bootcmd=run distro_bootcmd`) with a valid CRC, and
 this U-Boot would no longer boot the firmware. Remove `/etc/fw_env.config`
 instead and report the output of the stock check above.
+
+## A failed upgrade
+
+Once an upgrade has begun, ssh and the system log are gone, and if it fails the
+unit reboots at once, so its reason only shows on the serial console. The script
+also writes the reason to the kernel log. If the unit comes back on its old system,
+look in `/sys/fs/pstore/console-ramoops-0` before the next reboot. This has not
+been tried on hardware yet. Failures that can be found before the upgrade begins,
+such as too little RAM or a missing tool, are reported by `sysupgrade` itself
+unless `-F` is given.
 
 ## Crash logs
 
