@@ -122,9 +122,9 @@ diff --git a/drivers/net/wireless/ath/ath12k/core.h b/drivers/net/wireless/ath/a
  	bool recovery_booting;
 +	/* protected by base_lock. reset_gen counts resets (bumped where
 +	 * is_reset is set); a recovery power-up records it in boot_gen, and
-+	 * core_start copies boot_gen to ready_gen. ready_gen == reset_gen:
-+	 * the firmware that has started was booted for the current reset,
-+	 * the only one whose success may be reported.
++	 * ath12k_core_to_group_ref_get() copies boot_gen to ready_gen.
++	 * ready_gen == reset_gen: the firmware that has started was booted for
++	 * the current reset, the only one whose success may be reported.
 +	 */
 +	u32 reset_gen;
 +	u32 boot_gen;
