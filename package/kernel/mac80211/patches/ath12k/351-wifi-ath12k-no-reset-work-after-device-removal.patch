@@ -5,11 +5,12 @@ Subject: [PATCH] wifi: ath12k: no reset work after device removal
 ath12k_ahb_remove_prepare() never cancelled reset_work. A reset work
 that was queued, or sleeping in its 20 s wait, during rmmod then ran
 after ath12k_core_deinit() had cleared ab->ag (and freed the group), and
-locked ab->ag->mutex. Set UNREGISTERING under ag->mutex, which every path
-that tests it and queues reset_work holds, then cancel reset_work. Do
-the same in ath12k_pci_remove(), which cancelled the work but set the
-bit without the mutex, so a partner could still queue it after the
-cancel.
+locked ab->ag->mutex. Set UNREGISTERING under ag->mutex, which the group
+recovery paths hold while they test it and queue reset_work, then cancel
+reset_work. Do the same in ath12k_pci_remove(), which cancelled the work
+but set the bit without the mutex, so a partner could still queue it
+after the cancel. The MHI RDDM callback tests the bit without the mutex;
+355 handles a run it queues after the cancel.
 
 The group power-up now does nothing once the group is being
 unregistered and skips devices being removed, instead of booting them
@@ -25,10 +26,10 @@ diff --git a/drivers/net/wireless/ath/ath12k/ahb.c b/drivers/net/wireless/ath/at
  	}
  
 +	/*
-+	 * Under ag->mutex, which every path that tests this bit and then
-+	 * queues reset_work holds, so nothing queues it after the cancel
-+	 * below. A reset work must not outlive the device: it locks
-+	 * ab->ag->mutex, and ath12k_core_deinit() clears ab->ag.
++	 * Under ag->mutex, which the group recovery paths hold while they
++	 * test this bit and queue reset_work, so they cannot queue it after
++	 * the cancel below. A reset work must not outlive the device: it
++	 * locks ab->ag->mutex, and ath12k_core_deinit() clears ab->ag.
 +	 */
 +	mutex_lock(&ab->ag->mutex);
  	set_bit(ATH12K_FLAG_UNREGISTERING, &ab->dev_flags);

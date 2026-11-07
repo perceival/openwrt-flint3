@@ -6,23 +6,16 @@ The MHI RDDM callback tests UNREGISTERING without ag->mutex (taking the
 mutex there could wait behind a group power-up), so a reset work it
 queues can start after remove cancelled the work. Return from such a run
 before it touches the device; nothing waits for a device being removed.
-Correct the comment in ath12k_ahb_remove_prepare(), which claimed every
-queueing path holds the mutex.
+Say so in the comment in ath12k_ahb_remove_prepare().
 ---
 diff --git a/drivers/net/wireless/ath/ath12k/ahb.c b/drivers/net/wireless/ath/ath12k/ahb.c
 --- a/drivers/net/wireless/ath/ath12k/ahb.c
 +++ b/drivers/net/wireless/ath/ath12k/ahb.c
-@@ -1397,10 +1397,12 @@ static void ath12k_ahb_remove_prepare(st
- 	}
- 
- 	/*
--	 * Under ag->mutex, which every path that tests this bit and then
--	 * queues reset_work holds, so nothing queues it after the cancel
--	 * below. A reset work must not outlive the device: it locks
--	 * ab->ag->mutex, and ath12k_core_deinit() clears ab->ag.
-+	 * Under ag->mutex, which the group recovery paths hold while they
-+	 * test this bit and queue reset_work, so they cannot queue it after
-+	 * the cancel below. A reset work must not outlive the device: it
+@@ -1400,7 +1400,9 @@ static void ath12k_ahb_remove_prepare(st
+ 	 * Under ag->mutex, which the group recovery paths hold while they
+ 	 * test this bit and queue reset_work, so they cannot queue it after
+ 	 * the cancel below. A reset work must not outlive the device: it
+-	 * locks ab->ag->mutex, and ath12k_core_deinit() clears ab->ag.
 +	 * locks ab->ag->mutex, and ath12k_core_deinit() clears ab->ag. The
 +	 * MHI RDDM callback tests the bit without the mutex; a run it queues
 +	 * after the cancel returns at once (ath12k_core_reset()).

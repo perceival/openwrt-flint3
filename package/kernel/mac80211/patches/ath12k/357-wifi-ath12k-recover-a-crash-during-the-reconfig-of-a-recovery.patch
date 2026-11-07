@@ -16,7 +16,8 @@ it for the newer reset.
   boot; otherwise the device crashed since and is reset now.
 - reset_gen / boot_gen / ready_gen (under base_lock): reset_gen is
   bumped where is_reset is set, the recovery power-up copies it to
-  boot_gen, core_start copies boot_gen to ready_gen. The reconfig
+  boot_gen, and ath12k_core_to_group_ref_get(), called from
+  ath12k_core_start(), copies boot_gen to ready_gen. The reconfig
   complete handler reports success only when ready_gen == reset_gen,
   i.e. when the firmware that has started was booted for the current
   reset.

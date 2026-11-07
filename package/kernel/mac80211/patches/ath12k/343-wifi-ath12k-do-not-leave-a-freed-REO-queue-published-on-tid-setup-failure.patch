@@ -13,9 +13,6 @@ a recycled object for the rest of the association.
 
 Clear the active bit, and free the buffer and its per-peer slot only if
 this call allocated it. The same code is in mainline.
-
-From the netlink-panic investigation (finding NL-2, proposed there as
-patch 148).
 ---
 diff --git a/drivers/net/wireless/ath/ath12k/dp_rx.c b/drivers/net/wireless/ath/ath12k/dp_rx.c
 --- a/drivers/net/wireless/ath/ath12k/dp_rx.c

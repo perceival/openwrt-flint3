@@ -14,9 +14,6 @@ hexdump (the 0x?DBEEF header magic identifies REO descriptors).
 
 When disabled, allocation and free use kzalloc()/kfree() exactly as
 before.
-
-From the netlink-panic investigation (finding NL-1, proposed there as
-patch 149), gated behind a module parameter for this tree.
 ---
 diff --git a/drivers/net/wireless/ath/ath12k/dp_rx.c b/drivers/net/wireless/ath/ath12k/dp_rx.c
 --- a/drivers/net/wireless/ath/ath12k/dp_rx.c

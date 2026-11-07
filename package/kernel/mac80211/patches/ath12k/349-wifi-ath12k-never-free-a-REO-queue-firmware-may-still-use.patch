@@ -15,8 +15,10 @@ and a visible bound:
   until the id was reused or firmware restarted. Release the hold on
   any unmap of the id, before the peer lookup.
 - Count held descriptors in the cache-flush loop and warn, at most once
-  a minute, when more than 256 (about 8 MB) are held, so that firmware
-  that stops confirming deletes shows up instead of quietly using RAM.
+  a minute, when more than 256 are held (about 512 KB: each QoS queue
+  descriptor is a 2 KB allocation, sized for a 1024 BA window at 1663
+  bytes; the queues of about 15 peers), so that firmware that stops
+  confirming deletes shows up instead of quietly using RAM.
 ---
 diff --git a/drivers/net/wireless/ath/ath12k/dp_peer.c b/drivers/net/wireless/ath/ath12k/dp_peer.c
 --- a/drivers/net/wireless/ath/ath12k/dp_peer.c
@@ -110,12 +112,13 @@ diff --git a/drivers/net/wireless/ath/ath12k/dp_rx.c b/drivers/net/wireless/ath/
 diff --git a/drivers/net/wireless/ath/ath12k/dp_rx.h b/drivers/net/wireless/ath/ath12k/dp_rx.h
 --- a/drivers/net/wireless/ath/ath12k/dp_rx.h
 +++ b/drivers/net/wireless/ath/ath12k/dp_rx.h
-@@ -71,6 +71,10 @@ struct ath12k_dp_rx_reo_cmd {
+@@ -71,6 +71,11 @@ struct ath12k_dp_rx_reo_cmd {
  
  #define ATH12K_DP_RX_REO_DESC_FREE_THRES  64
  #define ATH12K_DP_RX_REO_DESC_FREE_TIMEOUT_MS 1000
 +/* warn (once a minute) when more REO queue descriptors than this are held
-+ * for peers whose delete firmware has not confirmed (about 8 MB)
++ * for peers whose delete firmware has not confirmed: each QoS descriptor is
++ * a 2 KB allocation, so about 512 KB, the queues of about 15 peers
 + */
 +#define ATH12K_DP_RX_REO_DESC_HOLD_WARN 256
  
