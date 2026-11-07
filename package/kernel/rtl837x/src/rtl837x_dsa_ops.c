@@ -11,6 +11,7 @@
 #include <linux/kernel.h>
 #include <linux/phylink.h>
 #include <linux/phy.h>
+#include <linux/slab.h>
 #include <linux/string.h>
 #include <linux/dsa/8021q.h>
 #include <net/dsa.h>
@@ -128,6 +129,7 @@ static int rtl837x_save_boot_max_len(struct rtk_gsw *gsw);
 static int rtl837x_port_change_mtu(struct dsa_switch *ds, int port,
 				   int new_mtu);
 static void rtl837x_mdio_teardown(struct dsa_switch *ds);
+static void rtl837x_host_fdb_flush(struct rtk_gsw *gsw);
 
 static DEFINE_MUTEX(rtl837x_phy_driver_lock);
 static unsigned int rtl837x_phy_driver_users;
@@ -2174,6 +2176,7 @@ static void rtl837x_teardown(struct dsa_switch *ds)
 
 	rtl837x_mdio_teardown(ds);
 	rtl837x_mirror_clear_shadow(gsw);
+	rtl837x_host_fdb_flush(gsw);
 	ret = rtk_cpuTag_enable_set(EXTERNAL_CPU, DISABLED);
 	if (ret)
 		dev_err(ds->dev, "failed to disable CPU tag during teardown: %d\n", ret);
@@ -3129,10 +3132,53 @@ pvid:
 	return 0;
 }
 
+/* DSA counts host addresses per {MAC, VID, database}, but several of those
+ * can share one LUT key. The user ports normally all have the same MAC, so
+ * under rtl8_4 every port's standalone entry and the bridge's own entries
+ * (VID 0 and VID 1) all land on {MAC, VID 1}, and with per_bridge_fid the
+ * standalone entries of all ports share one FID. Without counting, taking
+ * one port down, or the last port leaving the bridge, would remove the LUT
+ * entry from under the others. Caller holds rtl837x_ind_lock.
+ */
+struct rtl837x_host_fdb {
+	struct list_head list;
+	u8 addr[ETH_ALEN];
+	u32 ivl;
+	u16 vid_fid;
+	unsigned int refcount;
+};
+
+static struct rtl837x_host_fdb *
+rtl837x_host_fdb_find(struct rtk_gsw *gsw, const unsigned char *addr, u32 ivl,
+		      u16 vid_fid)
+{
+	struct rtl837x_host_fdb *host;
+
+	list_for_each_entry(host, &gsw->host_fdb, list)
+		if (host->ivl == ivl && host->vid_fid == vid_fid &&
+		    ether_addr_equal(host->addr, addr))
+			return host;
+
+	return NULL;
+}
+
+static void rtl837x_host_fdb_flush(struct rtk_gsw *gsw)
+{
+	struct rtl837x_host_fdb *host, *tmp;
+
+	mutex_lock(&rtl837x_ind_lock);
+	list_for_each_entry_safe(host, tmp, &gsw->host_fdb, list) {
+		list_del(&host->list);
+		kfree(host);
+	}
+	mutex_unlock(&rtl837x_ind_lock);
+}
+
 static int rtl837x_port_fdb_add(struct dsa_switch *ds, int port,
 				const unsigned char *addr, u16 vid,
 				struct dsa_db db)
 {
+	struct rtl837x_host_fdb *host = NULL, *new_host = NULL;
 	struct rtk_gsw *gsw = ds->priv;
 	rtk_l2_ucastAddr_t l2 = { 0 };
 	rtk_mac_t mac = { 0 };
@@ -3159,9 +3205,31 @@ static int rtl837x_port_fdb_add(struct dsa_switch *ds, int port,
 	l2.auth = 1;
 	l2.is_static = 1;
 
+	if (port == gsw->cpu_port) {
+		new_host = kzalloc(sizeof(*new_host), GFP_KERNEL);
+		if (!new_host)
+			return -ENOMEM;
+	}
+
 	mutex_lock(&rtl837x_ind_lock);
-	ret = rtk_l2_addr_add(&mac, &l2);
+	if (new_host)
+		host = rtl837x_host_fdb_find(gsw, addr, ivl, vid_fid);
+	if (host) {
+		host->refcount++;
+		ret = RT_ERR_OK;
+	} else {
+		ret = rtk_l2_addr_add(&mac, &l2);
+		if (new_host && ret == RT_ERR_OK) {
+			ether_addr_copy(new_host->addr, addr);
+			new_host->ivl = ivl;
+			new_host->vid_fid = vid_fid;
+			new_host->refcount = 1;
+			list_add_tail(&new_host->list, &gsw->host_fdb);
+			new_host = NULL;
+		}
+	}
 	mutex_unlock(&rtl837x_ind_lock);
+	kfree(new_host);
 	return rtl837x_to_errno(ret);
 }
 
@@ -3169,6 +3237,7 @@ static int rtl837x_port_fdb_del(struct dsa_switch *ds, int port,
 				const unsigned char *addr, u16 vid,
 				struct dsa_db db)
 {
+	struct rtl837x_host_fdb *host = NULL;
 	struct rtk_gsw *gsw = ds->priv;
 	rtk_l2_ucastAddr_t l2 = { 0 };
 	rtk_mac_t mac = { 0 };
@@ -3194,7 +3263,19 @@ static int rtl837x_port_fdb_del(struct dsa_switch *ds, int port,
 	l2.is_static = 1;
 
 	mutex_lock(&rtl837x_ind_lock);
-	ret = rtk_l2_addr_del(&mac, &l2);
+	if (port == gsw->cpu_port)
+		host = rtl837x_host_fdb_find(gsw, addr, ivl, vid_fid);
+	if (host && host->refcount > 1) {
+		host->refcount--;
+		ret = RT_ERR_OK;
+	} else {
+		ret = rtk_l2_addr_del(&mac, &l2);
+		if (host && (ret == RT_ERR_OK ||
+			     ret == RT_ERR_L2_ENTRY_NOTFOUND)) {
+			list_del(&host->list);
+			kfree(host);
+		}
+	}
 	mutex_unlock(&rtl837x_ind_lock);
 	if (ret == RT_ERR_L2_ENTRY_NOTFOUND)
 		return 0;
@@ -3452,6 +3533,7 @@ int rtl837x_dsa_register(struct rtk_gsw *gsw)
 
 	rtl837x_stats_init(gsw);
 	mutex_init(&gsw->isolation_lock);
+	INIT_LIST_HEAD(&gsw->host_fdb);
 
 	ds->dev = gsw->dev;
 	ds->priv = gsw;

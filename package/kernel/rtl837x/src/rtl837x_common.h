@@ -193,6 +193,11 @@ struct rtk_gsw {
 	u32 boot_tag_inc[RTK_MAX_NUM_OF_PORT];
 	bool boot_max_len_valid;
 
+	/* Users of each CPU-port LUT entry, see rtl837x_host_fdb_find().
+	 * Protected by rtl837x_ind_lock.
+	 */
+	struct list_head host_fdb;
+
 	/* CPU-port watchdog: set while it holds the conduit closed itself,
 	 * with the user ports that were running when it closed it.
 	 */
