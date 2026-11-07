@@ -5,23 +5,36 @@ Subject: [PATCH] wifi: ath12k: do not wait for a rootPD restart under the group 
 ath12k_ahb_power_up() waited up to 30 s for a crashed rootPD to restart.
 Recovery power-ups run under ag->mutex, so for that long remove, the
 userPD fatal path and the reset work of every partner were blocked, for
-each AHB device of the group in turn.
+each AHB device of the group whose rootPD crashed, in turn.
 
 Wait in the reset work instead: after the power-down and before the
 device is marked as powered down, without ag->mutex. The group power-up
 cannot run meanwhile, because recovery_wait_power_down is still set.
-Remove ends the wait early. The waiter consumes the crash marker under
-ag->mutex once the rootPD is up, so the AFTER_POWERUP notifier normally
-queues nothing; if the notifier gets the mutex first it queues a group
-recovery, whose runs return at once when the group power-up has answered
-them.
+Remove ends the wait early.
+
+The waiter does not touch the crash marker; only the power-up consumes
+it. rootpd_ready becomes complete_all(), so that waiting does not use it
+up and it says whether the rootPD is up until the next crash resets it.
+A crash during the wait therefore cannot have its marker cleared by the
+waiter.
+
+The AFTER_POWERUP notifier takes ag->mutex right after completing
+rootpd_ready and finds the marker still set. If it then queued a group
+recovery, a partner already down would start a new reset run that waits
+20 s for the round in progress and tears it down if the round takes
+longer. It now queues nothing while the device of that rootPD has
+recovery_wait_power_down set: that device's reset work leads to the group
+power-up, which picks the restart up.
 
 ath12k_ahb_power_up() no longer waits. If the rootPD still has not
 restarted (the wait timed out, or the rootPD crashed after this device
-finished its reset work), the power-up fails with -EAGAIN and leaves the
-marker set. The group then retries as for any failed power-up, bounded
-by fail_cont_count, and the notifier queues a recovery once the rootPD
-is up.
+finished its reset work), it returns -ETIMEDOUT and leaves the marker
+set. In a recovery the group then retries as for any failed power-up,
+bounded by fail_cont_count, and the notifier queues a recovery once the
+rootPD is up. First bring-up has no retry, so ath12k_core_soc_create()
+waits before its power-up as well, under ag->mutex as that path always
+ran; a rootPD that does not come back within 30 s fails the probe, as
+before.
 
 ag->mutex is still held across the rest of the power-up, as for every
 recovery power-up: firmware load and authentication, and the userPD
@@ -32,72 +45,65 @@ Signed-off-by: CoolFreeze23 <34906576+CoolFreeze23@users.noreply.github.com>
 diff --git a/drivers/net/wireless/ath/ath12k/ahb.c b/drivers/net/wireless/ath/ath12k/ahb.c
 --- a/drivers/net/wireless/ath/ath12k/ahb.c
 +++ b/drivers/net/wireless/ath/ath12k/ahb.c
-@@ -378,18 +378,17 @@ static int ath12k_ahb_power_up(struct at
+@@ -376,19 +376,19 @@ static int ath12k_ahb_power_up(struct at
+ 	int ret;
+ 
  	/*
- 	 * A recovery power-up can run before remoteproc has finished
- 	 * restarting a crashed rootPD (for example while the rootPD dump is
+-	 * A recovery power-up can run before remoteproc has finished
+-	 * restarting a crashed rootPD (for example while the rootPD dump is
 -	 * still being collected). Booting the userPD then fails. Wait for the
 -	 * restart and only then consume the crash marker, so the
 -	 * QCOM_SSR_AFTER_POWERUP notifier still knows a recovery is owed if
 -	 * this wait times out. Recovery power-ups run under ag->mutex, which
 -	 * the notifier takes only after completing rootpd_ready.
-+	 * still being collected). Booting the userPD then fails. Recovery
-+	 * power-ups run under ag->mutex, so do not wait for the restart here:
-+	 * the reset work does that (ath12k_ahb_recovery_wait()). A restart
-+	 * still missing fails the power-up, which queues a retry of the group,
-+	 * and leaves the crash marker set, so the QCOM_SSR_AFTER_POWERUP
-+	 * notifier still knows a recovery is owed.
++	 * A power-up can run before remoteproc has finished restarting a
++	 * crashed rootPD (for example while the rootPD dump is still being
++	 * collected). Booting the userPD then fails. Recovery power-ups run
++	 * under ag->mutex, so do not wait here: callers wait first, through
++	 * ath12k_hif_recovery_wait(). If the restart is still missing, fail
++	 * and leave the crash marker set (only this check consumes it). In a
++	 * recovery that failure queues a retry of the group, and the
++	 * QCOM_SSR_AFTER_POWERUP notifier still knows a recovery is owed; at
++	 * first bring-up it fails the probe.
  	 */
  	if (READ_ONCE(ab_ahb->rootpd_crashed)) {
 -		time_left = wait_for_completion_timeout(&ab_ahb->rootpd_ready,
 -							ATH12K_ROOTPD_RECOVERY_TIMEOUT);
 -		if (!time_left) {
 -			ath12k_err(ab, "rootPD did not restart after crash, cannot boot userPD\n");
--			return -ETIMEDOUT;
-+		if (!try_wait_for_completion(&ab_ahb->rootpd_ready)) {
++		if (!completion_done(&ab_ahb->rootpd_ready)) {
 +			ath12k_err(ab, "rootPD has not restarted after crash, cannot boot userPD\n");
-+			return -EAGAIN;
+ 			return -ETIMEDOUT;
  		}
  		WRITE_ONCE(ab_ahb->rootpd_crashed, false);
- 	}
-@@ -615,6 +614,36 @@ static void ath12k_ahb_power_down(struct
+@@ -615,6 +615,26 @@ static void ath12k_ahb_power_down(struct
  	}
  }
  
 +/*
-+ * The reset work of a device whose rootPD crashed waits here for the restart,
-+ * without ag->mutex, so that remove, a userPD fatal IRQ and partner resets are
-+ * not held up. The group power-up cannot run meanwhile: the device is marked
-+ * as waiting (recovery_wait_power_down). Remove completes rootpd_ready to end
-+ * the wait early.
++ * Wait for a crashed rootPD to restart. The reset work calls this without
++ * ag->mutex, so that remove, a userPD fatal IRQ and partner resets are not held
++ * up, and the group power-up cannot run meanwhile because the device is marked
++ * as waiting (recovery_wait_power_down). First bring-up calls it under
++ * ag->mutex, which is safe: the notifier completes rootpd_ready before it takes
++ * the mutex. Remove completes rootpd_ready to end the wait early.
 + */
 +static void ath12k_ahb_recovery_wait(struct ath12k_base *ab)
 +{
 +	struct ath12k_ahb *ab_ahb = ath12k_ab_to_ahb(ab);
-+	struct ath12k_hw_group *ag = ab->ag;
-+	unsigned long time_left;
 +
 +	if (!READ_ONCE(ab_ahb->rootpd_crashed))
 +		return;
 +
-+	time_left = wait_for_completion_timeout(&ab_ahb->rootpd_ready,
-+						ATH12K_ROOTPD_RECOVERY_TIMEOUT);
-+	if (!time_left) {
++	if (!wait_for_completion_timeout(&ab_ahb->rootpd_ready,
++					 ATH12K_ROOTPD_RECOVERY_TIMEOUT))
 +		ath12k_warn(ab, "rootPD did not restart after crash\n");
-+		return;
-+	}
-+
-+	/* Under the mutex: the notifier re-checks the marker under it. */
-+	mutex_lock(&ag->mutex);
-+	if (!test_bit(ATH12K_FLAG_UNREGISTERING, &ab->dev_flags))
-+		WRITE_ONCE(ab_ahb->rootpd_crashed, false);
-+	mutex_unlock(&ag->mutex);
 +}
 +
  static void ath12k_ahb_init_qmi_ce_config(struct ath12k_base *ab)
  {
  	struct ath12k_qmi_ce_cfg *cfg = &ab->qmi.ce_cfg;
-@@ -838,6 +867,7 @@ static const struct ath12k_hif_ops ath12
+@@ -838,6 +858,7 @@ static const struct ath12k_hif_ops ath12
  	.map_service_to_pipe = ath12k_ahb_map_service_to_pipe,
  	.power_up = ath12k_ahb_power_up,
  	.power_down = ath12k_ahb_power_down,
@@ -105,7 +111,7 @@ diff --git a/drivers/net/wireless/ath/ath12k/ahb.c b/drivers/net/wireless/ath/at
  };
  
  static void ath12k_ahb_log_userpd_crash_reason(struct ath12k_base *ab)
-@@ -963,11 +993,10 @@ static void ath12k_ahb_release_crashed_u
+@@ -963,13 +984,15 @@ static void ath12k_ahb_release_crashed_u
   * that is already in flight cannot absorb a crash that happens during its
   * own power-up, so every device is (re)queued; ath12k_core_reset()
   * serialises re-entry through reset_count/reset_complete.
@@ -114,19 +120,46 @@ diff --git a/drivers/net/wireless/ath/ath12k/ahb.c b/drivers/net/wireless/ath/at
 - * marker is re-checked under the mutex: if it is still set, no power-up
 - * picked the restart up (none ran yet, or it timed out) and recovery is
 - * still owed.
-+ * False when the rootPD has finished restarting. A reset work waiting for it
-+ * and a recovery power-up consume rootpd_crashed under ag->mutex, so the
-+ * marker is re-checked under the mutex: if it is still set, neither has
-+ * picked the restart up yet and recovery is still owed.
-  * In both cases every device's reset is requested and its work queued,
-  * also when it is queued or running already: a run whose request was
+- * In both cases every device's reset is requested and its work queued,
+- * also when it is queued or running already: a run whose request was
++ * False when the rootPD has finished restarting. A recovery power-up consumes
++ * rootpd_crashed under ag->mutex, so the marker is re-checked under the mutex:
++ * if it is clear, a power-up picked the restart up. Nothing is queued either
++ * if this device's reset is still on its way to the group power-up
++ * (recovery_wait_power_down): a new run of a partner could only wait for that
++ * round, and tear it down if the round outlasts the 20 s wait. Otherwise
++ * recovery is still owed.
++ * When recovery is queued, every device's reset is requested and its work
++ * queued, also when it is queued or running already: a run whose request was
   * answered by a later group power-up, or that finds no request, returns
-@@ -1412,6 +1441,9 @@ static void ath12k_ahb_remove_prepare(st
+  * at once (ath12k_core_reset()), so an extra run costs nothing.
+  */
+@@ -984,7 +1007,8 @@ static void ath12k_ahb_queue_group_recov
+ 		return;
+ 
+ 	mutex_lock(&ag->mutex);
+-	if (!new_crash && !READ_ONCE(ath12k_ab_to_ahb(ab)->rootpd_crashed))
++	if (!new_crash && (!READ_ONCE(ath12k_ab_to_ahb(ab)->rootpd_crashed) ||
++			   ab->recovery_wait_power_down))
+ 		goto out;
+ 
+ 	for (i = 0; i < ag->num_devices; i++) {
+@@ -1017,7 +1041,8 @@ static int ath12k_ahb_root_pd_state_noti
+ 	switch (event) {
+ 	case QCOM_SSR_AFTER_POWERUP:
+ 		ath12k_dbg(ab, ATH12K_DBG_AHB, "Root PD is UP\n");
+-		complete(&ab_ahb->rootpd_ready);
++		/* all: done stays set, waiting does not use it up, until a crash */
++		complete_all(&ab_ahb->rootpd_ready);
+ 		if (READ_ONCE(ab_ahb->rootpd_crashed))
+ 			ath12k_ahb_queue_group_recovery(ab, false);
+ 		return NOTIFY_OK;
+@@ -1412,6 +1437,9 @@ static void ath12k_ahb_remove_prepare(st
  	set_bit(ATH12K_FLAG_UNREGISTERING, &ab->dev_flags);
  	mutex_unlock(&ab->ag->mutex);
  
 +	/* a reset work waiting for a rootPD restart need not wait any longer */
-+	complete(&ath12k_ab_to_ahb(ab)->rootpd_ready);
++	complete_all(&ath12k_ab_to_ahb(ab)->rootpd_ready);
 +
  	cancel_work_sync(&ab->reset_work);
  	cancel_work_sync(&ab->restart_work);
@@ -134,7 +167,16 @@ diff --git a/drivers/net/wireless/ath/ath12k/ahb.c b/drivers/net/wireless/ath/at
 diff --git a/drivers/net/wireless/ath/ath12k/core.c b/drivers/net/wireless/ath/ath12k/core.c
 --- a/drivers/net/wireless/ath/ath12k/core.c
 +++ b/drivers/net/wireless/ath/ath12k/core.c
-@@ -2049,6 +2049,9 @@ reset:
+@@ -866,6 +866,8 @@ static int ath12k_core_soc_create(struct
+ 
+ 	ath12k_debugfs_soc_create(ab);
+ 
++	ath12k_hif_recovery_wait(ab);
++
+ 	ret = ath12k_hif_power_up(ab);
+ 	if (ret) {
+ 		ath12k_err(ab, "failed to power up :%d\n", ret);
+@@ -2049,6 +2051,9 @@ reset:
  
  	ath12k_hif_power_down(ab, false);
  
@@ -155,13 +197,11 @@ diff --git a/drivers/net/wireless/ath/ath12k/hif.h b/drivers/net/wireless/ath/at
  	int (*suspend)(struct ath12k_base *ab);
  	int (*resume)(struct ath12k_base *ab);
  	int (*map_service_to_pipe)(struct ath12k_base *ab, u16 service_id,
-@@ -141,6 +142,15 @@ static inline int ath12k_hif_power_up(st
+@@ -141,6 +142,13 @@ static inline int ath12k_hif_power_up(st
  	return ab->hif.ops->power_up(ab);
  }
  
-+/* Reset work, after the power-down and without ag->mutex: wait for what the
-+ * device needs before it can be powered up again.
-+ */
++/* Wait for what the device needs before a power-up can succeed. */
 +static inline void ath12k_hif_recovery_wait(struct ath12k_base *ab)
 +{
 +	if (ab->hif.ops->recovery_wait)
