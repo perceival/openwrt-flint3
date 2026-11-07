@@ -140,12 +140,67 @@ glinet_emmc_stage_fit_part() {
 	}
 }
 
+# Compare the start of a partition with the hash of what was written there.
+# conv=fsync only says that the flush was accepted, and a plain read would be
+# answered from the page cache dd has just filled: sync and drop it first.
+glinet_emmc_verify() {
+	local want="$1"
+	local device="$2"
+	local size="$3"
+	local got
+
+	sync
+	{ echo 3 > /proc/sys/vm/drop_caches; } 2>/dev/null
+
+	got=$( { dd bs=1048576 count=$((size / 1048576))
+		dd bs=512 count=$((size % 1048576 / 512))
+		dd bs=1 count=$((size % 512)); } < "$device" 2>/dev/null | sha256sum)
+	[ -n "$want" ] && [ "$want" = "$got" ]
+}
+
 glinet_emmc_write_staged() {
 	local name="$1"
 	local device="$2"
+	local staged="$(glinet_emmc_staged "$name")"
+	local want="$(sha256sum < "$staged")"
+	local size="$(wc -c < "$staged")"
+	local try
 
-	v "Writing $name to $device"
-	dd if="$(glinet_emmc_staged "$name")" of="$device" bs=1M conv=fsync
+	for try in 1 2; do
+		v "Writing $name to $device"
+		dd if="$staged" of="$device" bs=1M conv=fsync &&
+			glinet_emmc_verify "$want" "$device" "$size" && return 0
+		v "$name does not read back correctly from $device."
+	done
+
+	v "Giving up on $name. The eMMC may be failing; use the U-Boot recovery."
+	return 1
+}
+
+# emmc_upgrade_tar() writes the kernel with no check. Nothing is staged on this
+# path, so the image itself is what the partition is compared with.
+glinet_emmc_verify_tar_kernel() {
+	local image="$1"
+	local hlos_dev="$(find_mmc_part "$CI_KERNPART" "$CI_ROOTDEV")"
+	local gz board_dir want size
+
+	[ "$(identify_magic_long "$(get_magic_long "$image" cat)")" = "gzip" ] && gz=z
+	board_dir=$(tar t${gz}f "$image" 2>/dev/null | grep -m 1 '^sysupgrade-.*/$')
+	board_dir=${board_dir%/}
+
+	size=$(tar x${gz}f "$image" "$board_dir/kernel" -O 2>/dev/null | wc -c)
+	[ "$size" -gt 0 ] || return 0
+
+	want=$(tar x${gz}f "$image" "$board_dir/kernel" -O 2>/dev/null | sha256sum)
+	glinet_emmc_verify "$want" "$hlos_dev" "$size" && return 0
+
+	v "The kernel does not read back correctly from $hlos_dev, writing it again."
+	tar x${gz}f "$image" "$board_dir/kernel" -O 2>/dev/null |
+		dd of="$hlos_dev" bs=1M conv=fsync
+	glinet_emmc_verify "$want" "$hlos_dev" "$size" && return 0
+
+	v "Giving up on the kernel. The eMMC may be failing; use the U-Boot recovery."
+	return 1
 }
 
 glinet_emmc_cleanup_staged() {
@@ -163,6 +218,11 @@ glinet_emmc_do_fit_upgrade() {
 	local rootfs_size
 
 	[ -n "$wifi_fw" ] && wifi_fw_dev=$(find_mmc_part "0:WIFIFW" "$CI_ROOTDEV")
+	command -v sha256sum >/dev/null || {
+		v "sha256sum is missing, so nothing written could be verified."
+		return 1
+	}
+
 	[ -n "$hlos" ] && [ -n "$rootfs" ] && \
 		[ -n "$hlos_dev" ] && [ -n "$rootfs_dev" ] || {
 		v "Unable to find the required GL.iNet image sections or eMMC partitions."
@@ -217,7 +277,11 @@ glinet_emmc_do_upgrade() {
 		glinet_emmc_do_fit_upgrade "$1"
 		;;
 	*)
-		emmc_do_upgrade "$1"
+		command -v sha256sum >/dev/null || {
+			v "sha256sum is missing, so nothing written could be verified."
+			return 1
+		}
+		emmc_do_upgrade "$1" && glinet_emmc_verify_tar_kernel "$1"
 		;;
 	esac
 }
