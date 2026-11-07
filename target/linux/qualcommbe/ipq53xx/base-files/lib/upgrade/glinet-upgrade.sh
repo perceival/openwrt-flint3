@@ -45,6 +45,11 @@ glinet_emmc_check_tar() {
 	local image="$1"
 	local gz board_dir kernel size limit hlos_dev ret=1
 
+	command -v dumpimage >/dev/null || {
+		v "dumpimage is missing, so the kernel cannot be checked for FIT configuration \"config-1\"."
+		return 1
+	}
+
 	[ "$(identify_magic_long "$(get_magic_long "$image" cat)")" = "gzip" ] && gz=z
 	board_dir=$(tar t${gz}f "$image" 2>/dev/null | grep -m 1 '^sysupgrade-.*/$')
 	board_dir=${board_dir%/}
@@ -68,8 +73,7 @@ glinet_emmc_check_tar() {
 		v "Unable to create a temporary file in /tmp."
 	else
 		tar x${gz}f "$image" "$board_dir/kernel" -O > "$kernel" 2>/dev/null
-		if ! command -v dumpimage >/dev/null ||
-		   dumpimage -l "$kernel" 2>/dev/null | grep -q "^ *Configuration [0-9]* (config-1)$"; then
+		if dumpimage -l "$kernel" 2>/dev/null | grep -q "^ *Configuration [0-9]* (config-1)$"; then
 			ret=0
 		else
 			v "The kernel has no FIT configuration \"config-1\"; stock U-Boot cannot boot it."
