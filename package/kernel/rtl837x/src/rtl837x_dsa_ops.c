@@ -44,6 +44,11 @@
  * confirmed it. Enable per feature from /etc/modules.d, e.g.
  * "rtl837x_dsa vlan_passthrough=1 per_bridge_fid=1". Read-only at runtime,
  * so the hardware state never changes under a running configuration.
+ *
+ * Nothing at setup clears what these modes program, and the GL-BE9300 has no
+ * switch reset line. Unloading the module undoes it, see
+ * rtl837x_clear_opt_in_state(); a reboot does not run that and may not clear
+ * it, so after turning a mode off, unload the module or power-cycle.
  */
 static bool vlan_passthrough;
 module_param(vlan_passthrough, bool, 0444);
@@ -126,6 +131,7 @@ static int rtl837x_devlink_info_get(struct dsa_switch *ds,
 static int rtl837x_mdio_setup(struct dsa_switch *ds);
 static int rtl837x_open_tx_max_len(struct rtk_gsw *gsw);
 static int rtl837x_save_boot_max_len(struct rtk_gsw *gsw);
+static int rtl837x_restore_boot_max_len(struct rtk_gsw *gsw, int port);
 static int rtl837x_port_change_mtu(struct dsa_switch *ds, int port,
 				   int new_mtu);
 static void rtl837x_mdio_teardown(struct dsa_switch *ds);
@@ -2179,6 +2185,33 @@ static int rtl837x_setup(struct dsa_switch *ds)
 	return 0;
 }
 
+/* Undo what the opt-in modes programmed, so that the next load starts from the
+ * default state. The MSTP instances other than 0 and the TX frame limit stay:
+ * nothing uses those instances without per_bridge_fid, and the TX limit only
+ * ever gets opened.
+ */
+static void rtl837x_clear_opt_in_state(struct rtk_gsw *gsw)
+{
+	int port, ret;
+
+	for (port = 0; port < RTK_MAX_NUM_OF_PORT; port++) {
+		if (!rtl837x_valid_port(gsw, port))
+			continue;
+
+		ret = 0;
+		if (jumbo && gsw->boot_max_len_valid)
+			ret = rtl837x_restore_boot_max_len(gsw, port);
+		if (!ret && rtl837x_user_port(gsw, port))
+			ret = rtl837x_port_fid_apply(gsw, port, 0, true);
+		if (!ret && vlan_passthrough)
+			ret = rtl837x_set_transparent(gsw, port, false);
+		if (ret)
+			dev_err(gsw->dev,
+				"failed to clear opt-in state of port %d: %d\n",
+				port, ret);
+	}
+}
+
 static void rtl837x_teardown(struct dsa_switch *ds)
 {
 	struct rtk_gsw *gsw = ds->priv;
@@ -2197,6 +2230,7 @@ static void rtl837x_teardown(struct dsa_switch *ds)
 	rtl837x_mdio_teardown(ds);
 	rtl837x_mirror_clear_shadow(gsw);
 	rtl837x_host_fdb_flush(gsw);
+	rtl837x_clear_opt_in_state(gsw);
 	ret = rtk_cpuTag_enable_set(EXTERNAL_CPU, DISABLED);
 	if (ret)
 		dev_err(ds->dev, "failed to disable CPU tag during teardown: %d\n", ret);
