@@ -53,7 +53,9 @@ boot() {
 	sync
 
 	# Only clear pstore once every record is on flash and reads back intact
-	# (a failed or partial copy also fails here).
+	# (a failed or partial copy also fails here). Drop the page cache first,
+	# or cmp would read what cp has just left there and not the flash.
+	{ echo 3 > /proc/sys/vm/drop_caches; } 2>/dev/null || failed=1
 	for f in "$PSTORE"/*; do
 		[ -f "$f" ] || continue
 		cmp -s "$f" "$dir/${f##*/}" || failed=$((failed + 1))
@@ -63,7 +65,7 @@ boot() {
 		rm -f "$PSTORE"/*
 		log_kmsg "previous boot crashed: saved $count record(s) to $dir"
 	else
-		log_kmsg "previous boot crashed: saving to $dir failed for $failed record(s), records left in $PSTORE"
+		log_kmsg "previous boot crashed: could not verify the copy in $dir ($failed failure(s)), records left in $PSTORE"
 	fi
 
 	# Keep the newest $KEEP crashes.
