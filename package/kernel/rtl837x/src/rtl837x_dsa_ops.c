@@ -1755,11 +1755,15 @@ static int rtl837x_tag_protocol_resync(struct dsa_switch *ds)
 	return 0;
 }
 
+static void rtl837x_tag_protocol_unapply(struct dsa_switch *ds,
+					  enum dsa_tag_protocol proto);
+
 /* Apply the chip-side configuration a tagger needs. Caller holds rtnl. */
 static int rtl837x_tag_protocol_apply(struct dsa_switch *ds,
 				       enum dsa_tag_protocol proto)
 {
 	struct rtk_gsw *gsw = ds->priv;
+	enum dsa_tag_protocol old = gsw->tag_proto;
 	int ret;
 
 	switch (proto) {
@@ -1833,9 +1837,25 @@ static int rtl837x_tag_protocol_apply(struct dsa_switch *ds,
 		return -EPROTONOSUPPORT;
 	}
 
+	/* The resync reads tag_proto, so it has to be set first. */
 	gsw->tag_proto = proto;
 
-	return rtl837x_tag_protocol_resync(ds);
+	ret = rtl837x_tag_protocol_resync(ds);
+	if (ret && proto != old) {
+		/* DSA keeps the old tagger when a change fails, so tag_proto
+		 * has to keep naming it. Take back what was set up above,
+		 * tag_8021q's VLANs above all, so that the caller can apply
+		 * the old tagger on a clean slate. When proto is the tagger
+		 * already in place (setup, or that restore itself), there is
+		 * nothing better to fall back to and it stays.
+		 */
+		gsw->tag_proto_changing = true;
+		rtl837x_tag_protocol_unapply(ds, proto);
+		gsw->tag_proto_changing = false;
+		gsw->tag_proto = old;
+	}
+
+	return ret;
 }
 
 /* Undo whatever rtl837x_tag_protocol_apply() set up. Caller holds rtnl. */
