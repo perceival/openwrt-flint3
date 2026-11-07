@@ -2419,7 +2419,8 @@ static void rtl837x_phy_driver_put(void)
 	mutex_unlock(&rtl837x_phy_driver_lock);
 }
 
-/* Bind every PHY on the slave bus to rtl837x_phy_driver.
+/* With rebind_phy, bind every PHY on the slave bus to rtl837x_phy_driver.
+ * Without it the bus scan's result stands.
  *
  * The bus scan in mdiobus_register() binds each PHY to the first registered
  * driver that matches it, in driver registration order. The built-in
@@ -2859,7 +2860,7 @@ static int rtl837x_fdb_key(struct rtk_gsw *gsw, u16 vid, struct dsa_db db,
 {
 	if (gsw->tag_proto == DSA_TAG_PROTO_RTL8_4 &&
 	    !rtl837x_per_bridge_fid(gsw)) {
-		/* c950b59d92: one IVL base VLAN for every VLAN-unaware port. */
+		/* One IVL base VLAN for every VLAN-unaware port. */
 		if (!vid && db.type != DSA_DB_PORT && db.type != DSA_DB_BRIDGE)
 			return -EOPNOTSUPP;
 		*ivl = 1;
