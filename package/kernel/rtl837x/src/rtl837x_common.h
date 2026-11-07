@@ -185,7 +185,7 @@ struct rtk_gsw {
 	u32 base_vlan_only;
 
 	/* MAC_L2_PORT_MAX_LEN_CTRL as the bootloader left it (both speed
-	 * buckets and TAG_INC), read once at setup. port_change_mtu never
+	 * buckets and TAG_INC), read once at setup with jumbo. port_change_mtu never
 	 * programs less than this: LAN-to-LAN frames are switched in hardware
 	 * without Linux seeing them.
 	 */

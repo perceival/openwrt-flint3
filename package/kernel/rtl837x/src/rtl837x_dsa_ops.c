@@ -3452,9 +3452,6 @@ static int rtl837x_restore_boot_max_len(struct rtk_gsw *gsw, int port)
 
 static int rtl837x_port_max_mtu(struct dsa_switch *ds, int port)
 {
-	if (!jumbo)
-		return ETH_DATA_LEN;
-
 	return RTL837X_MAX_FRAME_LEN - RTL837X_FRAME_OVERHEAD;
 }
 
@@ -3464,14 +3461,6 @@ static int rtl837x_port_change_mtu(struct dsa_switch *ds, int port,
 	struct rtk_gsw *gsw = ds->priv;
 	u32 len;
 	int ret;
-
-	/* Without jumbo the port MTU is not implemented at all: DSA gets the
-	 * same answer as without this op, nothing reads or writes the frame
-	 * limits, and hosts that already exchange jumbo frames through the
-	 * switch keep doing so.
-	 */
-	if (!jumbo)
-		return -EOPNOTSUPP;
 
 	if (!rtl837x_valid_port(gsw, port) || new_mtu < ETH_MIN_MTU ||
 	    new_mtu > rtl837x_port_max_mtu(ds, port))
@@ -3538,13 +3527,18 @@ static const struct dsa_switch_ops rtl837x_dsa_ops = {
 	.port_fdb_add = rtl837x_port_fdb_add,
 	.port_fdb_del = rtl837x_port_fdb_del,
 	.port_fdb_dump = rtl837x_port_fdb_dump,
-	.port_change_mtu = rtl837x_port_change_mtu,
-	.port_max_mtu = rtl837x_port_max_mtu,
 	.port_mirror_add = rtl837x_port_mirror_add,
 	.port_mirror_del = rtl837x_port_mirror_del,
 	.tag_8021q_vlan_add = rtl837x_tag_8021q_vlan_add,
 	.tag_8021q_vlan_del = rtl837x_tag_8021q_vlan_del,
 };
+
+/* The ops with the port MTU implemented, for jumbo. Without it the MTU ops stay
+ * unregistered: DSA then returns before touching the conduit's MTU, nothing
+ * reads or writes the frame limits, and hosts that already exchange jumbo
+ * frames through the switch keep doing so.
+ */
+static struct dsa_switch_ops rtl837x_jumbo_dsa_ops;
 
 int rtl837x_dsa_register(struct rtk_gsw *gsw)
 {
@@ -3557,7 +3551,14 @@ int rtl837x_dsa_register(struct rtk_gsw *gsw)
 
 	ds->dev = gsw->dev;
 	ds->priv = gsw;
-	ds->ops = &rtl837x_dsa_ops;
+	if (jumbo) {
+		rtl837x_jumbo_dsa_ops = rtl837x_dsa_ops;
+		rtl837x_jumbo_dsa_ops.port_change_mtu = rtl837x_port_change_mtu;
+		rtl837x_jumbo_dsa_ops.port_max_mtu = rtl837x_port_max_mtu;
+		ds->ops = &rtl837x_jumbo_dsa_ops;
+	} else {
+		ds->ops = &rtl837x_dsa_ops;
+	}
 	ds->num_ports = gsw->dsa_num_ports;
 	ds->phys_mii_mask = rtl837x_user_ports(gsw);
 	ds->configure_vlan_while_not_filtering = true;
