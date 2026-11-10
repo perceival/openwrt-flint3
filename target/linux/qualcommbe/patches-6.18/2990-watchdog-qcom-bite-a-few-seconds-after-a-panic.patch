@@ -1,0 +1,113 @@
+From: CoolFreeze23 <34906576+CoolFreeze23@users.noreply.github.com>
+Date: Tue, 20 Oct 2026 07:30:00 +0900
+Subject: [PATCH] watchdog: qcom: bite a few seconds after a panic
+
+Once the kernel has panicked nothing pings the watchdog any more. If the
+panic path then hangs (a lock held by the crashed context, a stuck console
+or kmsg dumper, a restart handler that never returns), the system stays
+down until the running timeout expires, or forever if the watchdog was
+never started.
+
+Register a panic notifier, ahead of the other ones, that re-arms the
+watchdog with a bite of panic_timeout + 5 seconds and starts it if it was
+not running. The normal path (panic_timeout, then emergency_restart())
+still reboots first; the watchdog only catches the cases where that does
+not happen. panic=0 leaves the watchdog untouched.
+
+Signed-off-by: CoolFreeze23 <34906576+CoolFreeze23@users.noreply.github.com>
+---
+diff --git a/drivers/watchdog/qcom-wdt.c b/drivers/watchdog/qcom-wdt.c
+--- a/drivers/watchdog/qcom-wdt.c
++++ b/drivers/watchdog/qcom-wdt.c
+@@ -9,6 +9,8 @@
+ #include <linux/kernel.h>
+ #include <linux/module.h>
+ #include <linux/of.h>
++#include <linux/panic.h>
++#include <linux/panic_notifier.h>
+ #include <linux/platform_device.h>
+ #include <linux/watchdog.h>
+ 
+@@ -22,6 +24,12 @@ enum wdt_reg {
+ 
+ #define QCOM_WDT_ENABLE		BIT(0)
+ 
++/*
++ * Seconds the watchdog is given, on top of panic_timeout, to let the panic
++ * path reboot the system by itself before the watchdog bites.
++ */
++#define QCOM_WDT_PANIC_MARGIN	5
++
+ static const u32 reg_offset_data_apcs_tmr[] = {
+ 	[WDT_RST] = 0x38,
+ 	[WDT_EN] = 0x40,
+@@ -49,6 +57,7 @@ struct qcom_wdt {
+ 	unsigned long		rate;
+ 	void __iomem		*base;
+ 	const u32		*layout;
++	struct notifier_block	panic_nb;
+ };
+ 
+ static void __iomem *wdt_addr(struct qcom_wdt *wdt, enum wdt_reg reg)
+@@ -141,6 +150,46 @@ static int qcom_wdt_restart(struct watchdog_device *wdd, unsigned long action,
+ 	return 0;
+ }
+ 
++/*
++ * Once the kernel has panicked nothing pings the watchdog any more, and if
++ * the panic path then hangs (a lock held by the crashed context, a stuck
++ * console or kmsg dumper, a restart handler that never returns) the system
++ * sits there until the running timeout expires - or forever if userspace
++ * never started the watchdog. Re-arm it with a short bite instead: the
++ * normal path (panic_timeout, then emergency_restart()) still reboots first,
++ * the watchdog only catches the cases where that does not happen.
++ */
++static int qcom_wdt_panic_notify(struct notifier_block *nb,
++				 unsigned long event, void *data)
++{
++	struct qcom_wdt *wdt = container_of(nb, struct qcom_wdt, panic_nb);
++	unsigned int secs;
++
++	/* panic=0 asks to stay in the panic; leave the watchdog as it is. */
++	if (!panic_timeout)
++		return NOTIFY_DONE;
++
++	secs = QCOM_WDT_PANIC_MARGIN;
++	if (panic_timeout > 0)
++		secs += panic_timeout;
++	secs = min(secs, wdt->wdd.max_timeout);
++
++	writel(0, wdt_addr(wdt, WDT_EN));
++	writel(1, wdt_addr(wdt, WDT_RST));
++	writel(secs * wdt->rate, wdt_addr(wdt, WDT_BARK_TIME));
++	writel(secs * wdt->rate, wdt_addr(wdt, WDT_BITE_TIME));
++	writel(QCOM_WDT_ENABLE, wdt_addr(wdt, WDT_EN));
++
++	return NOTIFY_DONE;
++}
++
++static void qcom_wdt_unregister_panic(void *data)
++{
++	struct qcom_wdt *wdt = data;
++
++	atomic_notifier_chain_unregister(&panic_notifier_list, &wdt->panic_nb);
++}
++
+ static int qcom_wdt_is_running(struct watchdog_device *wdd)
+ {
+ 	struct qcom_wdt *wdt = to_qcom_wdt(wdd);
+@@ -299,6 +348,14 @@ static int qcom_wdt_probe(struct platform_device *pdev)
+ 	if (ret)
+ 		return ret;
+ 
++	/* Run before the other panic notifiers, which may themselves hang. */
++	wdt->panic_nb.notifier_call = qcom_wdt_panic_notify;
++	wdt->panic_nb.priority = INT_MAX;
++	atomic_notifier_chain_register(&panic_notifier_list, &wdt->panic_nb);
++	ret = devm_add_action_or_reset(dev, qcom_wdt_unregister_panic, wdt);
++	if (ret)
++		return ret;
++
+ 	platform_set_drvdata(pdev, wdt);
+ 	return 0;
+ }

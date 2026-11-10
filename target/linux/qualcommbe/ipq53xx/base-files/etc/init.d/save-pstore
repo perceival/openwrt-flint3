@@ -1,0 +1,78 @@
+#!/bin/sh /etc/rc.common
+# ramoops (DTS reserved-memory "ramoops@4da00000") keeps the kernel log of a
+# panic or oops in RAM across the reset; /etc/init.d/boot mounts it at
+# /sys/fs/pstore. That is still RAM: the next crash or a power cut loses it.
+# When the last boot ended in a crash, copy every record to flash, so a panic
+# that happens unattended can still be read afterwards, then remove the
+# records from pstore to free its slots for the next crash - but only once
+# every record is verifiably on flash.
+
+START=11
+
+PSTORE=/sys/fs/pstore
+DEST=/root/pstore
+KEEP=10
+
+# logd only starts at START=12, so logger would go nowhere: write to the
+# kernel log instead, which logd picks up and dmesg shows.
+log_kmsg() {
+	echo "<4>pstore: $*" > /dev/kmsg
+}
+
+boot() {
+	local f dir n count failed
+
+	# console-ramoops is the previous boot's console and exists after every
+	# reboot; only a dmesg record means the last boot crashed.
+	ls "$PSTORE"/dmesg-* >/dev/null 2>&1 || return 0
+
+	# /root is on the overlay. If that is not on flash (fstools fell back to
+	# tmpfs, e.g. because the crash corrupted it, or there is no overlay at
+	# all), a copy would be lost on the next reboot together with the
+	# records: leave them in pstore.
+	case "$(awk '$2 == "/overlay" { t = $3 } END { print t }' /proc/mounts)" in
+	""|tmpfs)
+		log_kmsg "previous boot crashed; overlay is not on flash, records left in $PSTORE"
+		return 0
+		;;
+	esac
+
+	mkdir -p "$DEST" || return 1
+	# Sequence number first: the clock may not be set this early.
+	n=$(ls -1 "$DEST" | sort | tail -n 1)
+	n=$(expr "${n%%-*}" + 1 2>/dev/null) || n=1
+	dir="$DEST/$(printf %04d "$n")-$(date +%Y%m%d-%H%M%S)"
+	mkdir -p "$dir" || return 1
+
+	count=0
+	failed=0
+	for f in "$PSTORE"/*; do
+		[ -f "$f" ] || continue
+		cp "$f" "$dir/" && count=$((count + 1))
+	done
+	sync
+
+	# Only clear pstore once every record is on flash and reads back intact
+	# (a failed or partial copy also fails here). Drop the page cache first,
+	# or cmp would read what cp has just left there and not the flash.
+	{ echo 3 > /proc/sys/vm/drop_caches; } 2>/dev/null || failed=1
+	for f in "$PSTORE"/*; do
+		[ -f "$f" ] || continue
+		cmp -s "$f" "$dir/${f##*/}" || failed=$((failed + 1))
+	done
+
+	if [ "$failed" -eq 0 ]; then
+		rm -f "$PSTORE"/*
+		log_kmsg "previous boot crashed: saved $count record(s) to $dir"
+	else
+		log_kmsg "previous boot crashed: could not verify the copy in $dir ($failed failure(s)), records left in $PSTORE"
+	fi
+
+	# Keep the newest $KEEP crashes.
+	n=$(ls -1 "$DEST" | wc -l)
+	for f in $(ls -1 "$DEST" | sort); do
+		[ "$n" -gt "$KEEP" ] || break
+		rm -rf "${DEST:?}/$f"
+		n=$((n - 1))
+	done
+}

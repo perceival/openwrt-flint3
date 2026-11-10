@@ -57,7 +57,8 @@ Throughput measured between two units over a 2.5G trunk: **~1.8–1.9 Gbit/s**.
   down; the cause of the crash itself is still open. Reported upstream.
 - **Kernel panic in netlink socket release**, seen six times since August on
   both APs after hours of uptime (sockets of a bridge notification, hostapd
-  or wsdd2). The AP reboots itself in ~90 s. wsdd2 is kept disabled as one
+  or wsdd2). The AP reboots itself in ~90 s (the panic log is kept, see
+  [Crash logs](#crash-logs)). wsdd2 is kept disabled as one
   trigger; root cause under investigation with a KASAN kernel.
 - **Client kicks for "excessive missing ACKs"**: the driver's packet-loss
   events are unreliable for multi-link stations, so hostapd's
@@ -67,6 +68,34 @@ Throughput measured between two units over a 2.5G trunk: **~1.8–1.9 Gbit/s**.
   No longer the hard ~600 Mbit/s cap earlier builds had, but not zero.
 - **802.11r is incompatible with MLO.** hostapd's FT code has no MLD
   awareness — do not enable 11r on an MLO SSID. 11k/11v are fine.
+
+## Testing the stock 2.4 GHz board file
+
+The image uses 2.4 GHz board data that is known to work with this firmware. GL's
+own firmware loads another board file for this board (`bdwlan.b12`), which has
+not yet been tried with the ath12k firmware. To try it, you need the optional
+package `ipq-wifi-glinet_gl-be9300-bdf-test`. A default build neither includes nor
+builds it, so select it first in `make menuconfig` (Firmware, ath10k Board-Specific
+Overrides): as `<*>` to put it in the image, or as `<M>` to build only the package,
+then copy the `.apk` from the build's `packages` directory to the unit and run
+`apk add --allow-untrusted` on it. It installs a `board-2.bin` container holding that board
+file, with the board name and regdb of the normal one, as
+`/lib/firmware/ath12k-test/ath12k/IPQ5332/hw1.0/board-2.bin`, which nothing loads
+unless selected. To select it until the next reboot:
+
+```sh
+wifi down
+echo -n /lib/firmware/ath12k-test > /sys/module/firmware_class/parameters/path
+rmmod ath12k_wifi7 ath12k
+modprobe ath12k && modprobe ath12k_wifi7
+sleep 30; wifi up
+```
+
+Then check that the 2.4 GHz network comes up (`iwinfo`, and `dmesg | grep ath12k`
+shows no board-data or firmware errors), and compare `iw dev <2.4 GHz interface> info`
+(txpower) and 2.4 GHz throughput with the normal file. Nothing is changed on
+flash: if Wi-Fi does not come back, just reboot and the normal board file is
+used again. Please report the result in the issue tracker.
 
 ## Building
 
@@ -105,9 +134,21 @@ are on the device page:
 **https://openwrt.org/toh/gl.inet/gl-be9300**
 
 Short version: from stock firmware, use the **factory** image with
-`sysupgrade -F -n`. The stock image check requires a QSDK FIT, so `-F` is
-required and the "missing section" warnings for `u-boot`/`tz`/`sb11` are
-expected. Do **not** force the plain sysupgrade image from stock.
+`sysupgrade -F -n`. `-F` is required because stock does not recognise the
+image's board name (see below); the "missing section" warnings for
+`u-boot`/`tz`/`sb11` are expected. Do **not** force the plain sysupgrade
+image from stock.
+
+`-n` is **required**, not optional. Without it, stock's own
+`platform_copy_config` formats an ext4 filesystem inside the `rootfs`
+partition and copies GL's configuration into it, where OpenWrt can pick it
+up as its overlay. If the file is not a QSDK FIT (for example the sysupgrade
+image forced by mistake), it formats from offset 0 and destroys the stock
+rootfs, and only U-Boot recovery brings the unit back. Check the image's
+`sha256sum` against the build's `sha256sums` file before forcing it.
+
+Back to stock from OpenWrt: `sysupgrade -n be9300-<version>.bin` (no `-F`
+needed; `-n` is required here too).
 
 Stock QSDK firmware may report `qcom,ipq5332-ap-mi01.6` as its board name.
 That is the generic Qualcomm MI01.6/RDP468 identity used by the vendor path,
@@ -120,6 +161,130 @@ factory-image path instead (see [issue #9](https://github.com/perceival/openwrt-
 
 **Back up your eMMC first** — the ART partition holds this unit's radio
 calibration and MAC addresses and cannot be recovered from anywhere else.
+
+**Upgrading with kept settings from an older build.** Older images pinned every
+AP to an address derived from ART in `/etc/config/wireless`. On the first boot,
+`99-gl-be9300-wifi-macs-cleanup` removes those `macaddr` options, but only the
+exact values that script wrote, in the order it wrote them, and only if at least
+the first two are there. Each removal is logged in `dmesg`. Anything else is taken
+for your own and stays, including a single AP pinned to the ART address, or pinned
+addresses after you added, removed or reordered APs. This runs once:
+`/etc/gl-be9300-wifi-macs-cleaned` is kept over later upgrades and stops it from
+running again, so addresses you set afterwards stay. To go back to the defaults
+for an interface that kept one:
+
+```sh
+uci delete wireless.<iface>.macaddr
+uci commit wireless
+wifi reload
+```
+
+## Recovery
+
+From least to most invasive:
+
+1. **Settings broken, system boots:** hold the reset button for more than
+   5 seconds while OpenWrt is running and release it. That is a factory reset
+   (`firstboot`), and the unit comes back at 192.168.1.1.
+2. **System does not finish booting:** failsafe. Power on and watch the white
+   LED. While it blinks during early boot, press reset briefly, and it switches
+   to a fast blink. Connect a PC with a static 192.168.1.2/24 to **LAN1** and
+   run `ssh root@192.168.1.1`. Then `mount_root` to get at the configuration,
+   or `firstboot -y && reboot`.
+3. **No kernel at all (bad flash):** the U-Boot recovery server. Power off,
+   hold reset, power on and keep holding for about 5 seconds. A web server
+   then answers at 192.168.1.1 (PC on 192.168.1.2/24). Upload a **stock GL.iNet
+   firmware** (`be9300-<version>.bin` from https://dl.gl-inet.com/router/be9300/),
+   let it flash and reboot into stock, and then reinstall OpenWrt from stock as
+   described above. The same server also has upload forms that write U-Boot
+   itself and the `0:ART` partition, with no authentication or check. Never use
+   those: ART holds this unit's calibration and MACs.
+
+What the recovery server does with *non-stock* images is GL's own code (the
+Qualcomm U-Boot it is based on has no web server), and GL ships no U-Boot in
+its firmware images, so it can only be read from a unit's bootloader:
+
+- `…-squashfs-factory.bin` carries the same U-Boot script as GL's images
+  (`flashinit mmc; flupdate set mmc; imxtract … hlos && flash 0:HLOS;
+  imxtract … rootfs && flash rootfs; flupdate clear`; in Qualcomm's U-Boot
+  `flupdate` only selects the flash type). If the server runs it, the image
+  is flashed. That is reported from the bootloader in PR #114, not tested.
+- the `…-initramfs-uImage.itb` is **not** flashed. The server reports "HTTP
+  ugrade is done" but the eMMC is unchanged. The image is left in RAM at
+  0x50000000, where `bootm 0x50000000` from the serial console can start it
+  (see the device page). This is what the device page measured, and it
+  matches the PR's analysis of the `.itb`.
+- `…-squashfs-sysupgrade.bin` is rejected.
+
+For a guaranteed result, use a stock image there.
+
+### U-Boot environment (`fw_printenv`)
+
+The images set up `fw_env.config` for the GL-BE9300 with stock's layout:
+`0:APPSBLENV` at offset 0, 256 KiB, the environment size of Qualcomm's
+U-Boot for IPQ5332. It was checked on a unit running stock 4.10.1, where
+`0:APPSBLENV` is 256 KiB, stock's own `/etc/fw_env.config` reads
+`/dev/mmcblk0p6 0x0 0x40000`, and `fw_printenv` shows no "Bad CRC" warning.
+To repeat the check on your own unit, run this **while it still runs
+stock**:
+
+```sh
+cat /etc/fw_env.config      # must read: /dev/mmcblk0p6 0x0 0x40000
+fw_printenv >/dev/null      # must print no "Bad CRC" warning
+```
+
+The entry is only created on a fresh install (or after
+`/etc/config/ubootenv` is removed); a keep-settings upgrade from an older
+build keeps its empty configuration. To add it by hand on a running unit:
+
+```sh
+echo "$(. /lib/functions.sh; find_mmc_part 0:APPSBLENV) 0x0 0x40000" > /etc/fw_env.config
+fw_printenv >/dev/null      # again: no "Bad CRC"
+```
+
+**Never run `fw_setenv` after `fw_printenv` has warned "Bad CRC, using
+default environment".** `fw_setenv` would then write the tools' generic
+default environment (`bootcmd=run distro_bootcmd`) with a valid CRC, and
+this U-Boot would no longer boot the firmware. Remove `/etc/fw_env.config`
+instead and report the output of the stock check above.
+
+## A failed upgrade
+
+Once an upgrade has begun, ssh and the system log are gone, and if it fails the
+unit reboots at once, so its reason only shows on the serial console. The script
+also writes the reason to the kernel log. If the unit comes back on its old system,
+look in `/sys/fs/pstore/console-ramoops-0` before the next reboot. This has not
+been tried on hardware yet. Failures that can be found before the upgrade begins,
+such as too little RAM or a missing tool, are reported by `sysupgrade` itself
+unless `-F` is given.
+
+## Crash logs
+
+A kernel panic reboots the unit after `kernel.panic` (3 s). If the panic path
+hangs instead, the watchdog bites at most 5 s later. Why a crashed AP takes
+~90 s to answer again cannot be settled from source. Probably most of it is
+the normal boot (U-Boot, kernel, and loading the Wi-Fi firmware for three
+radios), but a panic path that hangs until a watchdog bite would look the
+same from outside. The timestamps in the saved crash logs, or a serial
+console, will tell.
+
+The kernel log of the crash survives that reboot in RAM (ramoops, 1 MiB
+reserved at 0x4da00000). On the next boot `/etc/init.d/save-pstore` copies
+it to `/root/pstore/NNNN-<date>/` (`dmesg-ramoops-*` is the panic,
+`console-ramoops-*` the console of the crashed boot), keeps the last 10
+crashes, and says so in the kernel log (`dmesg | grep pstore`, also in
+`logread`). The RAM copy is only cleared once every record has been copied
+to the flash-backed overlay, synced and compared with the original. If the
+overlay is not on flash (it fell back to tmpfs, for example because the
+crash damaged it) or a copy fails, the records stay in `/sys/fs/pstore` and
+can be copied by hand. `/root/pstore` is kept across sysupgrades that keep
+settings. A power cut, or pulling the plug instead of waiting for the
+reboot, loses the RAM copy.
+
+U-Boot only collects its own crash dump (and waits for "any key within
+10s") when the download-mode cookie in TCSR (0x193D100, bit 4) is set. Linux
+clears it at boot (`qcom_scm.download_mode=off`, the default), so a panic
+reboots straight into a normal boot.
 
 ## Other boards
 
