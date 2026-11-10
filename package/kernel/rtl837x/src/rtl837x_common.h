@@ -49,6 +49,8 @@
 			gsw->sds1mode = (_mode);                        \
 	} while (0)
 
+struct gpio_chip;
+
 struct rtl837x_mib_counter {
 	uint16_t	base;
 	const char	*name;
@@ -153,6 +155,7 @@ struct rtk_gsw {
 	bool mirror_ingress;
 	struct net_device *ethernet_master;
 	struct sfp_bus *sfp_bus;
+	struct gpio_chip *gpio_chip;
 
 	struct rtl837x_mib_counter *mib_counters;
 	unsigned int num_mib_counters;
@@ -175,6 +178,32 @@ struct rtk_gsw {
 	uint16_t bridge_pvid[RTK_MAX_NUM_OF_PORT];
 	bool bridge_pvid_valid[RTK_MAX_NUM_OF_PORT];
 
+	/* rtl8_4: user ports that are members of the base VLAN 1 only because
+	 * they are standalone or in a VLAN-unaware bridge, not because a
+	 * bridge configured VID 1 on them. See rtl837x_base_vlan_join().
+	 */
+	u32 base_vlan_only;
+
+	/* MAC_L2_PORT_MAX_LEN_CTRL as the bootloader left it (both speed
+	 * buckets and TAG_INC), read once at setup with jumbo. port_change_mtu never
+	 * programs less than this: LAN-to-LAN frames are switched in hardware
+	 * without Linux seeing them.
+	 */
+	u32 boot_max_len[RTK_MAX_NUM_OF_PORT][2];
+	u32 boot_tag_inc[RTK_MAX_NUM_OF_PORT];
+	bool boot_max_len_valid;
+
+	/* Users of each CPU-port LUT entry, see rtl837x_host_fdb_find().
+	 * Protected by rtl837x_ind_lock.
+	 */
+	struct list_head host_fdb;
+
+	/* CPU-port watchdog: set while it holds the conduit closed itself,
+	 * with the user ports that were running when it closed it.
+	 */
+	bool cpu_reset_pending;
+	u32 cpu_reset_users;
+
 	uint16_t flow_control_map; // 流控配置位图
 	bool global_vlan_enable;
 
@@ -187,6 +216,18 @@ struct rtk_gsw {
 
 extern int rtl8372n_hw_init(struct rtk_gsw *gsw, rtl837x_pnswap_cfg_t swap_cfg);
 
+/* Serializes the SDK's multi-register indirect transactions -- the MIB
+ * counter engine, the ITA VLAN/LUT table engine, LUT flushes, indirect PHY
+ * and SerDes access -- each of which is a command/poll/data sequence that
+ * the per-register regmap lock does not cover (RTK_API_LOCK() is empty in
+ * the kernel build). The SDK is reached from RTNL, from DSA's FDB workqueue
+ * (no RTNL), from phylib, from stats_work and the CPU-port work, and from
+ * debugfs. Hold it around one SDK call at a time, never across a callback
+ * or while taking another lock; the order is rtnl / phylib -> this ->
+ * regmap map_lock -> MDIO bus lock.
+ */
+extern struct mutex rtl837x_ind_lock;
+
 extern int rtl837x_debug_proc_init(struct rtk_gsw *gsw);
 extern int rtl837x_debug_proc_deinit(struct rtk_gsw *gsw);
 
@@ -194,6 +235,7 @@ extern int rtl837x_dsa_register(struct rtk_gsw *gsw);
 extern void rtl837x_dsa_unregister(struct rtk_gsw *gsw);
 extern void rtl837x_dsa_shutdown(struct rtk_gsw *gsw);
 extern int rtl837x_gpiochip_init(struct rtk_gsw *gsw);
+extern void rtl837x_gpiochip_exit(struct rtk_gsw *gsw);
 
 unsigned int mii_mgr_read(unsigned int phy_addr, 
 		unsigned int phy_register, unsigned int *read_data);

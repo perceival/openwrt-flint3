@@ -19,8 +19,11 @@
 
 #define TO_FOPS(name) _##name##_rw_fops
 
+/* Large enough for the longest usage line below (65 bytes + NUL). */
+#define RTL837X_DBG_BUF_LEN 128
+
 #define REGRWFUNC(name) \
-	static char _buf_rd_##name[64];  \
+	static char _buf_rd_##name[RTL837X_DBG_BUF_LEN];  \
 	static ssize_t _##name##_rw_read(struct file *filep, char __user *ubuf,  \
 				  size_t count, loff_t *offp)   \
 	{   \
@@ -60,7 +63,9 @@ ssize_t _sdsreg_rw_write(struct file *filep, const char __user *ubuf,
 				kfree(buf);
 				return -EFAULT;
 			}
+			mutex_lock(&rtl837x_ind_lock);
 			ret = rtk_rtl8373_sds_reg_write(sds_id, page, reg, val);
+			mutex_unlock(&rtl837x_ind_lock);
 			if (ret) {
 				kfree(buf);
 				return -EIO;
@@ -75,15 +80,17 @@ ssize_t _sdsreg_rw_write(struct file *filep, const char __user *ubuf,
 				kfree(buf);
 				return -EFAULT;
 			}
+			mutex_lock(&rtl837x_ind_lock);
 			ret = rtk_rtl8373_sds_reg_read(sds_id, page, reg, &val);
+			mutex_unlock(&rtl837x_ind_lock);
 			if (ret) {
 				kfree(buf);
 				return -EIO;
 			}
-			snprintf(_buf_rd_sdsreg, 64, "sds_id: %d, page: 0x%08x, reg: 0x%08x, val: 0x%08x\n", sds_id, page, reg, val);
+			snprintf(_buf_rd_sdsreg, sizeof(_buf_rd_sdsreg), "sds_id: %d, page: 0x%08x, reg: 0x%08x, val: 0x%08x\n", sds_id, page, reg, val);
 		}
 	} else {
-		snprintf(_buf_rd_sdsreg, 64, "echo \"w/r <sds_id> <page> <reg> [<val>]\" > sdsreg\n");
+		snprintf(_buf_rd_sdsreg, sizeof(_buf_rd_sdsreg), "echo \"w/r <sds_id> <page> <reg> [<val>]\" > sdsreg\n");
 	}
 	kfree(buf);
 	return count;
@@ -110,7 +117,9 @@ ssize_t _phyreg_mmd_rw_write(struct file *filep, const char __user *ubuf,
 				kfree(buf);
 				return -EFAULT;
 			}
+			mutex_lock(&rtl837x_ind_lock);
 			ret = rtk_port_phyReg_set(1 << port, devad, reg, val);
+			mutex_unlock(&rtl837x_ind_lock);
 			if (ret) {
 				kfree(buf);
 				return -EIO;
@@ -125,15 +134,17 @@ ssize_t _phyreg_mmd_rw_write(struct file *filep, const char __user *ubuf,
 				kfree(buf);
 				return -EFAULT;
 			}
+			mutex_lock(&rtl837x_ind_lock);
 			ret = rtk_port_phyReg_get(port, devad, reg, &val);
+			mutex_unlock(&rtl837x_ind_lock);
 			if (ret) {
 				kfree(buf);
 				return -EIO;
 			}
-			snprintf(_buf_rd_phyreg_mmd, 64, "port: %d, devad: 0x%08x, reg: 0x%08x, val: 0x%08x\n", port, devad, reg, val);
+			snprintf(_buf_rd_phyreg_mmd, sizeof(_buf_rd_phyreg_mmd), "port: %d, devad: 0x%08x, reg: 0x%08x, val: 0x%08x\n", port, devad, reg, val);
 		}
 	} else {
-		snprintf(_buf_rd_phyreg_mmd, 64, "echo \"w/r <real_port_index> <devad> <reg> [<val>]\" > phyreg_mmd\n");
+		snprintf(_buf_rd_phyreg_mmd, sizeof(_buf_rd_phyreg_mmd), "echo \"w/r <real_port_index> <devad> <reg> [<val>]\" > phyreg_mmd\n");
 	}
 	kfree(buf);
 	return count;
@@ -160,7 +171,9 @@ ssize_t _reg_rw_write(struct file *filep, const char __user *ubuf,
 			kfree(buf);
 			return -EFAULT;
 		} else {
+			mutex_lock(&rtl837x_ind_lock);
 			ret = rtk_rtl8373_setAsicReg(reg, val);
+			mutex_unlock(&rtl837x_ind_lock);
 			if (ret) {
 				kfree(buf);
 				return -EIO;
@@ -171,15 +184,17 @@ ssize_t _reg_rw_write(struct file *filep, const char __user *ubuf,
 			kfree(buf);
 			return -EFAULT;
 		} else {
+			mutex_lock(&rtl837x_ind_lock);
 			ret = rtk_rtl8373_getAsicReg(reg, &val);
+			mutex_unlock(&rtl837x_ind_lock);
 			if (ret) {
 				kfree(buf);
 				return -EIO;
 			}
-			snprintf(_buf_rd_reg, 64, "reg: 0x%08x, val: 0x%08x\n", reg, val);
+			snprintf(_buf_rd_reg, sizeof(_buf_rd_reg), "reg: 0x%08x, val: 0x%08x\n", reg, val);
 		}
 	} else {
-		snprintf(_buf_rd_reg, 64, "echo \"w/r <reg> [<val>]\" > reg\n");
+		snprintf(_buf_rd_reg, sizeof(_buf_rd_reg), "echo \"w/r <reg> [<val>]\" > reg\n");
 	}
 	kfree(buf);
 	return count;
@@ -197,6 +212,7 @@ static ssize_t _sds_page_dump_read(struct file *filep, char __user *ubuf,
 	if (!buf)
 		return -ENOMEM;
 
+	mutex_lock(&rtl837x_ind_lock);
 	ret = rtk_rtl8373_getAsicReg(RTL8373_SDS_MODE_SEL_ADDR, &v3);
 	if (ret)
 		goto out_error;
@@ -283,10 +299,12 @@ static ssize_t _sds_page_dump_read(struct file *filep, char __user *ubuf,
 		goto out_error;
 	len += snprintf(buf + len, 4096 - len, "sds page 5  reg 1; bit7:0 = %#x\n", v3);
 
+	mutex_unlock(&rtl837x_ind_lock);
 	ret = simple_read_from_buffer(ubuf, count, offp, buf, len);
 	goto out;
 
 out_error:
+	mutex_unlock(&rtl837x_ind_lock);
 	ret = -EIO;
 
 out:
