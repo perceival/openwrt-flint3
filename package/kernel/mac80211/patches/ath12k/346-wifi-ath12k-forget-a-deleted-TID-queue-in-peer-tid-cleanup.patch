@@ -1,0 +1,57 @@
+From: CoolFreeze23 <34906576+CoolFreeze23@users.noreply.github.com>
+Date: Tue, 20 Oct 2026 12:00:00 +0900
+Subject: [PATCH] wifi: ath12k: forget a deleted TID queue in peer tid cleanup
+
+ath12k_dp_rx_peer_tid_cleanup() hands every active TID queue to its
+pending delete element, which frees the descriptor once REO has flushed
+it. The TID stays marked active in rx_tid_active_bitmask, and
+dp_peer->reoq_bufs[tid] and rx_tid->qbuf keep pointing at the
+descriptor.
+
+Two paths then give the soon-to-be-freed descriptor back to the
+hardware:
+
+- dp_peer outlives the link peer of an MLO station. When a new primary
+  link sets the TID up, ath12k_dp_rx_assign_reoq() finds
+  reoq_bufs[tid] still set and reuses it.
+- A peer whose DP state is cleaned up and set up again keeps the active
+  bit, so the next ADDBA takes the "already set up" branch and
+  re-programs the queue into REO (UPDATE_RX_QUEUE) and, on IPQ5332,
+  into firmware (WMI_PEER_REORDER_QUEUE_SETUP).
+
+After the free, REO writes into a recycled kmalloc-2k object. For each
+TID that was active, clear its active bit and forget both copies of the
+descriptor once it belongs to the delete element.
+---
+diff --git a/drivers/net/wireless/ath/ath12k/dp_rx.c b/drivers/net/wireless/ath/ath12k/dp_rx.c
+--- a/drivers/net/wireless/ath/ath12k/dp_rx.c
++++ b/drivers/net/wireless/ath/ath12k/dp_rx.c
+@@ -724,11 +724,28 @@ void ath12k_dp_rx_peer_tid_cleanup(struc
+ 		return;
+ 
+ 	for (i = 0; i <= IEEE80211_NUM_TIDS; i++) {
++		bool was_active = peer->rx_tid_active_bitmask & BIT(i);
++
+ 		rx_tid = &peer->dp_peer->rx_tid[i];
+ 
+ 		ath12k_dp_arch_rx_peer_tid_delete(dp, peer, i);
+ 		ath12k_dp_arch_rx_frags_cleanup(dp, rx_tid, true);
+ 
++		/*
++		 * An active TID's queue descriptor now belongs to the pending
++		 * delete element, which frees it once REO has flushed it.
++		 * dp_peer outlives this link peer for an MLO station (a new
++		 * primary link can set the TID up again), so forget the
++		 * descriptor here: otherwise ath12k_dp_rx_assign_reoq() would
++		 * hand the soon-to-be-freed buffer to REO again.
++		 */
++		if (was_active) {
++			peer->rx_tid_active_bitmask &= ~BIT(i);
++			memset(&peer->dp_peer->reoq_bufs[i], 0,
++			       sizeof(peer->dp_peer->reoq_bufs[i]));
++			memset(&rx_tid->qbuf, 0, sizeof(rx_tid->qbuf));
++		}
++
+ 		spin_unlock_bh(&dp->dp_lock);
+ 		timer_delete_sync(&rx_tid->frag_timer);
+ 		spin_lock_bh(&dp->dp_lock);

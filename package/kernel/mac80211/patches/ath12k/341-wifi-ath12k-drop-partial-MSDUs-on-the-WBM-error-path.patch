@@ -1,0 +1,79 @@
+From: CoolFreeze23 <34906576+CoolFreeze23@users.noreply.github.com>
+Date: Tue, 20 Oct 2026 12:00:00 +0900
+Subject: [PATCH] wifi: ath12k: drop partial MSDUs on the WBM error path
+
+ath12k_dp_rx_h_undecap_raw() WARNs on a RAW-decap MSDU that is not both
+first and last and then returns without trimming it, so the caller
+delivers the frame to mac80211 with FCS and crypto trailer attached.
+Both WBM-error callers can get there:
+
+- the RXDMA error handlers (unauth-WDS, TKIP MIC) parse every buffer as
+  a complete MSDU with its own rx descriptor, but only the first buffer
+  of a scattered MSDU has one; the others are parsed from payload bytes.
+  Drop scattered MSDUs released by RXDMA as a whole.
+- the null-queue-descriptor and TKIP-MIC paths do not filter RAW MSDUs
+  that are not first+last. Drop them before undecap.
+
+Also log a TQM completion for an already-unmapped peer at debug level,
+as the HTT completion path already does. It is expected when a station
+leaves with frames in flight (issue #86's "failed to find the peer with
+peer_id" bursts).
+---
+diff --git a/drivers/net/wireless/ath/ath12k/wifi7/dp_rx.c b/drivers/net/wireless/ath/ath12k/wifi7/dp_rx.c
+--- a/drivers/net/wireless/ath/ath12k/wifi7/dp_rx.c
++++ b/drivers/net/wireless/ath/ath12k/wifi7/dp_rx.c
+@@ -1624,6 +1624,10 @@ static int ath12k_wifi7_dp_rx_h_null_q_desc(struct ath12k_pdev_dp *dp_pdev,
+ 	if (rxcb->is_continuation)
+ 		return -EINVAL;
+ 
++	if (rx_info->decap_type == DP_RX_DECAP_TYPE_RAW &&
++	    !(rxcb->is_first_msdu && rxcb->is_last_msdu))
++		return -EINVAL;
++
+ 	if (!rx_info->msdu_done) {
+ 		ath12k_warn(ab,
+ 			    "msdu_done bit not set in null_q_des processing\n");
+@@ -1681,6 +1685,11 @@ static bool ath12k_wifi7_dp_rx_h_tkip_mic_err(struct ath12k_pdev_dp *dp_pdev,
+ 	rxcb->is_first_msdu = rx_info->is_first_msdu;
+ 	rxcb->is_last_msdu = rx_info->is_last_msdu;
+ 
++	if (rxcb->is_continuation ||
++	    (rx_info->decap_type == DP_RX_DECAP_TYPE_RAW &&
++	     !(rxcb->is_first_msdu && rxcb->is_last_msdu)))
++		return true;
++
+ 	if ((hal_rx_desc_sz + l3pad_bytes + msdu_len) > DP_RX_BUFFER_SIZE) {
+ 		ath12k_dbg(ab, ATH12K_DBG_DATA,
+ 			   "invalid msdu len in tkip mic err %u\n", msdu_len);
+@@ -2016,6 +2025,18 @@ int ath12k_wifi7_dp_rx_process_wbm_err(struct ath12k_dp *dp,
+ 			continue;
+ 		}
+ 
++		if (!skb_queue_empty(&scatter_msdu_list) &&
++		    err_info.err_rel_src == HAL_WBM_REL_SRC_MODULE_RXDMA) {
++			/* The RXDMA error handlers parse each buffer as a
++			 * complete MSDU with its own rx descriptor, but only
++			 * the first buffer of a scattered MSDU carries one.
++			 * Drop the whole scattered MSDU.
++			 */
++			ath12k_dp_clean_up_skb_list(&scatter_msdu_list);
++			dev_kfree_skb_any(msdu);
++			continue;
++		}
++
+ 		if (!skb_queue_empty(&scatter_msdu_list)) {
+ 			struct sk_buff *msdu;
+ 
+diff --git a/drivers/net/wireless/ath/ath12k/wifi7/dp_tx.c b/drivers/net/wireless/ath/ath12k/wifi7/dp_tx.c
+--- a/drivers/net/wireless/ath/ath12k/wifi7/dp_tx.c
++++ b/drivers/net/wireless/ath/ath12k/wifi7/dp_tx.c
+@@ -859,7 +859,8 @@ static void ath12k_wifi7_dp_tx_complete_msdu(struct ath12k_pdev_dp *dp_pdev,
+ 
+ 	peer = ath12k_dp_link_peer_find_by_peerid(dp_pdev, ts->peer_id);
+ 	if (!peer || !peer->sta) {
+-		ath12k_err(ab,
++		/* expected for frames completing after the peer was deleted */
++		ath12k_dbg(ab, ATH12K_DBG_DP_TX,
+ 			   "dp_tx: failed to find the peer with peer_id %d\n",
+ 			   ts->peer_id);
+ 		ieee80211_free_txskb(ath12k_pdev_dp_to_hw(dp_pdev), msdu);

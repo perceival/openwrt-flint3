@@ -1,0 +1,126 @@
+From: CoolFreeze23 <34906576+CoolFreeze23@users.noreply.github.com>
+Date: Tue, 20 Oct 2026 12:00:00 +0900
+Subject: [PATCH] wifi: ath12k: never free a REO queue firmware may still use
+
+Two gaps in patch 344 (hold REO queues until firmware unmaps the peer)
+and a visible bound:
+
+- ath12k_dp_rx_tid_del_func() freed the descriptor at once when the
+  cache-flush element could not be allocated: no REO cache flush, no
+  hold check, and VLD still set. Under memory pressure that is exactly
+  the use-after-free 344 prevents. Leak the descriptor instead and warn.
+- A firmware peer unmap that arrives after the host dropped the peer
+  (a delete that timed out and was continued, see 324) found no peer
+  and returned before releasing the hold, so the queues stayed held
+  until the id was reused or firmware restarted. Release the hold on
+  any unmap of the id, before the peer lookup.
+- Count held descriptors in the cache-flush loop and warn, at most once
+  a minute, when more than 256 are held (about 512 KB: each QoS queue
+  descriptor is a 2 KB allocation, sized for a 1024 BA window at 1663
+  bytes; the queues of about 15 peers), so that firmware that stops
+  confirming deletes shows up instead of quietly using RAM.
+---
+diff --git a/drivers/net/wireless/ath/ath12k/dp_peer.c b/drivers/net/wireless/ath/ath12k/dp_peer.c
+--- a/drivers/net/wireless/ath/ath12k/dp_peer.c
++++ b/drivers/net/wireless/ath/ath12k/dp_peer.c
+@@ -138,6 +138,13 @@ void ath12k_dp_link_peer_unmap_event(str
+ 
+ 	spin_lock_bh(&dp->dp_lock);
+ 
++	/* Firmware no longer references this peer id's REO queues. Release
++	 * them also when the host already dropped the peer (a delete that
++	 * timed out and was continued without this confirmation).
++	 */
++	if (peer_id <= DP_MAX_PEER_ID)
++		clear_bit(peer_id, dp->reoq_hold_peer_ids);
++
+ 	peer = ath12k_dp_link_peer_search_by_id(dp, peer_id);
+ 	if (!peer) {
+ 		ath12k_warn(ab, "peer-unmap-event: unknown peer id %d\n",
+@@ -148,10 +155,6 @@ void ath12k_dp_link_peer_unmap_event(str
+ 	ath12k_dbg(ab, ATH12K_DBG_DP_HTT, "htt peer unmap vdev %d peer %pM id %d\n",
+ 		   peer->vdev_id, peer->addr, peer_id);
+ 
+-	/* firmware no longer references this peer's REO queues */
+-	if (peer_id <= DP_MAX_PEER_ID)
+-		clear_bit(peer_id, dp->reoq_hold_peer_ids);
+-
+ 	ath12k_dp_link_peer_free(peer);
+ 	wake_up(&ab->peer_mapping_wq);
+ 
+diff --git a/drivers/net/wireless/ath/ath12k/dp_rx.c b/drivers/net/wireless/ath/ath12k/dp_rx.c
+--- a/drivers/net/wireless/ath/ath12k/dp_rx.c
++++ b/drivers/net/wireless/ath/ath12k/dp_rx.c
+@@ -614,9 +614,11 @@ EXPORT_SYMBOL(ath12k_dp_rx_process_reo_c
+ void ath12k_dp_rx_tid_del_func(struct ath12k_dp *dp, void *ctx,
+ 			       enum hal_reo_cmd_status status)
+ {
++	static DEFINE_RATELIMIT_STATE(hold_warn_rs, 60 * HZ, 1);
+ 	struct ath12k_base *ab = dp->ab;
+ 	struct ath12k_dp_rx_tid_rxq *rx_tid = ctx;
+ 	struct ath12k_dp_rx_reo_cache_flush_elem *elem, *tmp;
++	unsigned int held = 0;
+ 
+ 	if (status == HAL_REO_CMD_DRAIN) {
+ 		goto free_desc;
+@@ -635,8 +637,16 @@ void ath12k_dp_rx_tid_del_func(struct at
+ 	spin_unlock_bh(&dp->dp_lock);
+ 
+ 	elem = kzalloc_obj(*elem, GFP_ATOMIC);
+-	if (!elem)
+-		goto free_desc;
++	if (!elem) {
++		/* The descriptor was not flushed from the REO cache, and on
++		 * targets without a queue LUT firmware may still use it (the
++		 * delete keeps VLD set): leak it rather than hand memory the
++		 * hardware can write to back to the slab.
++		 */
++		ath12k_warn(ab, "no memory to age rx tid %d hw descriptor, leaking it\n",
++			    rx_tid->tid);
++		return;
++	}
+ 
+ 	elem->ts = jiffies;
+ 	memcpy(&elem->data, rx_tid, sizeof(*rx_tid));
+@@ -653,8 +663,10 @@ void ath12k_dp_rx_tid_del_func(struct at
+ 		 * or the device is torn down.
+ 		 */
+ 		if (elem->data.peer_id <= DP_MAX_PEER_ID &&
+-		    test_bit(elem->data.peer_id, dp->reoq_hold_peer_ids))
++		    test_bit(elem->data.peer_id, dp->reoq_hold_peer_ids)) {
++			held++;
+ 			continue;
++		}
+ 
+ 		if (dp->reo_cmd_cache_flush_count > ATH12K_DP_RX_REO_DESC_FREE_THRES ||
+ 		    time_after(jiffies, elem->ts +
+@@ -678,6 +690,14 @@ void ath12k_dp_rx_tid_del_func(struct at
+ 	}
+ 	spin_unlock_bh(&dp->reo_rxq_flush_lock);
+ 
++	/* A lower bound if the loop stopped early. Many held descriptors mean
++	 * firmware is not confirming peer deletes; make that visible instead
++	 * of letting the memory go quietly.
++	 */
++	if (held > ATH12K_DP_RX_REO_DESC_HOLD_WARN && __ratelimit(&hold_warn_rs))
++		ath12k_warn(ab, "%u REO queue descriptors held for peers firmware has not unmapped\n",
++			    held);
++
+ 	return;
+ free_desc:
+ 	ath12k_dp_rx_tid_cleanup(ab, &rx_tid->qbuf);
+diff --git a/drivers/net/wireless/ath/ath12k/dp_rx.h b/drivers/net/wireless/ath/ath12k/dp_rx.h
+--- a/drivers/net/wireless/ath/ath12k/dp_rx.h
++++ b/drivers/net/wireless/ath/ath12k/dp_rx.h
+@@ -71,6 +71,11 @@ struct ath12k_dp_rx_reo_cmd {
+ 
+ #define ATH12K_DP_RX_REO_DESC_FREE_THRES  64
+ #define ATH12K_DP_RX_REO_DESC_FREE_TIMEOUT_MS 1000
++/* warn (once a minute) when more REO queue descriptors than this are held
++ * for peers whose delete firmware has not confirmed: each QoS descriptor is
++ * a 2 KB allocation, so about 512 KB, the queues of about 15 peers
++ */
++#define ATH12K_DP_RX_REO_DESC_HOLD_WARN 256
+ 
+ enum ath12k_dp_rx_decap_type {
+ 	DP_RX_DECAP_TYPE_RAW,

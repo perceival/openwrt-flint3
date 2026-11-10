@@ -1,0 +1,279 @@
+From: CoolFreeze23 <34906576+CoolFreeze23@users.noreply.github.com>
+Date: Tue, 20 Oct 2026 12:00:00 +0900
+Subject: [PATCH] wifi: ath12k: complete MLO group recovery rounds
+
+Four gaps left in the group recovery of 339/348:
+
+- A device that crashes on its own while its partner is started (for
+  example a PCIe firmware crash before host capabilities during its
+  recovery boot: only that device's reset is queued) puts its group
+  reference and waits for the partner, whose reset nobody queues. The
+  group stays down until the next crash. After its put, a device now
+  requests the reset of every started partner.
+- recovery_powered_down was set after a power-down done without
+  ag->mutex. A partner's group power-up inside that window could boot
+  the device, and the device's own mutex section then booted it again.
+  The device is now marked as waiting (and not powered down) under the
+  mutex before it powers down.
+- A reset work queued twice for one crash (RDDM and the AHB fatal IRQ
+  both queue the PCIe device; a work re-queued while running) runs a
+  second time after the group power-up and resets a device that is
+  booting or already up. Every path that queues reset_work now sets
+  ATH12K_FLAG_RESET_REQUESTED, the reset work consumes it at its start
+  and returns at once without it, and the group power-up clears it for
+  each device it boots: that boot answers every earlier request.
+- When a recovery round outlasts the 20 s reset wait, a device can be
+  booted by one power-up and still be booting when the next power-up
+  resets the MLO memory under it. recovery_booting marks a device booted
+  by a recovery power-up until it starts or powers down; the group
+  power-up first requests the reset of such a device and powers nothing
+  until it is down.
+---
+diff --git a/drivers/net/wireless/ath/ath12k/ahb.c b/drivers/net/wireless/ath/ath12k/ahb.c
+--- a/drivers/net/wireless/ath/ath12k/ahb.c
++++ b/drivers/net/wireless/ath/ath12k/ahb.c
+@@ -996,6 +996,7 @@ static void ath12k_ahb_queue_group_recov
+ 		if (!new_crash && work_busy(&partner_ab->reset_work))
+ 			continue;
+ 
++		set_bit(ATH12K_FLAG_RESET_REQUESTED, &partner_ab->dev_flags);
+ 		queue_work(partner_ab->workqueue_aux, &partner_ab->reset_work);
+ 	}
+ out:
+diff --git a/drivers/net/wireless/ath/ath12k/core.c b/drivers/net/wireless/ath/ath12k/core.c
+--- a/drivers/net/wireless/ath/ath12k/core.c
++++ b/drivers/net/wireless/ath/ath12k/core.c
+@@ -698,6 +698,8 @@ void ath12k_core_to_group_ref_get(struct
+ 
+ 	lockdep_assert_held(&ag->mutex);
+ 
++	ab->recovery_booting = false;
++
+ 	if (ab->hw_group_ref) {
+ 		ath12k_dbg(ab, ATH12K_DBG_BOOT, "core already attached to group %d\n",
+ 			   ag->id);
+@@ -1711,6 +1713,26 @@ exit_restart:
+ 	complete(&ab->restart_completed);
+ }
+ 
++/* Queue a reset of @ab on behalf of the group recovery; the group is not
++ * powered up again until that reset work has run.
++ */
++static void ath12k_core_queue_reset_locked(struct ath12k_base *ab)
++{
++	lockdep_assert_held(&ab->ag->mutex);
++
++	set_bit(ATH12K_FLAG_CRASH_FLUSH, &ab->dev_flags);
++	set_bit(ATH12K_FLAG_RECOVERY, &ab->dev_flags);
++	WRITE_ONCE(ab->recovery_wait_power_down, true);
++	set_bit(ATH12K_FLAG_RESET_REQUESTED, &ab->dev_flags);
++	queue_work(ab->workqueue_aux, &ab->reset_work);
++}
++
++static bool ath12k_core_reset_queueable(struct ath12k_base *ab)
++{
++	return ab && test_bit(ATH12K_FLAG_REGISTERED, &ab->dev_flags) &&
++	       !test_bit(ATH12K_FLAG_UNREGISTERING, &ab->dev_flags);
++}
++
+ static void ath12k_core_group_queue_reset(struct ath12k_hw_group *ag)
+ {
+ 	struct ath12k_base *partner_ab;
+@@ -1720,15 +1742,8 @@ static void ath12k_core_group_queue_rese
+ 
+ 	for (i = 0; i < ag->num_devices; i++) {
+ 		partner_ab = ag->ab[i];
+-		if (!partner_ab ||
+-		    !test_bit(ATH12K_FLAG_REGISTERED, &partner_ab->dev_flags) ||
+-		    test_bit(ATH12K_FLAG_UNREGISTERING, &partner_ab->dev_flags))
+-			continue;
+-
+-		set_bit(ATH12K_FLAG_CRASH_FLUSH, &partner_ab->dev_flags);
+-		set_bit(ATH12K_FLAG_RECOVERY, &partner_ab->dev_flags);
+-		partner_ab->recovery_wait_power_down = true;
+-		queue_work(partner_ab->workqueue_aux, &partner_ab->reset_work);
++		if (ath12k_core_reset_queueable(partner_ab))
++			ath12k_core_queue_reset_locked(partner_ab);
+ 	}
+ }
+ 
+@@ -1763,6 +1778,26 @@ static void ath12k_core_group_recovery_p
+ 		}
+ 	}
+ 
++	/*
++	 * A device that an earlier power-up of this recovery booted, and that
++	 * has not started yet, may already have been given the MLO memory.
++	 * Resetting that memory under it, or starting the other devices
++	 * without it, breaks the group: reset it too, and power the group up
++	 * once it is down. Only reachable when a recovery round outlasts the
++	 * 20 s reset wait.
++	 */
++	for (i = 0; i < ag->num_devices; i++) {
++		ab = ag->ab[i];
++		if (!ab || !ab->recovery_booting ||
++		    !ath12k_core_reset_queueable(ab))
++			continue;
++
++		ath12k_dbg(ab, ATH12K_DBG_BOOT,
++			   "still booting from an earlier power-up, reset it first\n");
++		ath12k_core_queue_reset_locked(ab);
++		return;
++	}
++
+ 	/* Prepare MLO global memory region for power up */
+ 	ath12k_qmi_reset_mlo_mem(ag);
+ 
+@@ -1774,6 +1809,10 @@ static void ath12k_core_group_recovery_p
+ 		if (!ab || !ab->recovery_powered_down)
+ 			continue;
+ 		ab->recovery_powered_down = false;
++		/* this boot answers every reset requested for the device so
++		 * far: a reset work still queued for it is stale
++		 */
++		clear_bit(ATH12K_FLAG_RESET_REQUESTED, &ab->dev_flags);
+ 
+ 		ret = ath12k_hif_power_up(ab);
+ 		if (ret) {
+@@ -1782,6 +1821,7 @@ static void ath12k_core_group_recovery_p
+ 			power_up_failed = true;
+ 			continue;
+ 		}
++		ab->recovery_booting = true;
+ 		ath12k_dbg(ab, ATH12K_DBG_BOOT, "reset started\n");
+ 	}
+ 
+@@ -1805,7 +1845,9 @@ static void ath12k_core_reset_skipped(st
+ 
+ 	mutex_lock(&ag->mutex);
+ 	if (ab->recovery_wait_power_down) {
+-		ab->recovery_wait_power_down = false;
++		WRITE_ONCE(ab->recovery_wait_power_down, false);
++		/* not waited for again: this device has given up or is up */
++		ab->recovery_booting = false;
+ 		ath12k_core_group_recovery_power_up(ag);
+ 	}
+ 	mutex_unlock(&ag->mutex);
+@@ -1818,6 +1860,18 @@ static void ath12k_core_reset(struct wor
+ 	int reset_count, fail_cont_count;
+ 	long time_left;
+ 
++	/*
++	 * Every path that queues this work requests the reset first. A run
++	 * that finds no request is stale: a second queueing for the same
++	 * crash, or one answered by a group power-up that booted the device
++	 * since. Resetting the device again would tear down a recovery in
++	 * progress or a group that is already up.
++	 */
++	if (!test_and_clear_bit(ATH12K_FLAG_RESET_REQUESTED, &ab->dev_flags)) {
++		ath12k_dbg(ab, ATH12K_DBG_BOOT, "no reset requested, stale reset work\n");
++		return;
++	}
++
+ 	if (!(test_bit(ATH12K_FLAG_QMI_FW_READY_COMPLETE, &ab->dev_flags))) {
+ 		ath12k_warn(ab, "firmware crashed before QMI ready; recovery skipped (dev flags 0x%lx)\n",
+ 			    ab->dev_flags);
+@@ -1881,6 +1935,19 @@ static void ath12k_core_reset(struct wor
+ 	ath12k_hif_irq_disable(ab);
+ 	ath12k_hif_ce_irq_disable(ab);
+ 
++	/*
++	 * The power-down below runs without ag->mutex. Until this device is
++	 * marked powered down again, a partner's group power-up must neither
++	 * boot it nor use a recovery_powered_down left by an earlier run of
++	 * this work (a work re-queued while running, or one whose 20 s wait
++	 * expired while the round was still going on).
++	 */
++	mutex_lock(&ag->mutex);
++	WRITE_ONCE(ab->recovery_wait_power_down, true);
++	ab->recovery_powered_down = false;
++	ab->recovery_booting = false;
++	mutex_unlock(&ag->mutex);
++
+ 	ath12k_hif_power_down(ab, false);
+ 
+ 	/* prepare for power up */
+@@ -1889,9 +1956,35 @@ static void ath12k_core_reset(struct wor
+ 	mutex_lock(&ag->mutex);
+ 	ath12k_core_to_group_ref_put(ab);
+ 	ab->recovery_powered_down = true;
+-	ab->recovery_wait_power_down = false;
++	WRITE_ONCE(ab->recovery_wait_power_down, false);
+ 
+ 	if (ag->num_started > 0) {
++		int i;
++
++		/*
++		 * A started partner whose reset is not requested would keep
++		 * its reference and the group would wait for it forever: this
++		 * device crashed on its own (for example a PCIe crash before
++		 * host capabilities during its recovery boot), so the
++		 * partner firmware did not assert. Request its reset as well.
++		 * This is done even when its reset work is queued or running:
++		 * that run may be one that is about to skip ("to skip reset"),
++		 * and a duplicate request costs nothing, since a run whose
++		 * request was already answered returns at once.
++		 */
++		for (i = 0; i < ag->num_devices; i++) {
++			struct ath12k_base *partner_ab = ag->ab[i];
++
++			if (partner_ab == ab ||
++			    !ath12k_core_reset_queueable(partner_ab) ||
++			    !partner_ab->hw_group_ref)
++				continue;
++
++			ath12k_dbg(partner_ab, ATH12K_DBG_BOOT,
++				   "partner reset without this device, reset it too\n");
++			ath12k_core_queue_reset_locked(partner_ab);
++		}
++
+ 		ath12k_dbg(ab, ATH12K_DBG_BOOT,
+ 			   "waiting for %d partner device(s) to reset\n",
+ 			   ag->num_started);
+diff --git a/drivers/net/wireless/ath/ath12k/core.h b/drivers/net/wireless/ath/ath12k/core.h
+--- a/drivers/net/wireless/ath/ath12k/core.h
++++ b/drivers/net/wireless/ath/ath12k/core.h
+@@ -285,6 +285,10 @@ enum ath12k_dev_flags {
+ 	ATH12K_FLAG_QMI_FW_READY_COMPLETE,
+ 	ATH12K_FLAG_FTM_SEGMENTED,
+ 	ATH12K_FLAG_FIXED_MEM_REGION,
++	/* a reset of this device was requested and no reset run, nor a group
++	 * power-up that booted the device, has consumed the request yet
++	 */
++	ATH12K_FLAG_RESET_REQUESTED,
+ };
+ 
+ struct ath12k_tx_conf {
+@@ -1095,14 +1099,18 @@ struct ath12k_base {
+ 	atomic_t reset_count;
+ 	atomic_t recovery_count;
+ 	bool is_reset;
+-	/* Group recovery bookkeeping, both protected by ag->mutex.
++	/* Group recovery bookkeeping, protected by ag->mutex.
+ 	 * recovery_powered_down: this device's reset work powered it down and
+ 	 * it has not been powered up again since.
+-	 * recovery_wait_power_down: a recovery retry queued this device's
+-	 * reset work, which has not finished yet.
++	 * recovery_wait_power_down: this device's reset work is about to power
++	 * it down, or was queued by the recovery code and has not finished;
++	 * the group is not powered up until it has.
++	 * recovery_booting: a recovery power-up of this device succeeded and
++	 * the device has neither started nor been powered down since.
+ 	 */
+ 	bool recovery_powered_down;
+ 	bool recovery_wait_power_down;
++	bool recovery_booting;
+ 	struct completion reset_complete;
+ 	/* continuous recovery fail count */
+ 	atomic_t fail_cont_count;
+diff --git a/drivers/net/wireless/ath/ath12k/mhi.c b/drivers/net/wireless/ath/ath12k/mhi.c
+--- a/drivers/net/wireless/ath/ath12k/mhi.c
++++ b/drivers/net/wireless/ath/ath12k/mhi.c
+@@ -160,6 +160,7 @@ static void ath12k_mhi_op_status_cb(stru
+ 		if (!(test_bit(ATH12K_FLAG_UNREGISTERING, &ab->dev_flags))) {
+ 			set_bit(ATH12K_FLAG_CRASH_FLUSH, &ab->dev_flags);
+ 			set_bit(ATH12K_FLAG_RECOVERY, &ab->dev_flags);
++			set_bit(ATH12K_FLAG_RESET_REQUESTED, &ab->dev_flags);
+ 			queue_work(ab->workqueue_aux, &ab->reset_work);
+ 		}
+ 		break;

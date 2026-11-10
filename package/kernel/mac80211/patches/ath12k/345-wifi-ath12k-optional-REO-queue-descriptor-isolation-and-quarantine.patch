@@ -1,0 +1,341 @@
+From: CoolFreeze23 <34906576+CoolFreeze23@users.noreply.github.com>
+Date: Tue, 20 Oct 2026 12:00:00 +0900
+Subject: [PATCH] wifi: ath12k: optional REO queue descriptor isolation and quarantine
+
+Diagnostic for the netlink_release() panics (netlink_sock and the REO
+queue descriptors share kmalloc-2k). Off by default; enable with the
+ath12k module parameter reoq_debug=1 (read-only after load).
+
+When enabled, REO queue descriptors come from a dedicated non-mergeable
+slab, so a late hardware write can no longer hit another object. Freed
+descriptors are poisoned, cleaned to DRAM and held for at least 10 s
+(there is no timer: they are released by a later free on the device, or
+when it is cleaned up or removed); on release any byte the hardware
+changed after the free is reported with a hexdump (the 0x?DBEEF header
+magic identifies REO descriptors).
+
+The quarantine is kept per device (struct ath12k_dp), and only that
+device's own paths release its entries. They are all released, with
+their DMA mappings, when the device's REO lists are cleaned up and when
+the device is removed, so no entry outlives its device and none is left
+at module exit.
+
+When disabled, allocation and free use kzalloc()/kfree() exactly as
+before.
+---
+diff --git a/drivers/net/wireless/ath/ath12k/dp.h b/drivers/net/wireless/ath/ath12k/dp.h
+--- a/drivers/net/wireless/ath/ath12k/dp.h
++++ b/drivers/net/wireless/ath/ath12k/dp.h
+@@ -497,6 +497,11 @@ struct ath12k_dp {
+ 	 * - reo_cmd_list
+ 	 */
+ 	spinlock_t reo_cmd_lock;
++	/* reoq_debug=1 only: freed REO queue descriptors held back, each still
++	 * DMA-mapped for this device, see ath12k_dp_rx_reoq_quarantine().
++	 */
++	struct list_head reoq_quarantine_list;
++	spinlock_t reoq_quarantine_lock;
+ 	struct ath12k_hp_update_timer reo_cmd_timer;
+ 	struct ath12k_hp_update_timer tx_ring_timer[DP_TCL_NUM_RING_MAX];
+ 	struct ath12k_spt_info *spt_info;
+diff --git a/drivers/net/wireless/ath/ath12k/dp_rx.c b/drivers/net/wireless/ath/ath12k/dp_rx.c
+--- a/drivers/net/wireless/ath/ath12k/dp_rx.c
++++ b/drivers/net/wireless/ath/ath12k/dp_rx.c
+@@ -361,13 +361,181 @@ void ath12k_dp_init_rx_tid_rxq(struct at
+ }
+ EXPORT_SYMBOL(ath12k_dp_init_rx_tid_rxq);
+ 
++/* REO queue descriptors are read and written by the REO hardware.  With
++ * reoq_debug=1, keep them out of the generic kmalloc-2k cache (netlink
++ * sockets live there), and hold freed ones back, poisoned, so a late
++ * hardware write is caught instead of landing in an unrelated object.
++ * Diagnostic only, off by default. Read once at module load (0444): the
++ * allocator must not change while descriptors are outstanding.
++ */
++static bool ath12k_reoq_debug;
++module_param_named(reoq_debug, ath12k_reoq_debug, bool, 0444);
++MODULE_PARM_DESC(reoq_debug,
++		 "Isolate REO queue descriptors in their own slab and report writes after free (diagnostic)");
++
++#define ATH12K_REOQ_OBJ_SIZE		2048
++#define ATH12K_REOQ_QUARANTINE_MS	10000
++#define ATH12K_REOQ_POISON		0x6b
++
++struct ath12k_reoq_quarantine {
++	struct list_head list;
++	void *vaddr;
++	dma_addr_t paddr;
++	unsigned long ts;
++};
++
++static struct kmem_cache *ath12k_reoq_cache;
++
++int ath12k_dp_rx_reoq_cache_init(void)
++{
++	if (!ath12k_reoq_debug)
++		return 0;
++
++	pr_info("ath12k: REO queue descriptor isolation and quarantine enabled\n");
++	ath12k_reoq_cache = kmem_cache_create("ath12k_reoq", ATH12K_REOQ_OBJ_SIZE,
++					      HAL_LINK_DESC_ALIGN, SLAB_NO_MERGE,
++					      NULL);
++	return ath12k_reoq_cache ? 0 : -ENOMEM;
++}
++EXPORT_SYMBOL(ath12k_dp_rx_reoq_cache_init);
++
++void ath12k_dp_rx_reoq_cache_exit(void)
++{
++	if (!ath12k_reoq_cache)
++		return;
++
++	/* Every device flushed its quarantine when it was removed. */
++	kmem_cache_destroy(ath12k_reoq_cache);
++	ath12k_reoq_cache = NULL;
++}
++EXPORT_SYMBOL(ath12k_dp_rx_reoq_cache_exit);
++
++void *ath12k_dp_rx_reoq_alloc(size_t size, gfp_t gfp)
++{
++	if (!ath12k_reoq_cache)
++		return kzalloc(size, gfp);
++
++	if (WARN_ON_ONCE(size > ATH12K_REOQ_OBJ_SIZE))
++		return NULL;
++
++	return kmem_cache_zalloc(ath12k_reoq_cache, gfp);
++}
++EXPORT_SYMBOL(ath12k_dp_rx_reoq_alloc);
++
++/* For a descriptor that was never handed to hardware. */
++void ath12k_dp_rx_reoq_free_unused(void *vaddr)
++{
++	if (!ath12k_reoq_cache) {
++		kfree(vaddr);
++		return;
++	}
++
++	kmem_cache_free(ath12k_reoq_cache, vaddr);
++}
++EXPORT_SYMBOL(ath12k_dp_rx_reoq_free_unused);
++
++static void ath12k_dp_rx_reoq_release(struct ath12k_base *ab,
++				      struct ath12k_reoq_quarantine *q)
++{
++	u8 *p = q->vaddr;
++	int i;
++
++	/* Invalidates the CPU cache, so the check below reads DRAM. */
++	dma_unmap_single(ab->dev, q->paddr, ATH12K_REOQ_OBJ_SIZE,
++			 DMA_BIDIRECTIONAL);
++
++	for (i = 0; i < ATH12K_REOQ_OBJ_SIZE; i++)
++		if (p[i] != ATH12K_REOQ_POISON)
++			break;
++
++	if (i < ATH12K_REOQ_OBJ_SIZE) {
++		dev_err(ab->dev,
++			"REO queue descriptor %pad written after free (within %u ms, first byte at %d)\n",
++			&q->paddr, jiffies_to_msecs(jiffies - q->ts), i);
++		print_hex_dump(KERN_ERR, "reoq: ", DUMP_PREFIX_OFFSET, 16, 4,
++			       p, 256, false);
++		WARN_ON_ONCE(1);
++	}
++
++	kmem_cache_free(ath12k_reoq_cache, q->vaddr);
++	kfree(q);
++}
++
++/* An entry is only ever released by its own device, or when that device is
++ * cleaned up or removed (ath12k_dp_rx_reoq_quarantine_flush()), so it cannot
++ * outlive the device or its DMA mapping.
++ */
++static void ath12k_dp_rx_reoq_quarantine(struct ath12k_base *ab, void *vaddr)
++{
++	struct ath12k_dp *dp = ath12k_ab_to_dp(ab);
++	struct ath12k_reoq_quarantine *q, *tmp;
++	unsigned long flags;
++	LIST_HEAD(expired);
++
++	q = kmalloc(sizeof(*q), GFP_ATOMIC);
++	if (q) {
++		memset(vaddr, ATH12K_REOQ_POISON, ATH12K_REOQ_OBJ_SIZE);
++		/* Clean the poison to DRAM: the device is not coherent. */
++		q->paddr = dma_map_single(ab->dev, vaddr, ATH12K_REOQ_OBJ_SIZE,
++					  DMA_BIDIRECTIONAL);
++		if (dma_mapping_error(ab->dev, q->paddr)) {
++			kfree(q);
++			q = NULL;
++		}
++	}
++
++	if (q) {
++		q->vaddr = vaddr;
++		q->ts = jiffies;
++	} else {
++		kmem_cache_free(ath12k_reoq_cache, vaddr);
++	}
++
++	spin_lock_irqsave(&dp->reoq_quarantine_lock, flags);
++	if (q)
++		list_add_tail(&q->list, &dp->reoq_quarantine_list);
++	list_for_each_entry_safe(q, tmp, &dp->reoq_quarantine_list, list) {
++		if (!time_after(jiffies, q->ts +
++				msecs_to_jiffies(ATH12K_REOQ_QUARANTINE_MS)))
++			break;
++		list_move_tail(&q->list, &expired);
++	}
++	spin_unlock_irqrestore(&dp->reoq_quarantine_lock, flags);
++
++	list_for_each_entry_safe(q, tmp, &expired, list) {
++		list_del(&q->list);
++		ath12k_dp_rx_reoq_release(ab, q);
++	}
++}
++
++void ath12k_dp_rx_reoq_quarantine_flush(struct ath12k_base *ab)
++{
++	struct ath12k_dp *dp = ath12k_ab_to_dp(ab);
++	struct ath12k_reoq_quarantine *q, *tmp;
++	unsigned long flags;
++	LIST_HEAD(entries);
++
++	spin_lock_irqsave(&dp->reoq_quarantine_lock, flags);
++	list_splice_init(&dp->reoq_quarantine_list, &entries);
++	spin_unlock_irqrestore(&dp->reoq_quarantine_lock, flags);
++
++	list_for_each_entry_safe(q, tmp, &entries, list) {
++		list_del(&q->list);
++		ath12k_dp_rx_reoq_release(ab, q);
++	}
++}
++EXPORT_SYMBOL(ath12k_dp_rx_reoq_quarantine_flush);
++
+ static void ath12k_dp_rx_tid_cleanup(struct ath12k_base *ab,
+ 				     struct ath12k_reoq_buf *tid_qbuf)
+ {
+ 	if (tid_qbuf->vaddr) {
+ 		dma_unmap_single(ab->dev, tid_qbuf->paddr_aligned,
+ 				 tid_qbuf->size, DMA_BIDIRECTIONAL);
+-		kfree(tid_qbuf->vaddr);
++		if (ath12k_reoq_cache)
++			ath12k_dp_rx_reoq_quarantine(ab, tid_qbuf->vaddr);
++		else
++			kfree(tid_qbuf->vaddr);
+ 		tid_qbuf->vaddr = NULL;
+ 	}
+ }
+@@ -404,6 +572,9 @@ void ath12k_dp_rx_reo_cmd_list_cleanup(s
+ 	spin_unlock_bh(&dp->reo_cmd_lock);
+ 
+ 	bitmap_zero(dp->reoq_hold_peer_ids, DP_MAX_PEER_ID + 1);
++
++	/* last: the cleanups above add to it */
++	ath12k_dp_rx_reoq_quarantine_flush(ab);
+ }
+ 
+ void ath12k_dp_reo_cmd_free(struct ath12k_dp *dp, void *ctx,
+diff --git a/drivers/net/wireless/ath/ath12k/dp_rx.h b/drivers/net/wireless/ath/ath12k/dp_rx.h
+--- a/drivers/net/wireless/ath/ath12k/dp_rx.h
++++ b/drivers/net/wireless/ath/ath12k/dp_rx.h
+@@ -232,6 +232,11 @@ void ath12k_dp_rx_free(struct ath12k_bas
+ int ath12k_dp_rx_pdev_alloc(struct ath12k_base *ab, int pdev_idx);
+ void ath12k_dp_rx_pdev_free(struct ath12k_base *ab, int pdev_idx);
+ void ath12k_dp_rx_reo_cmd_list_cleanup(struct ath12k_base *ab);
++int ath12k_dp_rx_reoq_cache_init(void);
++void ath12k_dp_rx_reoq_cache_exit(void);
++void *ath12k_dp_rx_reoq_alloc(size_t size, gfp_t gfp);
++void ath12k_dp_rx_reoq_free_unused(void *vaddr);
++void ath12k_dp_rx_reoq_quarantine_flush(struct ath12k_base *ab);
+ int ath12k_dp_rx_bufs_replenish(struct ath12k_dp *dp,
+ 				struct dp_rxdma_ring *rx_ring,
+ 				struct list_head *used_list,
+diff --git a/drivers/net/wireless/ath/ath12k/wifi7/core.c b/drivers/net/wireless/ath/ath12k/wifi7/core.c
+--- a/drivers/net/wireless/ath/ath12k/wifi7/core.c
++++ b/drivers/net/wireless/ath/ath12k/wifi7/core.c
+@@ -12,6 +12,7 @@
+ #include "core.h"
+ #include "dp.h"
+ #include "../debug.h"
++#include "../dp_rx.h"
+ 
+ static int ahb_err, pci_err;
+ 
+@@ -32,12 +33,20 @@ int ath12k_wifi7_arch_init(struct ath12k
+ 
+ void ath12k_wifi7_arch_deinit(struct ath12k_base *ab)
+ {
++	/* also for the remove paths that never reach ath12k_dp_cleanup() */
++	ath12k_dp_rx_reoq_quarantine_flush(ab);
+ 	ath12k_wifi7_dp_device_free(ab->dp);
+ 	ab->dp = NULL;
+ }
+ 
+ static int ath12k_wifi7_init(void)
+ {
++	int ret;
++
++	ret = ath12k_dp_rx_reoq_cache_init();
++	if (ret)
++		return ret;
++
+ 	ahb_err = ath12k_wifi7_ahb_init();
+ 	if (ahb_err)
+ 		pr_warn("Failed to initialize ath12k Wi-Fi 7 AHB device: %d\n",
+@@ -49,7 +58,12 @@ static int ath12k_wifi7_init(void)
+ 			pci_err);
+ 
+ 	/* If both failed, return one of the failures (arbitrary) */
+-	return ahb_err && pci_err ? ahb_err : 0;
++	if (ahb_err && pci_err) {
++		ath12k_dp_rx_reoq_cache_exit();
++		return ahb_err;
++	}
++
++	return 0;
+ }
+ 
+ static void ath12k_wifi7_exit(void)
+@@ -59,6 +73,8 @@ static void ath12k_wifi7_exit(void)
+ 
+ 	if (!ahb_err)
+ 		ath12k_wifi7_ahb_exit();
++
++	ath12k_dp_rx_reoq_cache_exit();
+ }
+ 
+ module_init(ath12k_wifi7_init);
+diff --git a/drivers/net/wireless/ath/ath12k/wifi7/dp.c b/drivers/net/wireless/ath/ath12k/wifi7/dp.c
+--- a/drivers/net/wireless/ath/ath12k/wifi7/dp.c
++++ b/drivers/net/wireless/ath/ath12k/wifi7/dp.c
+@@ -172,6 +172,9 @@ struct ath12k_dp *ath12k_wifi7_dp_device
+ 
+ 	dp->ops = &ath12k_wifi7_dp_arch_ops;
+ 
++	INIT_LIST_HEAD(&dp->reoq_quarantine_list);
++	spin_lock_init(&dp->reoq_quarantine_lock);
++
+ 	return dp;
+ }
+ 
+diff --git a/drivers/net/wireless/ath/ath12k/wifi7/dp_rx.c b/drivers/net/wireless/ath/ath12k/wifi7/dp_rx.c
+--- a/drivers/net/wireless/ath/ath12k/wifi7/dp_rx.c
++++ b/drivers/net/wireless/ath/ath12k/wifi7/dp_rx.c
+@@ -273,7 +273,8 @@ int ath12k_wifi7_dp_rx_assign_reoq(struc
+ 			hw_desc_sz = ath12k_wifi7_hal_reo_qdesc_size(DP_BA_WIN_SZ_MAX,
+ 								     tid);
+ 
+-		vaddr = kzalloc(hw_desc_sz + HAL_LINK_DESC_ALIGN - 1, GFP_ATOMIC);
++		vaddr = ath12k_dp_rx_reoq_alloc(hw_desc_sz + HAL_LINK_DESC_ALIGN - 1,
++						GFP_ATOMIC);
+ 		if (!vaddr)
+ 			return -ENOMEM;
+ 
+@@ -286,7 +287,7 @@ int ath12k_wifi7_dp_rx_assign_reoq(struc
+ 					       DMA_BIDIRECTIONAL);
+ 		ret = dma_mapping_error(ab->dev, paddr_aligned);
+ 		if (ret) {
+-			kfree(vaddr);
++			ath12k_dp_rx_reoq_free_unused(vaddr);
+ 			return ret;
+ 		}
+ 

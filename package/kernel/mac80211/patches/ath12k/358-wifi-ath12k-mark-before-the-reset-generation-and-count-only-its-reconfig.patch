@@ -1,0 +1,150 @@
+From: CoolFreeze23 <34906576+CoolFreeze23@users.noreply.github.com>
+Date: Tue, 20 Oct 2026 12:00:00 +0900
+Subject: [PATCH] wifi: ath12k: mark before the reset generation and count only its reconfig
+
+Two gaps in 357:
+
+- is_reset was set and reset_gen bumped at the start of the reset, but
+  the device was marked (waiting, not powered down) only right before
+  its power-down. In between (the coredump alone can take up to the 90 s
+  MHI timeout on a PCIe device that is not in RDDM), a partner's group
+  power-up could boot it with the new generation; that boot's reconfig
+  then reported this reset's success and cleared is_reset, and the
+  power-down that followed tore the boot down. Mark the device and bump
+  the generation in one ag->mutex hold, mark first.
+- recovery_count was incremented on every reconfig complete while
+  is_reset was set, before the generation check, so the reconfig of an
+  older boot used up a newer reset's count and its success was never
+  reported. Zero the count with the bump, under base_lock, and in
+  ath12k_mac_op_reconfig_complete() check the generation first and count
+  only when it matches.
+---
+diff --git a/drivers/net/wireless/ath/ath12k/core.c b/drivers/net/wireless/ath/ath12k/core.c
+--- a/drivers/net/wireless/ath/ath12k/core.c
++++ b/drivers/net/wireless/ath/ath12k/core.c
+@@ -1979,11 +1979,29 @@ static void ath12k_core_reset(struct wor
+ reset:
+ 	ath12k_dbg(ab, ATH12K_DBG_BOOT, "reset starting\n");
+ 
++	/*
++	 * The power-down below runs without ag->mutex. Until this device is
++	 * marked powered down again, a partner's group power-up must neither
++	 * boot it nor use a recovery_powered_down left by an earlier run of
++	 * this work (a work re-queued while running, or one whose 20 s wait
++	 * expired while the round was still going on).
++	 * Mark it before the new reset generation starts, in the same hold: a
++	 * boot made after the bump would carry the new generation, and its
++	 * reconfig could report this reset's success (and clear is_reset)
++	 * before the power-down below tears that boot down. recovery_count
++	 * restarts with the generation, under the lock of the reconfig
++	 * complete check.
++	 */
++	mutex_lock(&ag->mutex);
++	WRITE_ONCE(ab->recovery_wait_power_down, true);
++	ab->recovery_powered_down = false;
++	ab->recovery_booting = false;
+ 	spin_lock_bh(&ab->base_lock);
+ 	ab->reset_gen++;
+ 	ab->is_reset = true;
+-	spin_unlock_bh(&ab->base_lock);
+ 	atomic_set(&ab->recovery_count, 0);
++	spin_unlock_bh(&ab->base_lock);
++	mutex_unlock(&ag->mutex);
+ 
+ 	ath12k_coredump_collect(ab);
+ 	ath12k_core_pre_reconfigure_recovery(ab);
+@@ -1995,19 +2013,6 @@ reset:
+ 	ath12k_hif_irq_disable(ab);
+ 	ath12k_hif_ce_irq_disable(ab);
+ 
+-	/*
+-	 * The power-down below runs without ag->mutex. Until this device is
+-	 * marked powered down again, a partner's group power-up must neither
+-	 * boot it nor use a recovery_powered_down left by an earlier run of
+-	 * this work (a work re-queued while running, or one whose 20 s wait
+-	 * expired while the round was still going on).
+-	 */
+-	mutex_lock(&ag->mutex);
+-	WRITE_ONCE(ab->recovery_wait_power_down, true);
+-	ab->recovery_powered_down = false;
+-	ab->recovery_booting = false;
+-	mutex_unlock(&ag->mutex);
+-
+ 	ath12k_hif_power_down(ab, false);
+ 
+ 	/* prepare for power up */
+diff --git a/drivers/net/wireless/ath/ath12k/mac.c b/drivers/net/wireless/ath/ath12k/mac.c
+--- a/drivers/net/wireless/ath/ath12k/mac.c
++++ b/drivers/net/wireless/ath/ath12k/mac.c
+@@ -13816,42 +13816,40 @@ ath12k_mac_op_reconfig_complete(struct i
+ 		}
+ 
+ 		if (ab->is_reset) {
+-			recovery_count = atomic_inc_return(&ab->recovery_count);
+-
+-			ath12k_dbg(ab, ATH12K_DBG_BOOT, "recovery count %d\n",
+-				   recovery_count);
++			bool current_reset, success = false;
+ 
++			/*
++			 * Count, and report success, only if the firmware that
++			 * has started was booted for the current reset. A
++			 * reconfig of an older reset that completes after a newer
++			 * reset started must neither clear is_reset of the newer
++			 * one nor use up its recovery_count, which restarts from
++			 * 0 with the generation (ath12k_core_reset()).
++			 */
++			spin_lock_bh(&ab->base_lock);
++			current_reset = ab->is_reset &&
++					ab->ready_gen == ab->reset_gen;
++			recovery_count = current_reset ?
++					 atomic_inc_return(&ab->recovery_count) : 0;
+ 			/* When there are multiple radios in an SOC,
+ 			 * the recovery has to be done for each radio
+ 			 */
+-			if (recovery_count == ab->num_radios) {
+-				bool current_reset;
+-
+-				/*
+-				 * Only if the firmware that has started was booted
+-				 * for the current reset: if the device crashed
+-				 * during this reconfig and a newer reset has started
+-				 * (or its boot has not started yet), that reset
+-				 * reports its own success, and is_reset must stay
+-				 * set for it.
+-				 */
+-				spin_lock_bh(&ab->base_lock);
+-				current_reset = ab->is_reset &&
+-						ab->ready_gen == ab->reset_gen;
+-				if (current_reset) {
+-					/* not below 0: see ath12k_core_reset() */
+-					atomic_dec_if_positive(&ab->reset_count);
+-					ab->is_reset = false;
+-					atomic_set(&ab->fail_cont_count, 0);
+-					clear_bit(ATH12K_FLAG_RECOVERY, &ab->dev_flags);
+-					complete(&ab->reset_complete);
+-				}
+-				spin_unlock_bh(&ab->base_lock);
+-
+-				ath12k_dbg(ab, ATH12K_DBG_BOOT, "%s\n",
+-					   current_reset ? "reset success" :
+-					   "reconfig of an older reset, newer reset in progress");
++			if (current_reset && recovery_count == ab->num_radios) {
++				/* not below 0: see ath12k_core_reset() */
++				atomic_dec_if_positive(&ab->reset_count);
++				ab->is_reset = false;
++				atomic_set(&ab->fail_cont_count, 0);
++				clear_bit(ATH12K_FLAG_RECOVERY, &ab->dev_flags);
++				complete(&ab->reset_complete);
++				success = true;
+ 			}
++			spin_unlock_bh(&ab->base_lock);
++
++			ath12k_dbg(ab, ATH12K_DBG_BOOT, "recovery count %d%s\n",
++				   recovery_count,
++				   success ? ", reset success" :
++				   current_reset ? "" :
++				   " (reconfig of an older reset, not counted)");
+ 		}
+ 
+ 		if (!hw_restarted)

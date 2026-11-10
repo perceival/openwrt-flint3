@@ -1,0 +1,109 @@
+From: CoolFreeze23 <34906576+CoolFreeze23@users.noreply.github.com>
+Date: Tue, 20 Oct 2026 12:00:00 +0900
+Subject: [PATCH] wifi: ath12k: report MLO low ack only when all links kicked out
+
+Firmware raises WMI_PEER_STA_KICKOUT_EVENTID per link peer, but the
+handler reports ieee80211_report_low_ack() on the whole MLD station.
+With disassoc_low_ack enabled, hostapd then disconnects the MLD from
+every link although only one link (for example a dozing 2.4 GHz link)
+stopped acknowledging.
+
+For an MLD station with more than one active link, record kicked-out
+links and report low ack only once every active link (links_map &
+valid_links) has kicked out within 30 s. Single-link and non-MLO
+stations are unchanged. A vanished MLD whose idle links never kick out
+falls back to hostapd's inactivity timeout, which is what the
+disassoc_low_ack=0 workaround already does for every station.
+
+Atomic bitops are used because kickout events for different links can
+come from different devices, under different ab->base_lock.
+---
+diff --git a/drivers/net/wireless/ath/ath12k/core.h b/drivers/net/wireless/ath/ath12k/core.h
+--- a/drivers/net/wireless/ath/ath12k/core.h
++++ b/drivers/net/wireless/ath/ath12k/core.h
+@@ -540,6 +540,13 @@ struct ath12k_sta {
+ 	enum ieee80211_sta_state state;
+ 
+ 	bool enable_4addr;
++
++	/* MLO links that reported a firmware kickout since kickout_ts.
++	 * Updated with atomic bitops: kickout events of different links can
++	 * come from different devices (different ab->base_lock).
++	 */
++	unsigned long kickout_links;
++	unsigned long kickout_ts;
+ };
+ 
+ #define ATH12K_HALF_20MHZ_BW	10
+diff --git a/drivers/net/wireless/ath/ath12k/mac.h b/drivers/net/wireless/ath/ath12k/mac.h
+--- a/drivers/net/wireless/ath/ath12k/mac.h
++++ b/drivers/net/wireless/ath/ath12k/mac.h
+@@ -24,6 +24,8 @@ struct ath12k_generic_iter {
+ 
+ /* number of failed packets (20 packets with 16 sw reties each) */
+ #define ATH12K_KICKOUT_THRESHOLD		(20 * 16)
++/* all active links of an MLD must kick out within this window */
++#define ATH12K_MLO_KICKOUT_WINDOW		(30 * HZ)
+ 
+ /* Use insanely high numbers to make sure that the firmware implementation
+  * won't start, we have the same functionality already in hostapd. Unit
+diff --git a/drivers/net/wireless/ath/ath12k/wmi.c b/drivers/net/wireless/ath/ath12k/wmi.c
+--- a/drivers/net/wireless/ath/ath12k/wmi.c
++++ b/drivers/net/wireless/ath/ath12k/wmi.c
+@@ -7644,6 +7644,45 @@ static void ath12k_scan_event(struct ath12k_base *ab, struct sk_buff *skb)
+ 	rcu_read_unlock();
+ }
+ 
++/*
++ * The firmware reports a kickout per link peer. For an MLD station one
++ * failing link (2.4 GHz link dozing or steered away, EMLSR) does not mean
++ * the station is gone, but ieee80211_report_low_ack() disconnects the whole
++ * MLD. Report only once every active link has kicked out within
++ * ATH12K_MLO_KICKOUT_WINDOW.
++ */
++static bool ath12k_wmi_mlo_kickout_all_links(struct ath12k_base *ab,
++					     struct ieee80211_sta *sta,
++					     struct ath12k_sta *ahsta,
++					     u8 link_id)
++{
++	unsigned long need = ahsta->links_map & sta->valid_links;
++	unsigned long ts = READ_ONCE(ahsta->kickout_ts);
++	unsigned long seen;
++
++	if (!sta->mlo || hweight_long(need) <= 1)
++		return true;
++
++	if (!READ_ONCE(ahsta->kickout_links) ||
++	    time_after(jiffies, ts + ATH12K_MLO_KICKOUT_WINDOW)) {
++		WRITE_ONCE(ahsta->kickout_ts, jiffies);
++		WRITE_ONCE(ahsta->kickout_links, 0);
++	}
++
++	set_bit(link_id, &ahsta->kickout_links);
++	seen = READ_ONCE(ahsta->kickout_links);
++
++	if ((seen & need) != need) {
++		ath12k_dbg(ab, ATH12K_DBG_WMI,
++			   "MLD %pM link %u kickout, kicked links 0x%lx of 0x%lx: not reporting low ack\n",
++			   sta->addr, link_id, seen, need);
++		return false;
++	}
++
++	WRITE_ONCE(ahsta->kickout_links, 0);
++	return true;
++}
++
+ static void ath12k_peer_sta_kickout_event(struct ath12k_base *ab, struct sk_buff *skb)
+ {
+ 	struct wmi_peer_sta_kickout_arg arg = {};
+@@ -7795,6 +7834,10 @@ static void ath12k_peer_sta_kickout_event(struct ath12k_base *ab, struct sk_buff
+ 		}
+ 		fallthrough;
+ 	default:
++		if (!ath12k_wmi_mlo_kickout_all_links(ab, sta, ahsta,
++						      arsta->link_id))
++			break;
++
+ 		ieee80211_report_low_ack(sta, 10);
+ 	}
+ 

@@ -1,0 +1,139 @@
+From: CoolFreeze23 <34906576+CoolFreeze23@users.noreply.github.com>
+Date: Tue, 20 Oct 2026 12:00:00 +0900
+Subject: [PATCH] wifi: ath12k: hold REO queues until firmware unmaps the peer
+
+On targets without a REO queue LUT (IPQ5332), queue addresses are given
+to firmware with WMI_PEER_REORDER_QUEUE_SETUP and are never withdrawn:
+WMI_PEER_REORDER_QUEUE_REMOVE has no caller, and the tid delete keeps
+the queue valid (VLD=1). Only the firmware peer delete stops REO from
+using a queue. The host, however, tears the queues down in
+ath12k_dp_peer_cleanup() before the WMI peer delete is even sent, and
+frees the descriptors after ATH12K_DP_RX_REO_DESC_FREE_TIMEOUT_MS (1 s)
+or at once above the 64-entry threshold, without waiting for the
+delete to be confirmed. When the delete times out (patch 324 continues
+teardown and quarantines the ML peer id), the zombie firmware peer keeps
+receiving and REO writes into freed kmalloc-2k memory.
+
+Record the link peer id of each queue being deleted. Mark the peer as
+held in ath12k_dp_peer_cleanup() while it is still mapped, and release
+the hold in the HTT peer unmap handler, which is firmware's
+confirmation. The cache-flush/free loop skips queues of held peers; a
+peer whose delete is never confirmed keeps its queues until the device
+is torn down (firmware restart), as 324 already does for its ML peer
+id. LUT targets are unchanged.
+---
+diff --git a/drivers/net/wireless/ath/ath12k/dp.c b/drivers/net/wireless/ath/ath12k/dp.c
+--- a/drivers/net/wireless/ath/ath12k/dp.c
++++ b/drivers/net/wireless/ath/ath12k/dp.c
+@@ -39,6 +39,12 @@ void ath12k_dp_peer_cleanup(struct ath12k *ar, int vdev_id, const u8 *addr)
+ 		return;
+ 	}
+ 
++	/* The peer is still mapped (found under dp_lock), so its HTT unmap,
++	 * which releases the hold, is still to come.
++	 */
++	if (!ab->hw_params->reoq_lut_support && peer->peer_id <= DP_MAX_PEER_ID)
++		set_bit(peer->peer_id, dp->reoq_hold_peer_ids);
++
+ 	ath12k_dp_rx_peer_tid_cleanup(ar, peer);
+ 	peer->dp_peer->dp_setup_done = false;
+ 	spin_unlock_bh(&dp->dp_lock);
+@@ -1516,6 +1522,7 @@ static int ath12k_dp_setup(struct ath12k_base *ab)
+ 	mutex_init(&dp->link_peer_rhash_tbl_lock);
+ 
+ 	dp->reo_cmd_cache_flush_count = 0;
++	bitmap_zero(dp->reoq_hold_peer_ids, DP_MAX_PEER_ID + 1);
+ 	dp->idle_link_rbm =
+ 			ath12k_hal_get_idle_link_rbm(&ab->hal, ab->device_id);
+ 
+diff --git a/drivers/net/wireless/ath/ath12k/dp.h b/drivers/net/wireless/ath/ath12k/dp.h
+--- a/drivers/net/wireless/ath/ath12k/dp.h
++++ b/drivers/net/wireless/ath/ath12k/dp.h
+@@ -479,6 +479,13 @@ struct ath12k_dp {
+ 	struct list_head reo_cmd_update_rx_queue_list;
+ 	struct list_head reo_cmd_cache_flush_list;
+ 	u32 reo_cmd_cache_flush_count;
++	/* Non-LUT targets (IPQ5332) hand REO queue addresses to firmware with
++	 * WMI_PEER_REORDER_QUEUE_SETUP and never withdraw them; only the
++	 * firmware peer delete does. Bit set: the link peer's queues were torn
++	 * down on the host but firmware has not unmapped the peer yet, so
++	 * its descriptors must not be freed. Atomic bitops.
++	 */
++	DECLARE_BITMAP(reoq_hold_peer_ids, DP_MAX_PEER_ID + 1);
+ 	/* protects access to below fields,
+ 	 * - reo_cmd_update_rx_queue_list
+ 	 * - reo_cmd_cache_flush_list
+diff --git a/drivers/net/wireless/ath/ath12k/dp_peer.c b/drivers/net/wireless/ath/ath12k/dp_peer.c
+--- a/drivers/net/wireless/ath/ath12k/dp_peer.c
++++ b/drivers/net/wireless/ath/ath12k/dp_peer.c
+@@ -148,6 +148,10 @@ void ath12k_dp_link_peer_unmap_event(struct ath12k_base *ab, u16 peer_id)
+ 	ath12k_dbg(ab, ATH12K_DBG_DP_HTT, "htt peer unmap vdev %d peer %pM id %d\n",
+ 		   peer->vdev_id, peer->addr, peer_id);
+ 
++	/* firmware no longer references this peer's REO queues */
++	if (peer_id <= DP_MAX_PEER_ID)
++		clear_bit(peer_id, dp->reoq_hold_peer_ids);
++
+ 	ath12k_dp_link_peer_free(peer);
+ 	wake_up(&ab->peer_mapping_wq);
+ 
+diff --git a/drivers/net/wireless/ath/ath12k/dp_rx.c b/drivers/net/wireless/ath/ath12k/dp_rx.c
+--- a/drivers/net/wireless/ath/ath12k/dp_rx.c
++++ b/drivers/net/wireless/ath/ath12k/dp_rx.c
+@@ -356,6 +356,7 @@ void ath12k_dp_init_rx_tid_rxq(struct ath12k_dp_rx_tid_rxq *rx_tid_rxq,
+ {
+ 	rx_tid_rxq->tid = rx_tid->tid;
+ 	rx_tid_rxq->active = active;
++	rx_tid_rxq->peer_id = ATH12K_DP_REOQ_NO_PEER;
+ 	rx_tid_rxq->qbuf = rx_tid->qbuf;
+ }
+ EXPORT_SYMBOL(ath12k_dp_init_rx_tid_rxq);
+@@ -401,6 +402,8 @@ void ath12k_dp_rx_reo_cmd_list_cleanup(struct ath12k_base *ab)
+ 		kfree(cmd);
+ 	}
+ 	spin_unlock_bh(&dp->reo_cmd_lock);
++
++	bitmap_zero(dp->reoq_hold_peer_ids, DP_MAX_PEER_ID + 1);
+ }
+ 
+ void ath12k_dp_reo_cmd_free(struct ath12k_dp *dp, void *ctx,
+@@ -490,6 +493,14 @@ void ath12k_dp_rx_tid_del_func(struct ath12k_dp *dp, void *ctx,
+ 	/* Flush and invalidate aged REO desc from HW cache */
+ 	list_for_each_entry_safe(elem, tmp, &dp->reo_cmd_cache_flush_list,
+ 				 list) {
++		/* Firmware may still use this queue (peer delete not yet
++		 * confirmed, or timed out): keep it until the peer is unmapped
++		 * or the device is torn down.
++		 */
++		if (elem->data.peer_id <= DP_MAX_PEER_ID &&
++		    test_bit(elem->data.peer_id, dp->reoq_hold_peer_ids))
++			continue;
++
+ 		if (dp->reo_cmd_cache_flush_count > ATH12K_DP_RX_REO_DESC_FREE_THRES ||
+ 		    time_after(jiffies, elem->ts +
+ 			       msecs_to_jiffies(ATH12K_DP_RX_REO_DESC_FREE_TIMEOUT_MS))) {
+@@ -590,6 +601,7 @@ static int ath12k_dp_prepare_reo_update_elem(struct ath12k_dp *dp,
+ 
+ 	ath12k_dp_init_rx_tid_rxq(&elem->rx_tid, rx_tid,
+ 				  (peer->rx_tid_active_bitmask & (1 << rx_tid->tid)));
++	elem->rx_tid.peer_id = peer->peer_id;
+ 
+ 	spin_lock_bh(&dp->reo_rxq_flush_lock);
+ 	list_add_tail(&elem->list, &dp->reo_cmd_update_rx_queue_list);
+diff --git a/drivers/net/wireless/ath/ath12k/dp_rx.h b/drivers/net/wireless/ath/ath12k/dp_rx.h
+--- a/drivers/net/wireless/ath/ath12k/dp_rx.h
++++ b/drivers/net/wireless/ath/ath12k/dp_rx.h
+@@ -38,9 +38,13 @@ struct ath12k_dp_rx_tid {
+ struct ath12k_dp_rx_tid_rxq {
+ 	u8 tid;
+ 	bool active;
++	/* link peer id owning the queue, ATH12K_DP_REOQ_NO_PEER if unknown */
++	u16 peer_id;
+ 	struct ath12k_reoq_buf qbuf;
+ };
+ 
++#define ATH12K_DP_REOQ_NO_PEER	U16_MAX
++
+ struct ath12k_dp_rx_reo_cache_flush_elem {
+ 	struct list_head list;
+ 	struct ath12k_dp_rx_tid_rxq data;

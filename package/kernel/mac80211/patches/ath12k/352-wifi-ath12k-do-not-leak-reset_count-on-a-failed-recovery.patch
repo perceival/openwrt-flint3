@@ -1,0 +1,56 @@
+From: CoolFreeze23 <34906576+CoolFreeze23@users.noreply.github.com>
+Date: Tue, 20 Oct 2026 12:00:00 +0900
+Subject: [PATCH] wifi: ath12k: do not leak reset_count on a failed recovery
+
+A reset work that finds another reset in progress waits 20 s for it to
+complete; when the wait times out it proceeds without dropping the
+count of the reset it waited for, and a later success drops the count
+only once. After any recovery that needed a retry, reset_count stays at
+1, so every later crash first waits 20 s for a completion that never
+comes and starts with fail_cont_count already raised.
+
+Drop the failed reset's count when the wait times out. If that reset
+completes after all (a round longer than 20 s), its success must not
+take the count below 0, so the success paths use
+atomic_dec_if_positive().
+---
+diff --git a/drivers/net/wireless/ath/ath12k/core.c b/drivers/net/wireless/ath/ath12k/core.c
+--- a/drivers/net/wireless/ath/ath12k/core.c
++++ b/drivers/net/wireless/ath/ath12k/core.c
+@@ -1686,7 +1686,7 @@ static void ath12k_core_restart(struct w
+ 
+ 	if (ab->is_reset) {
+ 		if (!test_bit(ATH12K_FLAG_REGISTERED, &ab->dev_flags)) {
+-			atomic_dec(&ab->reset_count);
++			atomic_dec_if_positive(&ab->reset_count);
+ 			ab->is_reset = false;
+ 			atomic_set(&ab->fail_cont_count, 0);
+ 			clear_bit(ATH12K_FLAG_RECOVERY, &ab->dev_flags);
+@@ -1931,6 +1931,14 @@ static void ath12k_core_reset(struct wor
+ 		ab->reset_fail_timeout = jiffies + ATH12K_RESET_FAIL_TIMEOUT_HZ;
+ 		/* Record the continuous recovery fail count when recovery failed*/
+ 		fail_cont_count = atomic_inc_return(&ab->fail_cont_count);
++
++		/*
++		 * The reset waited for failed and will never complete; stop
++		 * counting it. This run is now the only reset in progress, and
++		 * a later success drops reset_count back to 0. Otherwise every
++		 * later crash would first wait 20 s here for nothing.
++		 */
++		atomic_dec(&ab->reset_count);
+ 	}
+ 
+ 	ath12k_dbg(ab, ATH12K_DBG_BOOT, "reset starting\n");
+diff --git a/drivers/net/wireless/ath/ath12k/mac.c b/drivers/net/wireless/ath/ath12k/mac.c
+--- a/drivers/net/wireless/ath/ath12k/mac.c
++++ b/drivers/net/wireless/ath/ath12k/mac.c
+@@ -13825,7 +13825,8 @@ ath12k_mac_op_reconfig_complete(struct i
+ 			 * the recovery has to be done for each radio
+ 			 */
+ 			if (recovery_count == ab->num_radios) {
+-				atomic_dec(&ab->reset_count);
++				/* not below 0: see ath12k_core_reset() */
++				atomic_dec_if_positive(&ab->reset_count);
+ 				ab->is_reset = false;
+ 				atomic_set(&ab->fail_cont_count, 0);
+ 				clear_bit(ATH12K_FLAG_RECOVERY, &ab->dev_flags);

@@ -30,10 +30,10 @@ Signed-off-by: JiaY-shi <shi05275@163.com>
 +	__le32 max_num_simultaneous_links;
 +	__le32 nstr_indication_bitmap;
 +	__le32 recommended_max_num_simultaneous_links;
-+	struct {
-+		__le32 ml_reconfig: 1,
-+		       unused: 31;
-+	};
++	/* Bit 0: ML reconfiguration, the rest is reserved. Not a bitfield: its
++	 * layout would depend on the byte order of the host.
++	 */
++	__le32 ml_reconfig_info;
  } __packed;
  
  struct wmi_peer_assoc_complete_cmd {
