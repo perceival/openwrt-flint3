@@ -34,7 +34,7 @@ Signed-off-by: Kamil Bienkiewicz <perceivalpercy@gmail.com>
 ---
 --- a/drivers/net/ethernet/qualcomm/ppe/ppe_offload.c
 +++ b/drivers/net/ethernet/qualcomm/ppe/ppe_offload.c
-@@ -231,12 +231,12 @@
+@@ -231,12 +231,12 @@ static int ppe_offload_apply_l4_mangle(s
  	return 0;
  }
  
@@ -51,7 +51,7 @@ Signed-off-by: Kamil Bienkiewicz <perceivalpercy@gmail.com>
  
  /* Resolve the device a flow's packets arrive on down to the EDMA port
   * whose ingress L3 interface hardware will match against, mirroring
-@@ -361,6 +361,21 @@
+@@ -361,6 +361,21 @@ static int ppe_offload_flow_replace(stru
  	 * zones, WAN/LAN split) the kernel applies in software. The
  	 * vendor driver qualifies every flow the same way.
  	 */
@@ -73,7 +73,7 @@ Signed-off-by: Kamil Bienkiewicz <perceivalpercy@gmail.com>
  	if (!flow_rule_match_key(rule, FLOW_DISSECTOR_KEY_META))
  		return ppe_offload_decline("no ingress interface in rule");
  
-@@ -588,8 +603,7 @@
+@@ -588,8 +603,7 @@ static int ppe_offload_flow_replace(stru
  	 * our hardware entry.
  	 */
  	if (priv->flow_owner[flow_index]) {
@@ -83,7 +83,7 @@ Signed-off-by: Kamil Bienkiewicz <perceivalpercy@gmail.com>
  		priv->flow_owner[flow_index]->flow_valid = false;
  	}
  
-@@ -617,9 +631,9 @@
+@@ -617,9 +631,9 @@ static int ppe_offload_flow_replace(stru
  
  	mutex_unlock(&priv->lock);
  
@@ -96,7 +96,7 @@ Signed-off-by: Kamil Bienkiewicz <perceivalpercy@gmail.com>
  
  	return 0;
  
-@@ -688,8 +702,11 @@
+@@ -688,8 +702,11 @@ static int ppe_offload_flow_destroy(stru
  static int ppe_offload_flow_cmd(struct net_device *netdev, struct ppe_offload_priv *priv,
  				 struct flow_cls_offload *cls)
  {
@@ -110,7 +110,7 @@ Signed-off-by: Kamil Bienkiewicz <perceivalpercy@gmail.com>
  
  	switch (cls->command) {
  	case FLOW_CLS_REPLACE:
-@@ -732,7 +749,7 @@
+@@ -732,7 +749,7 @@ static int ppe_offload_setup_tc_block(st
  {
  	struct flow_block_cb *block_cb;
  
@@ -119,7 +119,7 @@ Signed-off-by: Kamil Bienkiewicz <perceivalpercy@gmail.com>
  			     netdev_name(netdev), f->binder_type, f->command);
  
  	if (f->binder_type != FLOW_BLOCK_BINDER_TYPE_CLSACT_INGRESS)
-@@ -758,7 +775,7 @@
+@@ -758,7 +775,7 @@ static int ppe_offload_setup_tc_block(st
  		flow_block_cb_incref(block_cb);
  		flow_block_cb_add(block_cb, f);
  		list_add_tail(&block_cb->driver_list, &ppe_offload_block_cb_list);
@@ -128,7 +128,7 @@ Signed-off-by: Kamil Bienkiewicz <perceivalpercy@gmail.com>
  		return 0;
  	case FLOW_BLOCK_UNBIND:
  		block_cb = flow_block_cb_lookup(f->block, ppe_offload_setup_tc_block_cb,
-@@ -965,6 +982,25 @@
+@@ -965,6 +982,25 @@ int ppe_offload_init(struct ppe_device *
  	return 0;
  }
  
@@ -154,7 +154,7 @@ Signed-off-by: Kamil Bienkiewicz <perceivalpercy@gmail.com>
  /**
   * ppe_offload_destroy() - Tear down PPE hardware flow-offload state.
   * @ppe_dev: PPE device.
-@@ -978,7 +1014,12 @@
+@@ -978,7 +1014,12 @@ void ppe_offload_destroy(struct ppe_devi
  
  	flow_indr_dev_unregister(ppe_offload_indr_setup_tc_cb, priv,
  				  ppe_offload_indr_block_unbind);

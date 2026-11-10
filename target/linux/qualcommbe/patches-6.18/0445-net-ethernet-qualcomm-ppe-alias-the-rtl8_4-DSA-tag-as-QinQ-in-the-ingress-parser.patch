@@ -60,7 +60,7 @@ Signed-off-by: Kamil Bienkiewicz <perceivalpercy@gmail.com>
 ---
 --- a/drivers/net/ethernet/qualcomm/Kconfig
 +++ b/drivers/net/ethernet/qualcomm/Kconfig
-@@ -63,6 +63,7 @@
+@@ -63,6 +63,7 @@ config QCOM_EMAC
  config QCOM_PPE
  	tristate "Qualcomm Technologies, Inc. PPE Ethernet support"
  	depends on COMMON_CLK && HAS_IOMEM && OF
@@ -113,7 +113,7 @@ Signed-off-by: Kamil Bienkiewicz <perceivalpercy@gmail.com>
  #define PPE_TPR_PKT_CNT_TBL_INC			4
 --- a/drivers/net/ethernet/qualcomm/ppe/edma_port.h
 +++ b/drivers/net/ethernet/qualcomm/ppe/edma_port.h
-@@ -84,6 +84,8 @@
+@@ -84,6 +84,8 @@ struct edma_port_pcpu_stats {
   * @pcpu_stats: Per CPU netdev statistics
   * @txr_map: Tx ring per-core mapping
   * @flags: Feature flags
@@ -122,7 +122,7 @@ Signed-off-by: Kamil Bienkiewicz <perceivalpercy@gmail.com>
   * @l3_if_index: This port's L3 interface table index, used for both
   * the egress and the ingress entry (see ppe_l3_if.h). Set once at port
   * setup and kept in sync with the netdevice's own MAC address;
-@@ -98,6 +100,7 @@
+@@ -98,6 +100,7 @@ struct edma_port_priv {
  	struct edma_txdesc_ring *txr_map[EDMA_PORT_MAX_CORE];
  	unsigned long flags;
  	u16 l3_if_index;
@@ -155,7 +155,7 @@ Signed-off-by: Kamil Bienkiewicz <perceivalpercy@gmail.com>
  #include "ppe_l3_if.h"
  #include "ppe_offload.h"
  #include "ppe_regs.h"
-@@ -94,11 +98,308 @@
+@@ -94,11 +98,308 @@ static u16 __maybe_unused edma_port_sele
  	return cpu;
  }
  
@@ -464,7 +464,7 @@ Signed-off-by: Kamil Bienkiewicz <perceivalpercy@gmail.com>
  
  	if (!port_priv)
  		return -EINVAL;
-@@ -115,6 +413,13 @@
+@@ -115,6 +416,13 @@ static int edma_port_open(struct net_dev
  	ppe_port  = port_priv->ppe_port;
  	port_id = ppe_port->port_id;
  
@@ -478,7 +478,7 @@ Signed-off-by: Kamil Bienkiewicz <perceivalpercy@gmail.com>
  	if (ppe_port->phylink)
  		phylink_start(ppe_port->phylink);
  
-@@ -149,6 +454,8 @@
+@@ -149,6 +457,8 @@ static int edma_port_close(struct net_de
  	if (ppe_port->phylink)
  		phylink_stop(ppe_port->phylink);
  
@@ -487,7 +487,7 @@ Signed-off-by: Kamil Bienkiewicz <perceivalpercy@gmail.com>
  	return 0;
  }
  
-@@ -562,6 +869,7 @@
+@@ -562,6 +872,7 @@ void edma_port_destroy(struct ppe_port *
  	ppe_my_mac_entry_set(edma_ctx->ppe_dev, port_priv->l3_if_index - 1, NULL, false);
  	ppe_l3_if_eg_entry_set(edma_ctx->ppe_dev, port_priv->l3_if_index, &zero);
  
@@ -495,7 +495,7 @@ Signed-off-by: Kamil Bienkiewicz <perceivalpercy@gmail.com>
  	unregister_netdev(netdev);
  	edma_port_deconfigure(netdev);
  	edma_port_stats_free(netdev);
-@@ -666,6 +974,13 @@
+@@ -666,6 +977,13 @@ int edma_port_setup(struct ppe_port *por
  		goto register_netdev_fail;
  	}
  

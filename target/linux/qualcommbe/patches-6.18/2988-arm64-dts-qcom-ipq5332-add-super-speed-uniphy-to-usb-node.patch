@@ -19,11 +19,9 @@ Signed-off-by: George Moussalem <george.moussalem@outlook.com>
  arch/arm64/boot/dts/qcom/ipq5332.dtsi | 6 +++---
  1 file changed, 3 insertions(+), 3 deletions(-)
 
-diff --git a/arch/arm64/boot/dts/qcom/ipq5332.dtsi b/arch/arm64/boot/dts/qcom/ipq5332.dtsi
-index 382691a77d61..98180d626216 100644
 --- a/arch/arm64/boot/dts/qcom/ipq5332.dtsi
 +++ b/arch/arm64/boot/dts/qcom/ipq5332.dtsi
-@@ -539,10 +539,10 @@ usb: usb@8a00000 {
+@@ -751,10 +751,10 @@
  					<&gcc MASTER_SNOC_USB &gcc SLAVE_SNOC_USB>;
  			interconnect-names = "usb-ddr", "apps-usb";
  
@@ -37,6 +35,3 @@ index 382691a77d61..98180d626216 100644
  
  			tx-fifo-resize;
  			snps,is-utmi-l1-suspend;
-
--- 
-2.53.0

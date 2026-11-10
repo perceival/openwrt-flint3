@@ -29,7 +29,7 @@ Signed-off-by: Kamil Bienkiewicz <perceivalpercy@gmail.com>
 ---
 --- a/drivers/net/ethernet/qualcomm/ppe/ppe_flow.c
 +++ b/drivers/net/ethernet/qualcomm/ppe/ppe_flow.c
-@@ -72,8 +72,13 @@
+@@ -72,8 +72,13 @@ static int ppe_flow_tbl_op_wait(struct p
  	if (ret)
  		return ret;
  
@@ -54,7 +54,7 @@ Signed-off-by: Kamil Bienkiewicz <perceivalpercy@gmail.com>
  #include <linux/list.h>
  #include <linux/mutex.h>
  #include <linux/netdevice.h>
-@@ -310,6 +311,9 @@
+@@ -310,6 +311,9 @@ static const struct rhashtable_params pp
   * were programmed and read back at init, see ppe_offload_hdr_exception_init().
   * IPv6 flows are only offloaded when they were; IPv4 keeps its measured
   * behaviour either way.
@@ -64,7 +64,7 @@ Signed-off-by: Kamil Bienkiewicz <perceivalpercy@gmail.com>
   * @lock: Serializes the whole replace/destroy sequence -- looking up
   * @flow_table, allocating from the pools, and programming hardware --
   * against concurrent calls for different flows, mirroring
-@@ -340,6 +344,7 @@
+@@ -340,6 +344,7 @@ struct ppe_offload_priv {
  	 * (ppe_offload_ipv6_selftest()). Without that IPv6 is declined.
  	 */
  	bool ipv6_table_ok;
@@ -72,7 +72,7 @@ Signed-off-by: Kamil Bienkiewicz <perceivalpercy@gmail.com>
  	struct mutex lock;
  	DECLARE_HASHTABLE(dsa_fixed_ht, 9);
  	spinlock_t dsa_fixed_lock; /* see @dsa_fixed_ht */
-@@ -852,6 +857,35 @@
+@@ -852,6 +857,35 @@ static void ppe_offload_flow_disown(stru
  			priv->flow_owner[entry->flow_index + i] = NULL;
  }
  
@@ -108,7 +108,7 @@ Signed-off-by: Kamil Bienkiewicz <perceivalpercy@gmail.com>
  static u64 ppe_offload_counter_delta(u64 now, u64 prev, u64 mask);
  static void ppe_offload_flow_forget(struct ppe_offload_priv *priv,
  				    struct ppe_offload_flow_entry *entry);
-@@ -932,6 +966,7 @@
+@@ -932,6 +966,7 @@ static int ppe_offload_flow_replace(stru
  	bool src_via_ingress = false;
  	bool ingress_dsa = false;
  	bool ip6_mangled = false;
@@ -116,7 +116,7 @@ Signed-off-by: Kamil Bienkiewicz <perceivalpercy@gmail.com>
  	bool pub_ip = false;
  	bool ipv6 = false;
  	unsigned int vlan_pops = 0;
-@@ -1570,6 +1605,10 @@
+@@ -1570,6 +1605,10 @@ static int ppe_offload_flow_replace(stru
  	ret = ppe_flow_entry_add(priv->ppe_dev, PPE_FLOW_OP_MODE_HASH, flow_words, flow_num_words,
  				 &flow_index);
  	if (ret) {
@@ -127,7 +127,7 @@ Signed-off-by: Kamil Bienkiewicz <perceivalpercy@gmail.com>
  		stage = "flow";
  		goto deref_host;
  	}
-@@ -1671,9 +1710,10 @@
+@@ -1671,9 +1710,10 @@ unlock:
  	 * direction of a connection whose one direction was declined, or
  	 * a flow hardware stopped matching. mtk_ppe_offload returns the
  	 * same -EEXIST for this; only a genuine programming failure is

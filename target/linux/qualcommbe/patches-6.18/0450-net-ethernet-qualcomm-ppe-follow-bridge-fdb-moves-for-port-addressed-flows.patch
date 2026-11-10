@@ -99,7 +99,7 @@ Signed-off-by: Kamil Bienkiewicz <perceivalpercy@gmail.com>
  
  #include "edma_port.h"
  #include "ppe.h"
-@@ -199,6 +207,27 @@
+@@ -199,6 +207,27 @@ struct ppe_offload_flow_entry {
  	bool flow_valid;
  	/* Only an SNAT flow holds a public IP table entry. */
  	bool pub_ip_valid;
@@ -127,7 +127,7 @@ Signed-off-by: Kamil Bienkiewicz <perceivalpercy@gmail.com>
  	/* Hardware counters are cumulative and not clear-on-read, so keep the
  	 * previous reading and report the difference. lastused is refreshed only
  	 * when the packet count actually moves, which is what tells the flowtable
-@@ -240,6 +269,17 @@
+@@ -240,6 +269,17 @@ static const struct rhashtable_params pp
   * @flow_table, allocating from the pools, and programming hardware --
   * against concurrent calls for different flows, mirroring
   * mtk_ppe_offload.c's single mtk_flow_offload_mutex.
@@ -145,7 +145,7 @@ Signed-off-by: Kamil Bienkiewicz <perceivalpercy@gmail.com>
   */
  struct ppe_offload_priv {
  	struct ppe_device *ppe_dev;
-@@ -250,6 +290,11 @@
+@@ -250,6 +290,11 @@ struct ppe_offload_priv {
  	struct ppe_offload_flow_entry **flow_owner;
  	bool tcp_exceptions_ok;
  	struct mutex lock;
@@ -157,7 +157,7 @@ Signed-off-by: Kamil Bienkiewicz <perceivalpercy@gmail.com>
  };
  
  static LIST_HEAD(ppe_offload_block_cb_list);
-@@ -387,6 +432,9 @@
+@@ -387,6 +432,9 @@ static bool ppe_offload_rule_has_vlan_ke
   * @ctag: Insert a C-VLAN tag with @cvid on egress.
   * @cvid: TCI of that tag.
   * @dsa_index: Switch port index when the egress is a DSA user port.
@@ -167,7 +167,7 @@ Signed-off-by: Kamil Bienkiewicz <perceivalpercy@gmail.com>
   * @dsa: Whether the egress is a DSA user port at all.
   * @dsa_fixed: Whether the tag inserts name that port outright (rather than
   * leaving the choice to the switch's own FDB), see ppe_offload_dsa_egress().
-@@ -398,6 +446,9 @@
+@@ -398,6 +446,9 @@ struct ppe_offload_egress {
  	bool ctag;
  	u16 cvid;
  	unsigned int dsa_index;
@@ -177,7 +177,7 @@ Signed-off-by: Kamil Bienkiewicz <perceivalpercy@gmail.com>
  	bool dsa;
  	bool dsa_fixed;
  };
-@@ -519,6 +570,7 @@
+@@ -519,6 +570,7 @@ static int ppe_offload_dsa_egress(struct
  		bridge = NULL;
  	if (bridge) {
  		vlan_aware = br_vlan_enabled(bridge);
@@ -185,7 +185,7 @@ Signed-off-by: Kamil Bienkiewicz <perceivalpercy@gmail.com>
  		/* Read once: this is the DSA bookkeeping the residual race
  		 * in the function comment is about.
  		 */
-@@ -571,6 +623,8 @@
+@@ -571,6 +623,8 @@ static int ppe_offload_dsa_egress(struct
  	egress->dev = conduit;
  	egress->dsa = true;
  	egress->dsa_index = dp->index;
@@ -194,7 +194,7 @@ Signed-off-by: Kamil Bienkiewicz <perceivalpercy@gmail.com>
  
  	return 0;
  }
-@@ -1199,6 +1253,22 @@
+@@ -1199,6 +1253,22 @@ static int ppe_offload_flow_replace(stru
  	entry->lastused = jiffies;
  	priv->flow_owner[flow_index] = entry;
  
@@ -217,7 +217,7 @@ Signed-off-by: Kamil Bienkiewicz <perceivalpercy@gmail.com>
  	mutex_unlock(&priv->lock);
  
  	pr_debug("ppe_offload: accepted %s flow_index=%u host_index=%u nexthop_index=%u src=%pI4->%pI4 dst=%pI4->%pI4 odev=%s egress=%s\n",
-@@ -1262,6 +1332,11 @@
+@@ -1262,6 +1332,11 @@ static int ppe_offload_flow_destroy(stru
  	}
  
  	rhashtable_remove_fast(&priv->flow_table, &entry->node, ppe_offload_flow_ht_params);
@@ -229,7 +229,7 @@ Signed-off-by: Kamil Bienkiewicz <perceivalpercy@gmail.com>
  
  	/* Clear flow_owner[] by pointer identity, unconditionally on
  	 * flow_valid: if this entry's own add later failed after already
-@@ -1293,6 +1368,359 @@
+@@ -1293,6 +1368,359 @@ static int ppe_offload_flow_destroy(stru
  	return 0;
  }
  
@@ -589,7 +589,7 @@ Signed-off-by: Kamil Bienkiewicz <perceivalpercy@gmail.com>
  /* Difference between two readings of a counter that is @mask wide.
   *
   * The counters are narrower than u64 (32-bit packets, 40-bit bytes) and wrap,
-@@ -1870,8 +2298,18 @@
+@@ -1870,8 +2298,18 @@ int ppe_offload_init(struct ppe_device *
  	if (ret)
  		return ret;
  
@@ -608,7 +608,7 @@ Signed-off-by: Kamil Bienkiewicz <perceivalpercy@gmail.com>
  		rhashtable_destroy(&priv->flow_table);
  		return ret;
  	}
-@@ -1914,6 +2352,8 @@
+@@ -1914,6 +2352,8 @@ static void ppe_offload_flow_free_fn(voi
  	struct ppe_offload_flow_entry *entry = ptr;
  	struct ppe_offload_priv *priv = arg;
  
@@ -617,7 +617,7 @@ Signed-off-by: Kamil Bienkiewicz <perceivalpercy@gmail.com>
  	if (priv->flow_owner[entry->flow_index] == entry)
  		priv->flow_owner[entry->flow_index] = NULL;
  	if (entry->flow_valid)
-@@ -1938,6 +2378,8 @@
+@@ -1938,6 +2378,8 @@ void ppe_offload_destroy(struct ppe_devi
  
  	flow_indr_dev_unregister(ppe_offload_indr_setup_tc_cb, priv,
  				  ppe_offload_indr_block_unbind);
@@ -628,7 +628,7 @@ Signed-off-by: Kamil Bienkiewicz <perceivalpercy@gmail.com>
  	 * forwarding for them -- and the pools torn down just below would then
 --- a/drivers/net/ethernet/qualcomm/ppe/ppe_flow.c
 +++ b/drivers/net/ethernet/qualcomm/ppe/ppe_flow.c
-@@ -221,6 +221,17 @@
+@@ -221,6 +221,17 @@ int ppe_flow_entry_add(struct ppe_device
  	 * occupant's lifetime totals to this flow on its first stats poll.
  	 */
  	ret = ppe_flow_counter_clear(ppe_dev, *index);

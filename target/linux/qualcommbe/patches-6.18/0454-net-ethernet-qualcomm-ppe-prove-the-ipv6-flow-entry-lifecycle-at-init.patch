@@ -41,7 +41,7 @@ Signed-off-by: Kamil Bienkiewicz <perceivalpercy@gmail.com>
  #define PPE_FLOW_TBL_HOST_ADDR_INDEX_TYPE	BIT(2)
 --- a/drivers/net/ethernet/qualcomm/ppe/ppe_offload.c
 +++ b/drivers/net/ethernet/qualcomm/ppe/ppe_offload.c
-@@ -335,6 +335,11 @@
+@@ -335,6 +335,11 @@ struct ppe_offload_priv {
  	struct ppe_offload_flow_entry **flow_owner;
  	bool tcp_exceptions_ok;
  	bool hdr_exceptions_ok;
@@ -53,7 +53,7 @@ Signed-off-by: Kamil Bienkiewicz <perceivalpercy@gmail.com>
  	struct mutex lock;
  	DECLARE_HASHTABLE(dsa_fixed_ht, 9);
  	spinlock_t dsa_fixed_lock; /* see @dsa_fixed_ht */
-@@ -1031,6 +1036,8 @@
+@@ -1031,6 +1036,8 @@ static int ppe_offload_flow_replace(stru
  
  		if (ipv6 && !priv->hdr_exceptions_ok)
  			return ppe_offload_decline("ipv6 offload disabled: no header exceptions");
@@ -62,7 +62,7 @@ Signed-off-by: Kamil Bienkiewicz <perceivalpercy@gmail.com>
  
  		flow_rule_match_ports(rule, &ports);
  		match_sport = ports.key->src;
-@@ -2727,6 +2734,86 @@
+@@ -2727,6 +2734,86 @@ static const u8 ppe_offload_hdr_exceptio
  	PPE_L3_EXCEPTION_IPV6_OTHER_EXT_HDR_CROSS_BORDER,
  };
  
@@ -149,7 +149,7 @@ Signed-off-by: Kamil Bienkiewicz <perceivalpercy@gmail.com>
  /**
   * ppe_offload_hdr_exception_init() - Program the fragment / extension-header exceptions.
   * @ppe_dev: PPE device.
-@@ -2840,6 +2927,7 @@
+@@ -2840,6 +2927,7 @@ void ppe_offload_hw_init(struct ppe_devi
  
  	priv->tcp_exceptions_ok = ppe_offload_tcp_exception_init(ppe_dev);
  	priv->hdr_exceptions_ok = ppe_offload_hdr_exception_init(ppe_dev);

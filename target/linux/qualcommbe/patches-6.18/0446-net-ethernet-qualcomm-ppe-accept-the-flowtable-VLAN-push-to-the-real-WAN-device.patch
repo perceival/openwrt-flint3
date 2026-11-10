@@ -66,7 +66,7 @@ Signed-off-by: Kamil Bienkiewicz <perceivalpercy@gmail.com>
   *   second/S-tag push, or any other VLAN proto than 802.1Q, is
   *   declined -- untested, and this hardware's nexthop entry only has
   *   a single C-VLAN + single S-VLAN insert field to begin with. Bridge
-@@ -548,6 +553,16 @@
+@@ -548,6 +553,16 @@ static int ppe_offload_flow_replace(stru
  			if (act->vlan.proto != htons(ETH_P_8021Q))
  				return ppe_offload_decline("vlan push proto=0x%04x unsupported",
  							    ntohs(act->vlan.proto));
@@ -83,7 +83,7 @@ Signed-off-by: Kamil Bienkiewicz <perceivalpercy@gmail.com>
  			vlan_push_seen = true;
  			vlan_push_vid = act->vlan.vid;
  			break;
-@@ -565,32 +580,57 @@
+@@ -565,32 +580,57 @@ static int ppe_offload_flow_replace(stru
  	 * vendor stack does with the transmit interface's MTU.
  	 */
  	pmtu = READ_ONCE(odev->mtu);
@@ -150,7 +150,7 @@ Signed-off-by: Kamil Bienkiewicz <perceivalpercy@gmail.com>
  	/* SNAT only: source changed, destination didn't. Declines the
  	 * DNAT/reply direction and anything that changes both or
  	 * neither -- see the file comment.
-@@ -611,6 +651,15 @@
+@@ -611,6 +651,15 @@ static int ppe_offload_flow_replace(stru
  
  	port_priv = netdev_priv(odev);
  

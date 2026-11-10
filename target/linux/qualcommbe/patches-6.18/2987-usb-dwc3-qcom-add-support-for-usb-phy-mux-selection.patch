@@ -32,8 +32,6 @@ enabling clocks.
  drivers/usb/dwc3/dwc3-qcom.c | 43 +++++++++++++++++++++++++++++++++++++++++++
  1 file changed, 43 insertions(+)
 
-diff --git a/drivers/usb/dwc3/dwc3-qcom.c b/drivers/usb/dwc3/dwc3-qcom.c
-index ac68b4218b56..8b7ab082b6a9 100644
 --- a/drivers/usb/dwc3/dwc3-qcom.c
 +++ b/drivers/usb/dwc3/dwc3-qcom.c
 @@ -12,9 +12,11 @@
@@ -67,7 +65,7 @@ index ac68b4218b56..8b7ab082b6a9 100644
  };
  
  #define to_dwc3_qcom(d) container_of((d), struct dwc3_qcom, dwc)
-@@ -558,6 +565,15 @@ static int dwc3_qcom_setup_irq(struct dwc3_qcom *qcom, struct platform_device *p
+@@ -558,6 +565,15 @@ static int dwc3_qcom_setup_irq(struct dw
  	return 0;
  }
  
@@ -83,7 +81,7 @@ index ac68b4218b56..8b7ab082b6a9 100644
  static void dwc3_qcom_set_role_notifier(struct dwc3 *dwc, enum usb_role next_role)
  {
  	struct dwc3_qcom *qcom = to_dwc3_qcom(dwc);
-@@ -624,6 +640,20 @@ static int dwc3_qcom_probe(struct platform_device *pdev)
+@@ -624,6 +640,20 @@ static int dwc3_qcom_probe(struct platfo
  
  	qcom->dev = &pdev->dev;
  
@@ -104,7 +102,7 @@ index ac68b4218b56..8b7ab082b6a9 100644
  	qcom->resets = devm_reset_control_array_get_optional_exclusive(dev);
  	if (IS_ERR(qcom->resets)) {
  		return dev_err_probe(&pdev->dev, PTR_ERR(qcom->resets),
-@@ -635,6 +665,18 @@ static int dwc3_qcom_probe(struct platform_device *pdev)
+@@ -635,6 +665,18 @@ static int dwc3_qcom_probe(struct platfo
  		return dev_err_probe(dev, ret, "failed to get clocks\n");
  	qcom->num_clocks = ret;
  
@@ -123,7 +121,7 @@ index ac68b4218b56..8b7ab082b6a9 100644
  	ret = reset_control_assert(qcom->resets);
  	if (ret) {
  		dev_err(&pdev->dev, "failed to assert resets, err=%d\n", ret);
-@@ -741,6 +783,7 @@ static void dwc3_qcom_remove(struct platform_device *pdev)
+@@ -740,6 +782,7 @@ static void dwc3_qcom_remove(struct plat
  	dwc3_core_remove(&qcom->dwc);
  	clk_bulk_disable_unprepare(qcom->num_clocks, qcom->clks);
  	dwc3_qcom_interconnect_exit(qcom);
@@ -131,6 +129,3 @@ index ac68b4218b56..8b7ab082b6a9 100644
  
  	pm_runtime_put_noidle(qcom->dev);
  }
-
--- 
-2.53.0

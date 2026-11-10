@@ -22,7 +22,7 @@ Signed-off-by: Francois Guerraz <kubrick@fgv6.net>
 ---
 --- a/drivers/net/ethernet/qualcomm/ppe/ppe_config.c
 +++ b/drivers/net/ethernet/qualcomm/ppe/ppe_config.c
-@@ -230,6 +230,40 @@
+@@ -230,6 +230,40 @@ static const struct ppe_bm_port_config i
  	},
  };
  
@@ -63,7 +63,7 @@ Signed-off-by: Francois Guerraz <kubrick@fgv6.net>
  /* QM fetches the packet from PPE buffer management for transmitting the
   * packet out. The QM group configuration limits the total number of buffers
   * enqueued by all PPE hardware queues.
-@@ -264,6 +298,35 @@
+@@ -264,6 +298,35 @@ static const struct ppe_qm_queue_config
  	},
  };
  
@@ -99,7 +99,7 @@ Signed-off-by: Francois Guerraz <kubrick@fgv6.net>
  /* PPE scheduler configuration for BM includes multiple entries. Each entry
   * indicates the primary port to be assigned the buffers for the ingress or
   * to release the buffers for the egress. Backup port ID will be used when
-@@ -1603,16 +1666,25 @@
+@@ -1603,16 +1666,25 @@ static int ppe_config_bm(struct ppe_devi
  {
  	const struct ppe_bm_port_config *port_cfg;
  	unsigned int i, bm_port_id, port_cfg_cnt;
@@ -128,7 +128,7 @@ Signed-off-by: Francois Guerraz <kubrick@fgv6.net>
  	ret = regmap_update_bits(ppe_dev->regmap, reg,
  				 PPE_BM_SHARED_GROUP_CFG_SHARED_LIMIT,
  				 val);
-@@ -1620,8 +1692,6 @@
+@@ -1620,8 +1692,6 @@ static int ppe_config_bm(struct ppe_devi
  		goto bm_config_fail;
  
  	/* Configure buffer thresholds for the BM ports. */
@@ -137,7 +137,7 @@ Signed-off-by: Francois Guerraz <kubrick@fgv6.net>
  	for (i = 0; i < port_cfg_cnt; i++) {
  		for (bm_port_id = port_cfg[i].port_id_start;
  		     bm_port_id <= port_cfg[i].port_id_end; bm_port_id++) {
-@@ -1649,6 +1719,17 @@
+@@ -1649,6 +1719,17 @@ static int ppe_config_qm(struct ppe_devi
  	u32 reg, multicast_queue_cfg[5];
  	u32 unicast_queue_cfg[4];
  	u32 group_cfg[3];
@@ -155,7 +155,7 @@ Signed-off-by: Francois Guerraz <kubrick@fgv6.net>
  
  	/* Assign the buffer number to the group 0 by default. */
  	reg = PPE_AC_GRP_CFG_TBL_ADDR;
-@@ -1657,15 +1738,13 @@
+@@ -1657,15 +1738,13 @@ static int ppe_config_qm(struct ppe_devi
  	if (ret)
  		goto qm_config_fail;
  

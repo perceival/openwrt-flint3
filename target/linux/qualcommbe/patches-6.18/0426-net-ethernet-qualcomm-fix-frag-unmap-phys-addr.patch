@@ -48,7 +48,7 @@ Signed-off-by: Kamil Bienkiewicz <perceivalpercy@gmail.com>
 ---
 --- a/drivers/net/ethernet/qualcomm/ppe/edma_tx.c
 +++ b/drivers/net/ethernet/qualcomm/ppe/edma_tx.c
-@@ -195,8 +195,18 @@
+@@ -195,8 +195,18 @@ u32 edma_tx_complete(u32 work_to_do, str
  				} else {
  					skb_frag_t *frag = &skb_shinfo(skb)->frags[frag_index];
  
@@ -69,7 +69,7 @@ Signed-off-by: Kamil Bienkiewicz <perceivalpercy@gmail.com>
  				}
  			}
  
-@@ -342,7 +352,7 @@
+@@ -342,7 +352,7 @@ static void edma_tx_dma_unmap_frags(stru
  		if (unlikely(buf_len == 0))
  			continue;
  
@@ -78,7 +78,7 @@ Signed-off-by: Kamil Bienkiewicz <perceivalpercy@gmail.com>
  			       DMA_TO_DEVICE);
  	}
  }
-@@ -531,8 +541,8 @@
+@@ -531,8 +541,8 @@ static void edma_tx_handle_dma_err(struc
  			if (unlikely(skb_frag_size(frag) == 0))
  				continue;
  

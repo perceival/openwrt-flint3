@@ -16,11 +16,9 @@ Signed-off-by: George Moussalem <george.moussalem@outlook.com>
  arch/arm64/boot/dts/qcom/ipq5332.dtsi       | 51 +++++++++++++----------------
  2 files changed, 24 insertions(+), 33 deletions(-)
 
-diff --git a/arch/arm64/boot/dts/qcom/ipq5332-rdp468.dts b/arch/arm64/boot/dts/qcom/ipq5332-rdp468.dts
-index c224ffc65b08..25a70cd884c0 100644
 --- a/arch/arm64/boot/dts/qcom/ipq5332-rdp468.dts
 +++ b/arch/arm64/boot/dts/qcom/ipq5332-rdp468.dts
-@@ -90,11 +90,9 @@ spi_0_cs_pins: spi-0-cs-state {
+@@ -90,11 +90,9 @@
  };
  
  &usb {
@@ -34,11 +32,9 @@ index c224ffc65b08..25a70cd884c0 100644
  };
  
  &usbphy0 {
-diff --git a/arch/arm64/boot/dts/qcom/ipq5332.dtsi b/arch/arm64/boot/dts/qcom/ipq5332.dtsi
-index 348f1e0906a9..1dd1fe76272b 100644
 --- a/arch/arm64/boot/dts/qcom/ipq5332.dtsi
 +++ b/arch/arm64/boot/dts/qcom/ipq5332.dtsi
-@@ -509,16 +509,9 @@ qpic_nand: spi@79b0000 {
+@@ -721,16 +721,9 @@
  			status = "disabled";
  		};
  
@@ -58,7 +54,7 @@ index 348f1e0906a9..1dd1fe76272b 100644
  
  			clocks = <&gcc GCC_USB0_MASTER_CLK>,
  				 <&gcc GCC_USB0_SLEEP_CLK>,
-@@ -529,31 +522,31 @@ usb: usb@8af8800 {
+@@ -741,31 +734,31 @@
  
  			resets = <&gcc GCC_USB_BCR>;
  
@@ -109,6 +105,3 @@ index 348f1e0906a9..1dd1fe76272b 100644
  		};
  
  		intc: interrupt-controller@b000000 {
-
--- 
-2.53.0

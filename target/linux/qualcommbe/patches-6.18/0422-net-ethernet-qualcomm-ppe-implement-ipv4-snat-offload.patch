@@ -69,7 +69,7 @@ Signed-off-by: Kamil Bienkiewicz <perceivalpercy@gmail.com>
 ---
 --- a/drivers/net/ethernet/qualcomm/ppe/ppe.h
 +++ b/drivers/net/ethernet/qualcomm/ppe/ppe.h
-@@ -15,6 +15,7 @@
+@@ -17,6 +17,7 @@ struct regmap;
  struct dentry;
  
  struct ppe_ports;
@@ -77,7 +77,7 @@ Signed-off-by: Kamil Bienkiewicz <perceivalpercy@gmail.com>
  
  /**
   * struct ppe_device - PPE device private data.
-@@ -31,6 +32,9 @@
+@@ -33,6 +34,9 @@ struct ppe_ports;
   * command/data/result register triplet (see ppe_host.c) against
   * concurrent add/del calls. Independent of @flow_tbl_lock: the two
   * tables use entirely separate registers.
@@ -87,7 +87,7 @@ Signed-off-by: Kamil Bienkiewicz <perceivalpercy@gmail.com>
   * @num_icc_paths: Number of interconnect paths.
   * @icc_paths: Interconnect path array.
   *
-@@ -47,6 +51,7 @@
+@@ -49,6 +53,7 @@ struct ppe_device {
  	struct ppe_ports *ports;
  	struct mutex flow_tbl_lock;
  	struct mutex host_tbl_lock;
@@ -105,7 +105,7 @@ Signed-off-by: Kamil Bienkiewicz <perceivalpercy@gmail.com>
  #include "ppe_port.h"
  
  #define PPE_PORT_MAX		8
-@@ -235,21 +236,32 @@
+@@ -235,21 +236,32 @@ static int qcom_ppe_probe(struct platfor
  	mutex_init(&ppe_dev->flow_tbl_lock);
  	mutex_init(&ppe_dev->host_tbl_lock);
  
@@ -141,7 +141,7 @@ Signed-off-by: Kamil Bienkiewicz <perceivalpercy@gmail.com>
  		return dev_err_probe(dev, ret,
  				     "PPE Port MAC initialization failed\n");
  	}
-@@ -268,6 +280,7 @@
+@@ -268,6 +280,7 @@ static void qcom_ppe_remove(struct platf
  	ppe_port_mac_deinit(ppe_dev);
  	ppe_debugfs_teardown(ppe_dev);
  	edma_destroy(ppe_dev);
@@ -151,7 +151,7 @@ Signed-off-by: Kamil Bienkiewicz <perceivalpercy@gmail.com>
  static const struct of_device_id qcom_ppe_of_match[] = {
 --- a/drivers/net/ethernet/qualcomm/ppe/edma_port.h
 +++ b/drivers/net/ethernet/qualcomm/ppe/edma_port.h
-@@ -99,4 +99,5 @@
+@@ -99,4 +99,5 @@ struct edma_port_priv {
  
  void edma_port_destroy(struct ppe_port *port);
  int edma_port_setup(struct ppe_port *port);
@@ -159,7 +159,7 @@ Signed-off-by: Kamil Bienkiewicz <perceivalpercy@gmail.com>
  #endif
 --- a/drivers/net/ethernet/qualcomm/ppe/edma_port.c
 +++ b/drivers/net/ethernet/qualcomm/ppe/edma_port.c
-@@ -365,6 +365,24 @@
+@@ -365,6 +365,24 @@ static const struct net_device_ops edma_
  };
  
  /**
@@ -681,7 +681,7 @@ Signed-off-by: Kamil Bienkiewicz <perceivalpercy@gmail.com>
  		return -EOPNOTSUPP;
  	default:
  		return -EOPNOTSUPP;
-@@ -54,13 +468,20 @@
+@@ -54,13 +468,20 @@ static int ppe_offload_setup_tc_block_cb
  					  void *cb_priv)
  {
  	struct net_device *netdev = cb_priv;
@@ -703,7 +703,7 @@ Signed-off-by: Kamil Bienkiewicz <perceivalpercy@gmail.com>
  	default:
  		return -EOPNOTSUPP;
  	}
-@@ -126,3 +547,51 @@
+@@ -126,3 +547,51 @@ int ppe_offload_setup_tc(struct net_devi
  		return -EOPNOTSUPP;
  	}
  }

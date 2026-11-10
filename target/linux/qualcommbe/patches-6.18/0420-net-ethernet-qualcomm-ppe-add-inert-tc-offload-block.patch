@@ -59,7 +59,7 @@ Signed-off-by: Kamil Bienkiewicz <perceivalpercy@gmail.com>
  #include "ppe_regs.h"
  
  /* Number of netdev queues. */
-@@ -360,6 +361,7 @@
+@@ -360,6 +361,7 @@ static const struct net_device_ops edma_
  	.ndo_eth_ioctl = edma_port_ioctl,
  	.ndo_features_check = edma_port_feature_check,
  	.ndo_select_queue = edma_port_select_queue,

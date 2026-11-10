@@ -24,11 +24,9 @@ enabling clocks.
  Documentation/devicetree/bindings/usb/qcom,snps-dwc3.yaml | 12 ++++++++++++
  1 file changed, 12 insertions(+)
 
-diff --git a/Documentation/devicetree/bindings/usb/qcom,snps-dwc3.yaml b/Documentation/devicetree/bindings/usb/qcom,snps-dwc3.yaml
-index e87cdf41f5f2..9a08a4b8f89f 100644
 --- a/Documentation/devicetree/bindings/usb/qcom,snps-dwc3.yaml
 +++ b/Documentation/devicetree/bindings/usb/qcom,snps-dwc3.yaml
-@@ -148,6 +148,16 @@ properties:
+@@ -140,6 +140,16 @@ properties:
      minItems: 3
      maxItems: 19
  
@@ -45,7 +43,7 @@ index e87cdf41f5f2..9a08a4b8f89f 100644
    qcom,select-utmi-as-pipe-clk:
      description:
        If present, disable USB3 pipe_clk requirement.
-@@ -534,6 +544,8 @@ allOf:
+@@ -468,6 +478,8 @@ allOf:
              - const: pwr_event
              - const: dp_hs_phy_irq
              - const: dm_hs_phy_irq
@@ -54,6 +52,3 @@ index e87cdf41f5f2..9a08a4b8f89f 100644
  
    - if:
        properties:
-
--- 
-2.53.0

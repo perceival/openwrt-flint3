@@ -16,9 +16,6 @@ Signed-off-by: George Moussalem <george.moussalem@outlook.com>
  .../phy/qcom,ipq5332-uniphy-usb-ss-phy.yaml        | 97 ++++++++++++++++++++++
  1 file changed, 97 insertions(+)
 
-diff --git a/Documentation/devicetree/bindings/phy/qcom,ipq5332-uniphy-usb-ss-phy.yaml b/Documentation/devicetree/bindings/phy/qcom,ipq5332-uniphy-usb-ss-phy.yaml
-new file mode 100644
-index 000000000000..a26b880dc2d3
 --- /dev/null
 +++ b/Documentation/devicetree/bindings/phy/qcom,ipq5332-uniphy-usb-ss-phy.yaml
 @@ -0,0 +1,97 @@
@@ -119,6 +116,3 @@ index 000000000000..a26b880dc2d3
 +
 +        vdd-supply = <&regulator_fixed_5p0>;
 +    };
-
--- 
-2.53.0

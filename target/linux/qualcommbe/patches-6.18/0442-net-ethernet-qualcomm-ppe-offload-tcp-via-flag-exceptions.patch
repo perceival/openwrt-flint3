@@ -92,7 +92,7 @@ Signed-off-by: Kamil Bienkiewicz <perceivalpercy@gmail.com>
 ---
 --- a/drivers/net/ethernet/qualcomm/ppe/ppe.c
 +++ b/drivers/net/ethernet/qualcomm/ppe/ppe.c
-@@ -252,6 +252,11 @@
+@@ -252,6 +252,11 @@ static int qcom_ppe_probe(struct platfor
  		return dev_err_probe(dev, ret, "PPE HW config failed\n");
  	}
  
@@ -192,7 +192,7 @@ Signed-off-by: Kamil Bienkiewicz <perceivalpercy@gmail.com>
  #endif
 --- a/drivers/net/ethernet/qualcomm/ppe/ppe_offload.h
 +++ b/drivers/net/ethernet/qualcomm/ppe/ppe_offload.h
-@@ -12,6 +12,7 @@
+@@ -12,6 +12,7 @@ struct net_device;
  enum tc_setup_type;
  
  int ppe_offload_init(struct ppe_device *ppe_dev);
@@ -247,7 +247,7 @@ Signed-off-by: Kamil Bienkiewicz <perceivalpercy@gmail.com>
  #include <net/dsa.h>
  #include <linux/rhashtable.h>
  #include <linux/slab.h>
-@@ -152,6 +183,11 @@
+@@ -152,6 +183,11 @@ static const struct rhashtable_params pp
   * and ppe_offload_flow_replace()/_destroy() for how it's used to stop
   * a superseded entry's later destroy from deleting a different, live
   * flow's hardware entry.
@@ -259,7 +259,7 @@ Signed-off-by: Kamil Bienkiewicz <perceivalpercy@gmail.com>
   * @lock: Serializes the whole replace/destroy sequence -- looking up
   * @flow_table, allocating from the pools, and programming hardware --
   * against concurrent calls for different flows, mirroring
-@@ -164,6 +200,7 @@
+@@ -164,6 +200,7 @@ struct ppe_offload_priv {
  	struct ppe_pub_ip_pool pub_ip_pool;
  	struct rhashtable flow_table;
  	struct ppe_offload_flow_entry **flow_owner;
@@ -267,7 +267,7 @@ Signed-off-by: Kamil Bienkiewicz <perceivalpercy@gmail.com>
  	struct mutex lock;
  };
  
-@@ -239,12 +276,27 @@
+@@ -239,12 +276,27 @@ static int ppe_offload_apply_l4_mangle(s
  	return 0;
  }
  
@@ -299,7 +299,7 @@ Signed-off-by: Kamil Bienkiewicz <perceivalpercy@gmail.com>
  
  /* Resolve the device a flow's packets arrive on down to the EDMA port
   * whose ingress L3 interface hardware will match against, mirroring
-@@ -341,6 +393,15 @@
+@@ -341,6 +393,15 @@ static int ppe_offload_flow_replace(stru
  		flow_rule_match_basic(rule, &basic);
  		switch (basic.key->ip_proto) {
  		case IPPROTO_TCP:
@@ -315,7 +315,7 @@ Signed-off-by: Kamil Bienkiewicz <perceivalpercy@gmail.com>
  			ip_proto = PPE_FLOW_PROTO_TCP;
  			break;
  		case IPPROTO_UDP:
-@@ -371,17 +432,39 @@
+@@ -371,17 +432,39 @@ static int ppe_offload_flow_replace(stru
  	 */
  	/* nf_flow_rule_match() builds TCP flows with tcp.flags = 0 masked to
  	 * RST|FIN, precisely so that a teardown is NOT accelerated and conntrack
@@ -360,7 +360,7 @@ Signed-off-by: Kamil Bienkiewicz <perceivalpercy@gmail.com>
  	}
  
  	if (!flow_rule_match_key(rule, FLOW_DISSECTOR_KEY_META))
-@@ -1018,6 +1101,244 @@
+@@ -1018,6 +1101,244 @@ static int ppe_offload_indr_setup_tc_cb(
  	}
  }
  
@@ -605,7 +605,7 @@ Signed-off-by: Kamil Bienkiewicz <perceivalpercy@gmail.com>
  /**
   * ppe_offload_init() - Initialize PPE hardware flow-offload state.
   * @ppe_dev: PPE device.
-@@ -1059,6 +1380,30 @@
+@@ -1059,6 +1380,30 @@ int ppe_offload_init(struct ppe_device *
  	return 0;
  }
  
@@ -638,7 +638,7 @@ Signed-off-by: Kamil Bienkiewicz <perceivalpercy@gmail.com>
   * is already unregistered.
 --- a/drivers/net/ethernet/qualcomm/ppe/ppe_flow_ipv4.h
 +++ b/drivers/net/ethernet/qualcomm/ppe/ppe_flow_ipv4.h
-@@ -60,8 +60,12 @@
+@@ -60,8 +60,12 @@ enum ppe_flow_fwd_type {
   * traffic egresses through after SNAT rewrite.
   * @nat_l4_port: L4 port to rewrite matched packets to -- source for
   * SNAT, destination for DNAT.
