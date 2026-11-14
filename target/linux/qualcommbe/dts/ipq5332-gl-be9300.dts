@@ -471,7 +471,6 @@
 			phy-mode = "10gbase-r";
 			label = "lan";
 			pcs-handle = <&pcs0_ch0>;
-			phy-handle = <&rtl837x>;
 			nvmem-cells = <&base_macaddr 2>;
 			nvmem-cell-names = "mac-address";
 			clocks = <&nsscc NSS_CC_PORT1_MAC_CLK>,

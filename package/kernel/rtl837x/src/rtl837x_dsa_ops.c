@@ -7,9 +7,11 @@
 #include <linux/etherdevice.h>
 #include <linux/if_bridge.h>
 #include <linux/if_ether.h>
+#include <linux/if_vlan.h>
 #include <linux/kernel.h>
 #include <linux/phylink.h>
 #include <linux/phy.h>
+#include <linux/slab.h>
 #include <linux/string.h>
 #include <linux/dsa/8021q.h>
 #include <net/dsa.h>
@@ -20,6 +22,64 @@
 #include "./rtk-api/l2.h"
 #include "./rtk-api/mirror.h"
 #include "./rtk-api/dal/rtl8373/dal_rtl8373_stp.h"
+#include "./rtk-api/dal/rtl8373/dal_rtl8373_port.h"
+
+/* Base VLAN of standalone and VLAN-unaware ports under rtl8_4, see
+ * rtl837x_base_vlan_join().
+ */
+#define RTL837X_BASE_VID		1
+
+/* Filtering databases under rtl8_4 (RTL8373: FID 0..15, RTL8373_FIDMAX).
+ * FID 0 is what the VLAN table entries use (VLAN-aware bridges); every
+ * VLAN-unaware bridge gets its own FID through the port-based FID, and all
+ * standalone ports share one more, which never holds a learned entry
+ * (learning is off on standalone ports).
+ */
+#define RTL837X_FID_VLAN		0
+#define RTL837X_FID_STANDALONE		1
+#define RTL837X_FID_BRIDGE(num)		(RTL837X_FID_STANDALONE + (num))
+
+/* Behaviour that rests on undocumented RTL8373 register semantics stays
+ * off by default -- the 8ea847fe90 behaviour -- until a bench run has
+ * confirmed it. Enable per feature from /etc/modules.d, e.g.
+ * "rtl837x_dsa vlan_passthrough=1 per_bridge_fid=1". Read-only at runtime,
+ * so the hardware state never changes under a running configuration.
+ *
+ * Nothing at setup clears what these modes program, and the GL-BE9300 has no
+ * switch reset line. Unloading the module undoes it, see
+ * rtl837x_clear_opt_in_state(); a reboot does not run that and may not clear
+ * it. To turn a mode off, unload the module while it is still loaded with the
+ * mode on, or power-cycle after the change.
+ */
+static bool vlan_passthrough;
+module_param(vlan_passthrough, bool, 0444);
+MODULE_PARM_DESC(vlan_passthrough,
+		 "rtl8_4: pass 802.1Q frames through VLAN-unaware ports (transparent VLAN, REAL_KEEP egress)");
+
+static bool per_bridge_fid;
+module_param(per_bridge_fid, bool, 0444);
+MODULE_PARM_DESC(per_bridge_fid,
+		 "rtl8_4: one filtering database per VLAN-unaware bridge (port-based FID, SVL base VLAN)");
+
+static bool jumbo;
+module_param(jumbo, bool, 0444);
+MODULE_PARM_DESC(jumbo,
+		 "Allow user-port MTUs above 1500 and program the per-port max frame length");
+
+static bool rebind_phy;
+module_param(rebind_phy, bool, 0444);
+MODULE_PARM_DESC(rebind_phy,
+		 "Bind internal PHYs to the private RTL837x PHY driver, moving them from any other PHY driver");
+
+static bool rtl837x_vlan_passthrough(struct rtk_gsw *gsw)
+{
+	return vlan_passthrough && gsw->tag_proto == DSA_TAG_PROTO_RTL8_4;
+}
+
+static bool rtl837x_per_bridge_fid(struct rtk_gsw *gsw)
+{
+	return per_bridge_fid && gsw->tag_proto == DSA_TAG_PROTO_RTL8_4;
+}
 
 static int rtl837x_to_errno(int ret)
 {
@@ -70,10 +130,19 @@ static int rtl837x_devlink_info_get(struct dsa_switch *ds,
 }
 
 static int rtl837x_mdio_setup(struct dsa_switch *ds);
+static int rtl837x_open_tx_max_len(struct rtk_gsw *gsw);
+static int rtl837x_save_boot_max_len(struct rtk_gsw *gsw);
+static int rtl837x_restore_boot_max_len(struct rtk_gsw *gsw, int port);
+static int rtl837x_port_change_mtu(struct dsa_switch *ds, int port,
+				   int new_mtu);
 static void rtl837x_mdio_teardown(struct dsa_switch *ds);
+static void rtl837x_host_fdb_flush(struct rtk_gsw *gsw);
 
 static DEFINE_MUTEX(rtl837x_phy_driver_lock);
 static unsigned int rtl837x_phy_driver_users;
+
+/* See rtl837x_common.h. */
+DEFINE_MUTEX(rtl837x_ind_lock);
 
 static bool rtl837x_valid_port(struct rtk_gsw *gsw, int port)
 {
@@ -361,25 +430,46 @@ static int rtl837x_set_mac_eee(struct dsa_switch *ds, int port,
 	return 0;
 }
 
-/* With tag_8021q, forwarding and isolation are governed entirely by VLAN
- * membership (standalone per-port VIDs isolate; shared bridge VIDs bridge).
- * Keep the hardware port-isolation matrix fully permissive so VLAN egress
- * filtering is the sole gate.
+/* Learning and lookup domain of a user port.
+ *
+ * Under rtl8_4 every VLAN-unaware port classifies into the same base VLAN,
+ * so with one shared database a MAC address learned in one bridge was
+ * looked up by every other bridge and by standalone ports: the same MAC in
+ * two bridges moved the entry back and forth, and a frame from a standalone
+ * port or another bridge to a MAC learned here was forwarded towards a port
+ * the isolation matrix then refused -- dropped instead of flooded to the
+ * CPU. The port-based FID (PORT_BASED_FID_EN 0x4E38 / PORT_BASED_FID
+ * 0x4E3C, dal_rtl8373_vlan_portFid_set(): "all input packets will be
+ * assigned to the port-based fid regardless vlan tag") gives each bridge,
+ * and the standalone ports, a database of their own. The base VLAN entry is
+ * SVL under rtl8_4 (rtl837x_write_vlan()) so that the lookup is keyed by
+ * that FID. VLAN-aware ports and tag_8021q (whose per-bridge VIDs already
+ * separate learning) keep the VLAN-based lookup.
  */
-static int rtl837x_open_isolation(struct rtk_gsw *gsw)
+static int rtl837x_port_fid_apply(struct rtk_gsw *gsw, int port,
+				  unsigned int bridge_num, bool vlan_filtering)
 {
-	int port, ret;
+	bool enable = rtl837x_per_bridge_fid(gsw) && !vlan_filtering;
+	rtk_fid_t fid = bridge_num ? RTL837X_FID_BRIDGE(bridge_num) :
+				     RTL837X_FID_STANDALONE;
 
-	for (port = 0; port < RTK_MAX_NUM_OF_PORT; port++) {
-		if (!rtl837x_valid_port(gsw, port))
-			continue;
+	BUILD_BUG_ON(RTL837X_FID_BRIDGE(DSA_TAG_8021Q_MAX_NUM_BRIDGES) >
+		     RTL8373_FIDMAX);
 
-		ret = rtk_port_isolation_set(port, gsw->valid_port_mask);
-		if (ret)
-			return rtl837x_to_errno(ret);
-	}
+	/* The parameter, not rtl837x_per_bridge_fid(): a tagger change has to
+	 * be able to turn the port-based FID off again. Without the parameter
+	 * nothing ever turned it on, so leave the registers alone, and do not
+	 * let a bridge join depend on a write it has no use for.
+	 */
+	if (!per_bridge_fid)
+		return 0;
 
-	return 0;
+	if (!rtl837x_user_port(gsw, port) ||
+	    bridge_num > DSA_TAG_8021Q_MAX_NUM_BRIDGES)
+		return -EINVAL;
+
+	return rtl837x_to_errno(rtk_vlan_portFid_set(port,
+		enable ? ENABLED : DISABLED, enable ? fid : RTL837X_FID_VLAN));
 }
 
 struct rtl837x_isolation_update {
@@ -398,17 +488,30 @@ rtl837x_bridge_dev_for_port(struct rtk_gsw *gsw, int port, int changed_port,
 	return gsw->bridge_dev[port];
 }
 
+/* Egress permit mask for @port, derived from bridge membership.
+ *
+ * Under the rtl8_4 tagger every standalone port and every VLAN-unaware
+ * bridge classifies into the same base VLAN 1, so this matrix is the only
+ * thing keeping standalone ports apart from each other and one bridge apart
+ * from another: a user port may reach the CPU, itself (hairpin is gated
+ * separately by localPktPermit) and the other members of its own bridge,
+ * minus the BR_ISOLATED pairs. Under tag_8021q the per-port and per-bridge
+ * VIDs already separate them and this is a second, redundant gate.
+ */
 static u32 rtl837x_isolation_mask_for_port(struct rtk_gsw *gsw, int port,
 					   u32 isolated_port_mask,
 					   int changed_port,
 					   struct net_device *changed_bridge_dev)
 {
 	struct net_device *bridge_dev;
-	u32 mask = gsw->valid_port_mask;
+	u32 mask;
 	int other;
 
-	if (!(isolated_port_mask & BIT(port)))
-		return mask;
+	/* The CPU port must be able to reach every port. */
+	if (!rtl837x_user_port(gsw, port))
+		return gsw->valid_port_mask;
+
+	mask = BIT(gsw->cpu_port) | BIT(port);
 
 	bridge_dev = rtl837x_bridge_dev_for_port(gsw, port, changed_port,
 						 changed_bridge_dev);
@@ -418,17 +521,21 @@ static u32 rtl837x_isolation_mask_for_port(struct rtk_gsw *gsw, int port,
 	for (other = 0; other < RTK_MAX_NUM_OF_PORT; other++) {
 		struct net_device *other_bridge_dev;
 
-		if (other == port || !rtl837x_valid_port(gsw, other))
-			continue;
-
-		if (!(isolated_port_mask & BIT(other)))
+		if (other == port || !rtl837x_user_port(gsw, other))
 			continue;
 
 		other_bridge_dev = rtl837x_bridge_dev_for_port(gsw, other,
 								changed_port,
 								changed_bridge_dev);
-		if (other_bridge_dev == bridge_dev)
-			mask &= ~BIT(other);
+		if (other_bridge_dev != bridge_dev)
+			continue;
+
+		/* BR_ISOLATED: two isolated ports of one bridge stay apart. */
+		if ((isolated_port_mask & BIT(port)) &&
+		    (isolated_port_mask & BIT(other)))
+			continue;
+
+		mask |= BIT(other);
 	}
 
 	return mask;
@@ -621,6 +728,22 @@ static int rtl837x_port_bridge_join(struct dsa_switch *ds, int port,
 		gsw->isolated_port_mask = isolated_port_mask;
 	}
 	mutex_unlock(&gsw->isolation_lock);
+
+	/* Learn and look up in the bridge's own database from now on. */
+	if (!ret) {
+		ret = rtl837x_port_fid_apply(gsw, port, bridge.num,
+					     br_vlan_enabled(bridge.dev));
+		if (ret) {
+			mutex_lock(&gsw->isolation_lock);
+			if (rtl837x_apply_isolation(gsw, gsw->isolated_port_mask,
+						    port, NULL))
+				dev_warn(gsw->dev,
+					 "failed to roll back isolation for port %d\n",
+					 port);
+			gsw->bridge_dev[port] = NULL;
+			mutex_unlock(&gsw->isolation_lock);
+		}
+	}
 	if (ret) {
 		/* The tag join may already have changed VLAN state.  The DSA core
 		 * does not own partial state from a failed driver callback, so
@@ -667,6 +790,15 @@ static void rtl837x_port_bridge_leave(struct dsa_switch *ds, int port,
 	}
 	mutex_unlock(&gsw->isolation_lock);
 
+	/* Back to the standalone database (DSA resets VLAN filtering for a
+	 * port leaving a VLAN-aware bridge, which lands here again).
+	 */
+	ret = rtl837x_port_fid_apply(gsw, port, 0,
+				     dsa_port_is_vlan_filtering(dsa_to_port(ds, port)));
+	if (ret)
+		dev_err(gsw->dev, "failed to reset FID for port %d: %d\n",
+			port, ret);
+
 	/* Do not carry hairpin state into the next bridge-port instance. */
 	ret = rtl837x_set_hairpin(gsw, port, false);
 	if (ret)
@@ -680,7 +812,7 @@ static void rtl837x_port_bridge_leave(struct dsa_switch *ds, int port,
 
 static int rtl837x_set_stp_state(struct rtk_gsw *gsw, int port, u8 state)
 {
-	u32 mstp_state;
+	u32 mstp_state, msti;
 	int ret;
 
 	if (!rtl837x_valid_port(gsw, port))
@@ -704,8 +836,24 @@ static int rtl837x_set_stp_state(struct rtk_gsw *gsw, int port, u8 state)
 		return -EINVAL;
 	}
 
-	ret = dal_rtl8373_asicMstpPortStatus_set(0, port, mstp_state);
-	return rtl837x_to_errno(ret);
+	/* The MSTP state table is indexed by FID (RTL8373_MSPT_STATE_ADDR(),
+	 * range-checked against RTL8373_FIDMAX), and VLAN-unaware ports look
+	 * up in their port-based FID. DSA has a single STP state per port.
+	 * Only per_bridge_fid puts ports in FIDs other than 0, so only then
+	 * program every instance; otherwise keep the original single write to
+	 * instance 0.
+	 */
+	for (msti = 0; msti <= (rtl837x_per_bridge_fid(gsw) ? RTL8373_MSTIMAX : 0);
+	     msti++) {
+		ret = dal_rtl8373_asicMstpPortStatus_set(msti, port, mstp_state);
+		if (ret) {
+			dev_dbg(gsw->dev, "MSTI %u: STP state %u on port %d: %d\n",
+				msti, state, port, ret);
+			return rtl837x_to_errno(ret);
+		}
+	}
+
+	return 0;
 }
 
 static int rtl837x_read_ethtool_stat(int port, rtk_stat_port_type_t counter,
@@ -714,7 +862,9 @@ static int rtl837x_read_ethtool_stat(int port, rtk_stat_port_type_t counter,
 	rtk_stat_counter_t counter_value = 0;
 	int ret;
 
+	mutex_lock(&rtl837x_ind_lock);
 	ret = rtk_stat_port_get(port, counter, &counter_value);
+	mutex_unlock(&rtl837x_ind_lock);
 	if (ret)
 		return rtl837x_to_errno(ret);
 
@@ -1202,6 +1352,66 @@ static void rtl837x_stats_stop(struct rtk_gsw *gsw)
  * port's bridge-VID membership dropped while vlan_filtering is on (the tagger
  * does not use that VID in VLAN-aware mode), which is a separate change.
  */
+/* VLAN "transparency" from @igr_port: VLAN_PORT_EGR_TRANS (0x4EB8, three
+ * egress ports per register, a 10-bit ingress port mask each, written by
+ * dal_rtl8373_vlan_portTransparent_set()) lists, per egress port, the
+ * ingress ports whose frames skip the egress VLAN membership check there.
+ * It is the RTL8373 counterpart of the RTL8365MB register the upstream
+ * rtl8365mb driver uses for VLAN-unaware ports (VLAN_EGRESS_TRANSPARENT,
+ * 0x09D0, same SDK function name and arguments).
+ */
+static int rtl837x_set_transparent(struct rtk_gsw *gsw, int igr_port,
+				   bool enable)
+{
+	int egr_port, ret;
+
+	for (egr_port = 0; egr_port < RTK_MAX_NUM_OF_PORT; egr_port++) {
+		rtk_portmask_t pmsk = { 0 };
+		u32 old;
+
+		if (!rtl837x_valid_port(gsw, egr_port))
+			continue;
+
+		ret = rtk_vlan_transparent_get(egr_port, &pmsk);
+		if (ret)
+			return rtl837x_to_errno(ret);
+
+		old = pmsk.bits[0];
+		if (enable)
+			pmsk.bits[0] |= BIT(igr_port);
+		else
+			pmsk.bits[0] &= ~BIT(igr_port);
+
+		if (pmsk.bits[0] == old)
+			continue;
+
+		ret = rtk_vlan_transparent_set(egr_port, &pmsk);
+		if (ret)
+			return rtl837x_to_errno(ret);
+	}
+
+	return 0;
+}
+
+/* Undo what vlan_passthrough sets on a port. The parameter, not
+ * rtl837x_vlan_passthrough(): a port has to return to this when the tagger
+ * changes. Without the parameter nothing ever set these registers.
+ */
+static int rtl837x_clear_passthrough(struct rtk_gsw *gsw, int port)
+{
+	int ret;
+
+	if (!vlan_passthrough)
+		return 0;
+
+	ret = rtl837x_set_transparent(gsw, port, false);
+	if (ret)
+		return ret;
+
+	return rtl837x_to_errno(rtk_vlan_tagMode_set(port,
+						     VLAN_EGRESS_TAG_MODE_ORIGINAL));
+}
+
 static int rtl837x_set_ingress_policy(struct rtk_gsw *gsw, int port,
 				      bool vlan_filtering)
 {
@@ -1213,6 +1423,11 @@ static int rtl837x_set_ingress_policy(struct rtk_gsw *gsw, int port,
 		if (ret)
 			return rtl837x_to_errno(ret);
 
+		/* VLAN-aware: egress follows the VLAN table again. */
+		ret = rtl837x_clear_passthrough(gsw, port);
+		if (ret)
+			return ret;
+
 		ret = rtk_vlan_portAcceptFrameType_set(port, ACCEPT_FRAME_TYPE_ALL);
 		if (ret)
 			return rtl837x_to_errno(ret);
@@ -1220,10 +1435,51 @@ static int rtl837x_set_ingress_policy(struct rtk_gsw *gsw, int port,
 		return 0;
 	}
 
-	/* Stop admitting tagged frames before membership checking goes away. */
+	if (rtl837x_vlan_passthrough(gsw)) {
+		/* A VLAN-unaware port must pass 802.1Q frames through as they
+		 * are -- an 8021q upper on a standalone port, a VLAN trunk
+		 * through a VLAN-unaware bridge -- which is what the upstream
+		 * rtl8365mb driver does for the same tag family: membership
+		 * checks off in both directions (transparent egress from this
+		 * port, ingress filtering off), every frame type admitted,
+		 * and egress in exactly the received format (REAL_KEEP: tag
+		 * presence, VID and priority untouched; the user-port egress
+		 * tag mode is otherwise ORIGINAL, which would strip VID 1
+		 * tags through the base VLAN's untag mask). Under rtl8_4 the
+		 * CPU tag carries the source port, so a tagged frame cannot
+		 * forge identity, and the isolation matrix still bounds where
+		 * it can go.
+		 */
+		ret = rtk_vlan_tagMode_set(port, VLAN_EGRESS_TAG_MODE_REAL_KEEP);
+		if (ret)
+			return rtl837x_to_errno(ret);
+
+		ret = rtl837x_set_transparent(gsw, port, true);
+		if (ret)
+			return ret;
+
+		ret = rtk_vlan_portAcceptFrameType_set(port, ACCEPT_FRAME_TYPE_ALL);
+		if (ret)
+			return rtl837x_to_errno(ret);
+
+		ret = rtk_vlan_portIgrFilterEnable_set(port, DISABLED);
+		if (ret)
+			return rtl837x_to_errno(ret);
+
+		return 0;
+	}
+
+	/* tag_8021q: the VID is the port identity, so admit untagged frames
+	 * only. rtl8_4 without vlan_passthrough keeps the same, proven policy.
+	 * Stop admitting tagged frames before membership checking goes away.
+	 */
 	ret = rtk_vlan_portAcceptFrameType_set(port, ACCEPT_FRAME_TYPE_UNTAG_ONLY);
 	if (ret)
 		return rtl837x_to_errno(ret);
+
+	ret = rtl837x_clear_passthrough(gsw, port);
+	if (ret)
+		return ret;
 
 	ret = rtk_vlan_portIgrFilterEnable_set(port, DISABLED);
 	if (ret)
@@ -1239,11 +1495,18 @@ static int rtl837x_write_vlan(struct rtk_gsw *gsw, u16 vid)
 
 	vlan.mbr.bits[0] = gsw->vlan_table[vid].mbr;
 	vlan.untag.bits[0] = gsw->vlan_table[vid].untag;
-	vlan.fid_msti = 0;
+	vlan.fid_msti = RTL837X_FID_VLAN;
 	vlan.svlan_chk_ivl_svl = 0;
-	vlan.ivl_svl = 1;
+	/* IVL (keyed by VID) everywhere except the rtl8_4 base VLAN, which is
+	 * SVL so that the port-based FID of a VLAN-unaware port is the
+	 * lookup key (rtl837x_port_fid_apply()).
+	 */
+	vlan.ivl_svl = !(vid == RTL837X_BASE_VID &&
+			 rtl837x_per_bridge_fid(gsw));
 
+	mutex_lock(&rtl837x_ind_lock);
 	ret = rtk_vlan_set(vid, &vlan);
+	mutex_unlock(&rtl837x_ind_lock);
 	return rtl837x_to_errno(ret);
 }
 
@@ -1257,6 +1520,7 @@ static int rtl837x_seed_vlan_table(struct rtk_gsw *gsw)
 	int port, ret;
 
 	memset(gsw->vlan_table, 0, sizeof(gsw->vlan_table));
+	gsw->base_vlan_only = rtl837x_user_ports(gsw);
 
 	gsw->vlan_table[1].valid = 1;
 	gsw->vlan_table[1].vid = 1;
@@ -1293,6 +1557,10 @@ static int rtl837x_seed_vlan_table(struct rtk_gsw *gsw)
 		 * priority-tagged (VID 0) frames, so 802.1p clients are
 		 * unaffected. The CPU port must keep accepting tagged frames:
 		 * that is how the tagger addresses a port.
+		 *
+		 * That is the tag_8021q policy. Under rtl8_4 the CPU tag
+		 * carries the port, and a VLAN-unaware port passes tagged
+		 * frames through instead; see rtl837x_set_ingress_policy().
 		 */
 		if (rtl837x_user_port(gsw, port)) {
 			ret = rtl837x_set_ingress_policy(gsw, port, false);
@@ -1311,6 +1579,98 @@ static int rtl837x_seed_vlan_table(struct rtk_gsw *gsw)
 	}
 
 	return 0;
+}
+
+/* Under rtl8_4, VID 1 is also the base VLAN every standalone or VLAN-unaware
+ * user port classifies into (rtl837x_commit_pvid_for_mode() falls back to
+ * it), so such a port -- and with it the CPU port -- has to stay a member
+ * whatever the bridge does with its own default VID 1. The bridge deletes
+ * that VID from every port it releases (nbp_vlan_flush() runs before DSA's
+ * bridge leave), which used to leave the port classifying into a VLAN it was
+ * no longer a member of; once the last port had left, the CPU port was
+ * dropped as well and standalone RX died before reaching the CPU. The port
+ * isolation matrix keeps the members apart. base_vlan_only records the ports
+ * that are members only because of this rule, so that a VLAN-aware bridge
+ * does not inherit the membership.
+ */
+static bool rtl837x_uses_base_vlan(struct rtk_gsw *gsw, int port)
+{
+	return gsw->tag_proto == DSA_TAG_PROTO_RTL8_4 &&
+	       rtl837x_user_port(gsw, port) &&
+	       !dsa_port_is_vlan_filtering(dsa_to_port(&gsw->ds, port));
+}
+
+/* Does any user port in VID 1 classify into it as the base VLAN? */
+static bool rtl837x_base_vlan_in_use(struct rtk_gsw *gsw)
+{
+	unsigned long mbr = gsw->vlan_table[RTL837X_BASE_VID].mbr &
+			    rtl837x_user_ports(gsw);
+	int port;
+
+	if (gsw->tag_proto != DSA_TAG_PROTO_RTL8_4)
+		return false;
+
+	for_each_set_bit(port, &mbr, RTK_MAX_NUM_OF_PORT)
+		if ((gsw->base_vlan_only & BIT(port)) ||
+		    rtl837x_uses_base_vlan(gsw, port))
+			return true;
+
+	return false;
+}
+
+static int rtl837x_base_vlan_join(struct rtk_gsw *gsw, int port)
+{
+	typeof(gsw->vlan_table[0]) old_vlan = gsw->vlan_table[RTL837X_BASE_VID];
+	u32 old_only = gsw->base_vlan_only;
+	int ret;
+
+	if (old_vlan.valid && (old_vlan.mbr & BIT(port)))
+		return 0;
+
+	gsw->vlan_table[RTL837X_BASE_VID].valid = 1;
+	gsw->vlan_table[RTL837X_BASE_VID].vid = RTL837X_BASE_VID;
+	gsw->vlan_table[RTL837X_BASE_VID].mbr |= BIT(port) | BIT(gsw->cpu_port);
+	gsw->vlan_table[RTL837X_BASE_VID].untag |= BIT(port);
+	gsw->base_vlan_only |= BIT(port);
+
+	ret = rtl837x_write_vlan(gsw, RTL837X_BASE_VID);
+	if (ret) {
+		gsw->vlan_table[RTL837X_BASE_VID] = old_vlan;
+		gsw->base_vlan_only = old_only;
+	}
+
+	return ret;
+}
+
+static int rtl837x_base_vlan_leave(struct rtk_gsw *gsw, int port)
+{
+	typeof(gsw->vlan_table[0]) old_vlan = gsw->vlan_table[RTL837X_BASE_VID];
+	u32 old_only = gsw->base_vlan_only;
+	int ret;
+
+	if (!(gsw->base_vlan_only & BIT(port)))
+		return 0;
+
+	gsw->base_vlan_only &= ~BIT(port);
+	if (!old_vlan.valid)
+		return 0;
+
+	gsw->vlan_table[RTL837X_BASE_VID].mbr &= ~BIT(port);
+	gsw->vlan_table[RTL837X_BASE_VID].untag &= ~BIT(port);
+	if (!rtl837x_vlan_has_user(gsw, RTL837X_BASE_VID)) {
+		gsw->vlan_table[RTL837X_BASE_VID].mbr &= ~BIT(gsw->cpu_port);
+		gsw->vlan_table[RTL837X_BASE_VID].untag &= ~BIT(gsw->cpu_port);
+	}
+	if (!gsw->vlan_table[RTL837X_BASE_VID].mbr)
+		gsw->vlan_table[RTL837X_BASE_VID].valid = 0;
+
+	ret = rtl837x_write_vlan(gsw, RTL837X_BASE_VID);
+	if (ret) {
+		gsw->vlan_table[RTL837X_BASE_VID] = old_vlan;
+		gsw->base_vlan_only = old_only;
+	}
+
+	return ret;
 }
 
 /* Turn the conduit's checksum offloads on or off.
@@ -1357,11 +1717,63 @@ static void rtl837x_conduit_csum_offload(struct dsa_switch *ds, bool enable)
 		 enable ? "enabled" : "disabled", netdev_name(conduit));
 }
 
+/* Bring what the opt-in modes program in line with gsw->tag_proto. Caller
+ * holds rtnl. With both modes off this does nothing, which leaves one thing
+ * tagger-dependent: going from tag_8021q to rtl8_4 reseeds the VLAN table
+ * (rtl837x_tag_protocol_unapply()), which resets the ingress policy of every
+ * user port, VLAN-aware ones included, and nothing restores it.
+ */
+static int rtl837x_tag_protocol_resync(struct dsa_switch *ds)
+{
+	struct rtk_gsw *gsw = ds->priv;
+	int port, ret;
+
+	if (!vlan_passthrough && !per_bridge_fid)
+		return 0;
+
+	if (vlan_passthrough) {
+		ret = rtl837x_set_transparent(gsw, gsw->cpu_port,
+					      rtl837x_vlan_passthrough(gsw));
+		if (ret)
+			return ret;
+	}
+
+	/* IVL/SVL of the base VLAN depends on the tagger. */
+	if (per_bridge_fid && gsw->vlan_table[RTL837X_BASE_VID].valid) {
+		ret = rtl837x_write_vlan(gsw, RTL837X_BASE_VID);
+		if (ret)
+			return ret;
+	}
+
+	for (port = 0; port < RTK_MAX_NUM_OF_PORT; port++) {
+		struct dsa_port *dp = dsa_to_port(ds, port);
+
+		if (!rtl837x_user_port(gsw, port))
+			continue;
+
+		if (vlan_passthrough) {
+			ret = rtl837x_set_ingress_policy(gsw, port,
+							 dsa_port_is_vlan_filtering(dp));
+			if (ret)
+				return ret;
+		}
+
+		ret = rtl837x_port_fid_apply(gsw, port,
+					     dsa_port_bridge_num_get(dp),
+					     dsa_port_is_vlan_filtering(dp));
+		if (ret)
+			return ret;
+	}
+
+	return 0;
+}
+
 /* Apply the chip-side configuration a tagger needs. Caller holds rtnl. */
 static int rtl837x_tag_protocol_apply(struct dsa_switch *ds,
 				       enum dsa_tag_protocol proto)
 {
 	struct rtk_gsw *gsw = ds->priv;
+	enum dsa_tag_protocol old = gsw->tag_proto;
 	int ret;
 
 	switch (proto) {
@@ -1387,8 +1799,13 @@ static int rtl837x_tag_protocol_apply(struct dsa_switch *ds,
 			return rtl837x_to_errno(ret);
 
 		ret = dsa_tag_8021q_register(ds, htons(ETH_P_8021Q));
-		if (ret)
+		if (ret) {
+			/* A failed register frees the context but leaves the
+			 * pointer to it.
+			 */
+			ds->tag_8021q_ctx = NULL;
 			return ret;
+		}
 
 		/* A standard 802.1Q tag is something the PPE parser handles,
 		 * so hardware checksumming is safe again.
@@ -1435,9 +1852,29 @@ static int rtl837x_tag_protocol_apply(struct dsa_switch *ds,
 		return -EPROTONOSUPPORT;
 	}
 
+	/* The resync reads tag_proto, so it has to be set first. */
 	gsw->tag_proto = proto;
 
-	return 0;
+	ret = rtl837x_tag_protocol_resync(ds);
+	if (ret && proto != old) {
+		/* DSA keeps the old tagger when a change fails, so tag_proto
+		 * has to keep naming it, and the caller applies that tagger
+		 * next. Remove tag_8021q's own VLANs and PVIDs, but do not
+		 * reseed the VLAN table as a regular unapply does: a
+		 * VLAN-aware bridge's VLANs and PVIDs are still valid for the
+		 * tagger being restored. When proto is the tagger already in
+		 * place (setup, or that restore itself), there is nothing
+		 * better to fall back to and it stays.
+		 */
+		if (proto == DSA_TAG_PROTO_VSC73XX_8021Q) {
+			gsw->tag_proto_changing = true;
+			dsa_tag_8021q_unregister(ds);
+			gsw->tag_proto_changing = false;
+		}
+		gsw->tag_proto = old;
+	}
+
+	return ret;
 }
 
 /* Undo whatever rtl837x_tag_protocol_apply() set up. Caller holds rtnl. */
@@ -1450,7 +1887,11 @@ static void rtl837x_tag_protocol_unapply(struct dsa_switch *ds,
 	if (proto == DSA_TAG_PROTO_VSC73XX_8021Q) {
 		int port;
 
-		dsa_tag_8021q_unregister(ds);
+		/* No context if restoring this tagger failed after a failed
+		 * change away from it.
+		 */
+		if (ds->tag_8021q_ctx)
+			dsa_tag_8021q_unregister(ds);
 
 		/* Unregistering drops tag_8021q's VLANs, but the ports are
 		 * still classifying by the PVIDs it installed. Forget that
@@ -1675,6 +2116,21 @@ static int rtl837x_setup(struct dsa_switch *ds)
 	if (ret)
 		return ret;
 
+	if (jumbo) {
+		ret = rtl837x_save_boot_max_len(gsw);
+		if (ret)
+			return ret;
+
+		ret = rtl837x_open_tx_max_len(gsw);
+		if (ret)
+			return ret;
+
+		/* DSA only programs the CPU port when the conduit MTU changes. */
+		ret = rtl837x_port_change_mtu(ds, gsw->cpu_port, ETH_DATA_LEN);
+		if (ret)
+			return ret;
+	}
+
 	ret = rtk_stat_global_reset();
 	if (ret)
 		return rtl837x_to_errno(ret);
@@ -1722,7 +2178,10 @@ static int rtl837x_setup(struct dsa_switch *ds)
 			return ret;
 	}
 
-	ret = rtl837x_open_isolation(gsw);
+	/* bridge_dev[] and isolated_port_mask were cleared above, so every
+	 * user port starts out reaching only the CPU port.
+	 */
+	ret = rtl837x_apply_isolation(gsw, 0, -1, NULL);
 	if (ret)
 		return ret;
 
@@ -1743,6 +2202,33 @@ static int rtl837x_setup(struct dsa_switch *ds)
 	return 0;
 }
 
+/* Undo what the opt-in modes programmed, so that the next load starts from the
+ * default state. The MSTP instances other than 0 and the TX frame limit stay:
+ * nothing uses those instances without per_bridge_fid, and the TX limit only
+ * ever gets opened.
+ */
+static void rtl837x_clear_opt_in_state(struct rtk_gsw *gsw)
+{
+	int port, ret;
+
+	for (port = 0; port < RTK_MAX_NUM_OF_PORT; port++) {
+		if (!rtl837x_valid_port(gsw, port))
+			continue;
+
+		ret = 0;
+		if (jumbo && gsw->boot_max_len_valid)
+			ret = rtl837x_restore_boot_max_len(gsw, port);
+		if (!ret && rtl837x_user_port(gsw, port))
+			ret = rtl837x_port_fid_apply(gsw, port, 0, true);
+		if (!ret && vlan_passthrough)
+			ret = rtl837x_set_transparent(gsw, port, false);
+		if (ret)
+			dev_err(gsw->dev,
+				"failed to clear opt-in state of port %d: %d\n",
+				port, ret);
+	}
+}
+
 static void rtl837x_teardown(struct dsa_switch *ds)
 {
 	struct rtk_gsw *gsw = ds->priv;
@@ -1760,6 +2246,8 @@ static void rtl837x_teardown(struct dsa_switch *ds)
 
 	rtl837x_mdio_teardown(ds);
 	rtl837x_mirror_clear_shadow(gsw);
+	rtl837x_host_fdb_flush(gsw);
+	rtl837x_clear_opt_in_state(gsw);
 	ret = rtk_cpuTag_enable_set(EXTERNAL_CPU, DISABLED);
 	if (ret)
 		dev_err(ds->dev, "failed to disable CPU tag during teardown: %d\n", ret);
@@ -1775,7 +2263,9 @@ static int rtl837x_mdio_read_c45(struct mii_bus *bus, int port, int devad,
 	if (!rtl837x_user_port(gsw, port))
 		return -EOPNOTSUPP;
 
+	mutex_lock(&rtl837x_ind_lock);
 	ret = rtk_port_phyReg_get(port, devad, regnum, &value);
+	mutex_unlock(&rtl837x_ind_lock);
 	/* MDIO bus probing treats negative reads as fatal bus errors. */
 	if (ret)
 		return 0xffff;
@@ -1792,7 +2282,9 @@ static int rtl837x_mdio_write_c45(struct mii_bus *bus, int port, int devad,
 	if (!rtl837x_user_port(gsw, port))
 		return -EOPNOTSUPP;
 
+	mutex_lock(&rtl837x_ind_lock);
 	ret = rtk_port_phyReg_set(BIT(port), devad, regnum, val);
+	mutex_unlock(&rtl837x_ind_lock);
 	return rtl837x_to_errno(ret);
 }
 
@@ -1891,6 +2383,11 @@ static struct phy_driver rtl837x_phy_driver = {
 	.match_phy_device = rtl837x_phy_match,
 	.probe = rtl837x_phy_probe,
 	.get_features = rtl837x_phy_get_features,
+	/* Without this phy_config_aneg() falls back to genphy_config_aneg()
+	 * -- Clause 22 accesses on a bus that has no C22 ops -- whenever the
+	 * PHY sets MDIO_DEVS_C22PRESENT in its devices-in-package word.
+	 */
+	.config_aneg = genphy_c45_config_aneg,
 	.read_status = rtl837x_phy_read_status,
 };
 
@@ -1921,6 +2418,77 @@ static void rtl837x_phy_driver_put(void)
 		phy_drivers_unregister(&rtl837x_phy_driver, 1);
 
 	mutex_unlock(&rtl837x_phy_driver_lock);
+}
+
+/* With rebind_phy, bind every PHY on the slave bus to rtl837x_phy_driver.
+ * Without it the bus scan's result stands.
+ *
+ * The bus scan in mdiobus_register() binds each PHY to the first registered
+ * driver that matches it, in driver registration order. The built-in
+ * REALTEK_PHY driver is registered long before this module, and its
+ * ID-matched entries (RTL8224, 0x001ccad0, and the other 2.5G Realtek IDs)
+ * can match the internal PHYs, so which driver ended up in charge depended
+ * on what the PHYs report as their ID rather than on this driver. Those
+ * drivers program the PHY through registers of a discrete chip, which on
+ * this bus are indirect accesses into the switch; the private driver
+ * reads link state from the switch MAC instead.
+ *
+ * device_driver_attach() binds a specific driver to a specific device; it is
+ * the same operation as writing the device to the driver's sysfs "bind"
+ * file. Done before DSA connects the user ports, so no phylink instance
+ * has seen the foreign driver yet.
+ */
+static int rtl837x_phy_bind_private(struct rtk_gsw *gsw, struct mii_bus *bus)
+{
+	struct device_driver *drv = &rtl837x_phy_driver.mdiodrv.driver;
+	int addr, ret;
+
+	for (addr = 0; addr < PHY_MAX_ADDR; addr++) {
+		struct phy_device *phydev = mdiobus_get_phy(bus, addr);
+		struct device *dev;
+
+		if (!phydev)
+			continue;
+
+		dev = &phydev->mdio.dev;
+		if (dev->driver == drv)
+			continue;
+
+		/* Without rebind_phy the outcome of the bus scan stands; a PHY
+		 * that stayed unbound gets phylib's generic driver at connect
+		 * time.
+		 */
+		if (!rebind_phy) {
+			if (dev->driver)
+				dev_info(gsw->dev,
+					 "port %d: PHY 0x%08x is bound to \"%s\" (rebind_phy=0: left as is)\n",
+					 addr, phydev->phy_id, dev->driver->name);
+			continue;
+		}
+
+		if (dev->driver) {
+			dev_info(gsw->dev,
+				 "port %d: PHY 0x%08x was bound to \"%s\", rebinding to \"%s\"\n",
+				 addr, phydev->phy_id, dev->driver->name, drv->name);
+			device_release_driver(dev);
+		}
+
+		ret = device_driver_attach(drv, dev);
+		if (ret) {
+			/* Never fail switch setup over this: let normal driver
+			 * matching pick a driver again (phylib falls back to the
+			 * generic C45 driver at connect time if none binds).
+			 */
+			dev_warn(gsw->dev,
+				 "port %d: failed to bind \"%s\": %d; using driver matching\n",
+				 addr, drv->name, ret);
+			if (device_attach(dev) < 0)
+				dev_warn(gsw->dev, "port %d: driver matching failed\n",
+					 addr);
+		}
+	}
+
+	return 0;
 }
 
 static int rtl837x_mdio_setup(struct dsa_switch *ds)
@@ -1962,6 +2530,15 @@ static int rtl837x_mdio_setup(struct dsa_switch *ds)
 	ret = mdiobus_register(bus);
 	if (ret) {
 		dev_err(gsw->dev, "failed to register slave MDIO bus: %d\n", ret);
+		mdiobus_free(bus);
+		ds->user_mii_bus = NULL;
+		rtl837x_phy_driver_put();
+		return ret;
+	}
+
+	ret = rtl837x_phy_bind_private(gsw, bus);
+	if (ret) {
+		mdiobus_unregister(bus);
 		mdiobus_free(bus);
 		ds->user_mii_bus = NULL;
 		rtl837x_phy_driver_put();
@@ -2266,25 +2843,66 @@ static void rtl837x_port_fast_age(struct dsa_switch *ds, int port)
 	cfg.flushStaticAddr = DISABLED;
 	cfg.flushAddrOnAllPorts = DISABLED;
 
+	mutex_lock(&rtl837x_ind_lock);
 	ret = rtk_l2_ucastAddr_flush(&cfg);
+	mutex_unlock(&rtl837x_ind_lock);
 	if (ret)
 		dev_err(gsw->dev, "failed to flush FDB for port %d: %d\n", port,
 			ret);
 }
 
-static int rtl837x_fdb_vid(u16 vid, struct dsa_db db, u16 *fdb_vid)
+/* LUT key {IVL: VID | SVL: FID} for an FDB entry the way the switch looks
+ * it up: under rtl8_4, VID 0 (VLAN-unaware) entries live in the bridge's or
+ * the standalone ports' port-based FID and VID 1 in the SVL base VLAN's
+ * FID; everything else, and everything under tag_8021q, is keyed by VID.
+ */
+static int rtl837x_fdb_key(struct rtk_gsw *gsw, u16 vid, struct dsa_db db,
+			   u32 *ivl, u16 *vid_fid)
 {
+	if (gsw->tag_proto == DSA_TAG_PROTO_RTL8_4 &&
+	    !rtl837x_per_bridge_fid(gsw)) {
+		/* One IVL base VLAN for every VLAN-unaware port. */
+		if (!vid && db.type != DSA_DB_PORT && db.type != DSA_DB_BRIDGE)
+			return -EOPNOTSUPP;
+		*ivl = 1;
+		*vid_fid = vid ? vid : RTL837X_BASE_VID;
+		return 0;
+	}
+
+	if (gsw->tag_proto == DSA_TAG_PROTO_RTL8_4) {
+		if (vid == RTL837X_BASE_VID) {
+			*ivl = 0;
+			*vid_fid = RTL837X_FID_VLAN;
+			return 0;
+		}
+
+		if (!vid) {
+			*ivl = 0;
+			switch (db.type) {
+			case DSA_DB_PORT:
+				*vid_fid = RTL837X_FID_STANDALONE;
+				return 0;
+			case DSA_DB_BRIDGE:
+				*vid_fid = RTL837X_FID_BRIDGE(db.bridge.num);
+				return 0;
+			default:
+				return -EOPNOTSUPP;
+			}
+		}
+	}
+
+	*ivl = 1;
 	if (vid) {
-		*fdb_vid = vid;
+		*vid_fid = vid;
 		return 0;
 	}
 
 	switch (db.type) {
 	case DSA_DB_PORT:
-		*fdb_vid = dsa_tag_8021q_standalone_vid(db.dp);
+		*vid_fid = dsa_tag_8021q_standalone_vid(db.dp);
 		return 0;
 	case DSA_DB_BRIDGE:
-		*fdb_vid = dsa_tag_8021q_bridge_vid(db.bridge.num);
+		*vid_fid = dsa_tag_8021q_bridge_vid(db.bridge.num);
 		return 0;
 	default:
 		return -EOPNOTSUPP;
@@ -2300,14 +2918,22 @@ static int rtl837x_port_vlan_fast_age(struct dsa_switch *ds, int port, u16 vid)
 	if (!rtl837x_user_port(gsw, port) || !vid || vid > RTK_VID_MAX)
 		return -EINVAL;
 
-	cfg.flushByVid = ENABLED;
-	cfg.vid = vid;
+	if (vid == RTL837X_BASE_VID && rtl837x_per_bridge_fid(gsw)) {
+		/* SVL base VLAN: its entries are keyed by FID. */
+		cfg.flushByFid = ENABLED;
+		cfg.fid = RTL837X_FID_VLAN;
+	} else {
+		cfg.flushByVid = ENABLED;
+		cfg.vid = vid;
+	}
 	/* The RTL8373 VID mode uses FLUSH_PMSK as the port restriction. */
 	cfg.portmask = BIT(port);
 	cfg.flushStaticAddr = DISABLED;
 	cfg.flushAddrOnAllPorts = DISABLED;
 
+	mutex_lock(&rtl837x_ind_lock);
 	ret = rtk_l2_ucastAddr_flush(&cfg);
+	mutex_unlock(&rtl837x_ind_lock);
 	return rtl837x_to_errno(ret);
 }
 
@@ -2380,21 +3006,40 @@ static int rtl837x_apply_vlan_mode(struct rtk_gsw *gsw, int port,
 		if (ret)
 			return ret;
 
-		ret = rtl837x_bridge_vid_member(gsw, port, false);
+		/* tag_8021q leaves its bridge VID; rtl8_4 leaves the base
+		 * VLAN unless the bridge itself configured VID 1 here.
+		 */
+		if (gsw->tag_proto == DSA_TAG_PROTO_VSC73XX_8021Q)
+			ret = rtl837x_bridge_vid_member(gsw, port, false);
+		else
+			ret = rtl837x_base_vlan_leave(gsw, port);
+		if (ret)
+			return ret;
+
+		ret = rtl837x_port_fid_apply(gsw, port,
+			dsa_port_bridge_num_get(dsa_to_port(&gsw->ds, port)), true);
 		if (ret)
 			return ret;
 
 		return rtl837x_set_ingress_policy(gsw, port, true);
 	}
 
-	/* Stop admitting tagged frames first, then rejoin the bridge VID and
-	 * classify into it again.
+	/* Stop admitting tagged frames first, then rejoin the bridge VID (or
+	 * under rtl8_4 the base VLAN) and classify into it again.
 	 */
 	ret = rtl837x_set_ingress_policy(gsw, port, false);
 	if (ret)
 		return ret;
 
-	ret = rtl837x_bridge_vid_member(gsw, port, true);
+	if (gsw->tag_proto == DSA_TAG_PROTO_VSC73XX_8021Q)
+		ret = rtl837x_bridge_vid_member(gsw, port, true);
+	else
+		ret = rtl837x_base_vlan_join(gsw, port);
+	if (ret)
+		return ret;
+
+	ret = rtl837x_port_fid_apply(gsw, port,
+		dsa_port_bridge_num_get(dsa_to_port(&gsw->ds, port)), false);
 	if (ret)
 		return ret;
 
@@ -2472,6 +3117,10 @@ static int rtl837x_port_vlan_add(struct dsa_switch *ds, int port,
 		return ret;
 	}
 
+	/* The bridge now owns this port's VID 1 membership. */
+	if (vid == RTL837X_BASE_VID)
+		gsw->base_vlan_only &= ~BIT(port);
+
 	if (pvid && port != gsw->cpu_port) {
 		u16 old_pvid = gsw->bridge_pvid[port];
 		bool old_pvid_valid = gsw->bridge_pvid_valid[port];
@@ -2503,14 +3152,29 @@ static int rtl837x_port_vlan_del(struct dsa_switch *ds, int port,
 	if (!vid || vid > RTK_VID_MAX || !gsw->vlan_table[vid].valid)
 		return 0;
 
+	if (vid == RTL837X_BASE_VID && rtl837x_uses_base_vlan(gsw, port)) {
+		/* A VLAN-unaware or departing bridge port stays in the base
+		 * VLAN; only the bridge's claim on it goes away.
+		 */
+		gsw->base_vlan_only |= BIT(port);
+		goto pvid;
+	}
+
 	old_vlan = gsw->vlan_table[vid];
 
 	gsw->vlan_table[vid].mbr &= ~BIT(port);
 	gsw->vlan_table[vid].untag &= ~BIT(port);
 
+	/* The CPU port leaves a VLAN once no user port is in it. Under rtl8_4
+	 * that also holds when DSA drops the bridge's own (host) VID 1 while
+	 * standalone ports still classify into the base VLAN.
+	 */
 	if (!rtl837x_vlan_has_user(gsw, vid)) {
 		gsw->vlan_table[vid].mbr &= ~BIT(gsw->cpu_port);
 		gsw->vlan_table[vid].untag &= ~BIT(gsw->cpu_port);
+	} else if (vid == RTL837X_BASE_VID && port == gsw->cpu_port &&
+		   rtl837x_base_vlan_in_use(gsw)) {
+		gsw->vlan_table[vid].mbr |= BIT(gsw->cpu_port);
 	}
 
 	if (!gsw->vlan_table[vid].mbr)
@@ -2522,6 +3186,7 @@ static int rtl837x_port_vlan_del(struct dsa_switch *ds, int port,
 		return ret;
 	}
 
+pvid:
 	if (port != gsw->cpu_port && gsw->bridge_pvid_valid[port] &&
 	    gsw->bridge_pvid[port] == vid) {
 		u16 old_pvid = gsw->bridge_pvid[port];
@@ -2539,14 +3204,97 @@ static int rtl837x_port_vlan_del(struct dsa_switch *ds, int port,
 	return 0;
 }
 
+/* DSA keeps one host address per {MAC, VID, database}, but several of those
+ * can share one LUT key. The user ports normally all have the same MAC, so
+ * under rtl8_4 every port's standalone entry and the bridge's own entries
+ * (VID 0 and VID 1) all land on {MAC, VID 1}, and with per_bridge_fid the
+ * standalone entries of all ports share one FID. The LUT entry has to stay
+ * until the last of them is gone, or taking one port down, or the last port
+ * leaving the bridge, would remove it from under the others.
+ *
+ * Each address remembers the key it was added with: the key depends on the
+ * tagger, and DSA keeps host addresses across a tagger change without
+ * replaying them. Callers hold rtl837x_ind_lock.
+ */
+struct rtl837x_host_fdb {
+	struct list_head list;
+	u8 addr[ETH_ALEN];
+	u16 vid;
+	struct dsa_db db;
+	u32 ivl;
+	u16 vid_fid;
+};
+
+static bool rtl837x_db_equal(const struct dsa_db *a, const struct dsa_db *b)
+{
+	if (a->type != b->type)
+		return false;
+
+	switch (a->type) {
+	case DSA_DB_PORT:
+		return a->dp == b->dp;
+	case DSA_DB_BRIDGE:
+		return a->bridge.num == b->bridge.num;
+	case DSA_DB_LAG:
+		return a->lag.dev == b->lag.dev;
+	default:
+		return false;
+	}
+}
+
+static struct rtl837x_host_fdb *
+rtl837x_host_fdb_find(struct rtk_gsw *gsw, const unsigned char *addr, u16 vid,
+		      const struct dsa_db *db)
+{
+	struct rtl837x_host_fdb *host;
+
+	list_for_each_entry(host, &gsw->host_fdb, list)
+		if (host->vid == vid && ether_addr_equal(host->addr, addr) &&
+		    rtl837x_db_equal(&host->db, db))
+			return host;
+
+	return NULL;
+}
+
+/* Does an address other than @skip hold this LUT key? */
+static bool rtl837x_host_fdb_key_used(struct rtk_gsw *gsw,
+				      const struct rtl837x_host_fdb *skip,
+				      const unsigned char *addr, u32 ivl,
+				      u16 vid_fid)
+{
+	struct rtl837x_host_fdb *host;
+
+	list_for_each_entry(host, &gsw->host_fdb, list)
+		if (host != skip && host->ivl == ivl &&
+		    host->vid_fid == vid_fid &&
+		    ether_addr_equal(host->addr, addr))
+			return true;
+
+	return false;
+}
+
+static void rtl837x_host_fdb_flush(struct rtk_gsw *gsw)
+{
+	struct rtl837x_host_fdb *host, *tmp;
+
+	mutex_lock(&rtl837x_ind_lock);
+	list_for_each_entry_safe(host, tmp, &gsw->host_fdb, list) {
+		list_del(&host->list);
+		kfree(host);
+	}
+	mutex_unlock(&rtl837x_ind_lock);
+}
+
 static int rtl837x_port_fdb_add(struct dsa_switch *ds, int port,
 				const unsigned char *addr, u16 vid,
 				struct dsa_db db)
 {
+	struct rtl837x_host_fdb *new_host = NULL;
 	struct rtk_gsw *gsw = ds->priv;
 	rtk_l2_ucastAddr_t l2 = { 0 };
 	rtk_mac_t mac = { 0 };
-	u16 fdb_vid;
+	u16 vid_fid;
+	u32 ivl;
 	int ret;
 
 	if (!rtl837x_valid_port(gsw, port))
@@ -2556,19 +3304,40 @@ static int rtl837x_port_fdb_add(struct dsa_switch *ds, int port,
 	if (gsw->chip_id == CHIP_RTL8372N && port == gsw->cpu_port)
 		return 0;
 
-	ret = rtl837x_fdb_vid(vid, db, &fdb_vid);
+	ret = rtl837x_fdb_key(gsw, vid, db, &ivl, &vid_fid);
 	if (ret)
 		return ret;
 
 	memcpy(mac.octet, addr, ETH_ALEN);
 	memcpy(l2.mac.octet, addr, ETH_ALEN);
-	l2.ivl = fdb_vid ? 1 : 0;
-	l2.vid_fid = fdb_vid;
+	l2.ivl = ivl;
+	l2.vid_fid = vid_fid;
 	l2.port = port;
 	l2.auth = 1;
 	l2.is_static = 1;
 
-	ret = rtk_l2_addr_add(&mac, &l2);
+	if (port == gsw->cpu_port) {
+		new_host = kzalloc(sizeof(*new_host), GFP_KERNEL);
+		if (!new_host)
+			return -ENOMEM;
+	}
+
+	mutex_lock(&rtl837x_ind_lock);
+	if (new_host && rtl837x_host_fdb_key_used(gsw, NULL, addr, ivl, vid_fid))
+		ret = RT_ERR_OK;
+	else
+		ret = rtk_l2_addr_add(&mac, &l2);
+	if (new_host && ret == RT_ERR_OK) {
+		ether_addr_copy(new_host->addr, addr);
+		new_host->vid = vid;
+		new_host->db = db;
+		new_host->ivl = ivl;
+		new_host->vid_fid = vid_fid;
+		list_add_tail(&new_host->list, &gsw->host_fdb);
+		new_host = NULL;
+	}
+	mutex_unlock(&rtl837x_ind_lock);
+	kfree(new_host);
 	return rtl837x_to_errno(ret);
 }
 
@@ -2576,10 +3345,12 @@ static int rtl837x_port_fdb_del(struct dsa_switch *ds, int port,
 				const unsigned char *addr, u16 vid,
 				struct dsa_db db)
 {
+	struct rtl837x_host_fdb *host = NULL;
 	struct rtk_gsw *gsw = ds->priv;
 	rtk_l2_ucastAddr_t l2 = { 0 };
 	rtk_mac_t mac = { 0 };
-	u16 fdb_vid;
+	u16 vid_fid;
+	u32 ivl;
 	int ret;
 
 	if (!rtl837x_valid_port(gsw, port))
@@ -2588,18 +3359,36 @@ static int rtl837x_port_fdb_del(struct dsa_switch *ds, int port,
 	if (gsw->chip_id == CHIP_RTL8372N && port == gsw->cpu_port)
 		return 0;
 
-	ret = rtl837x_fdb_vid(vid, db, &fdb_vid);
+	ret = rtl837x_fdb_key(gsw, vid, db, &ivl, &vid_fid);
 	if (ret)
 		return ret;
 
 	memcpy(mac.octet, addr, ETH_ALEN);
 	memcpy(l2.mac.octet, addr, ETH_ALEN);
-	l2.ivl = fdb_vid ? 1 : 0;
-	l2.vid_fid = fdb_vid;
 	l2.port = port;
 	l2.is_static = 1;
 
-	ret = rtk_l2_addr_del(&mac, &l2);
+	mutex_lock(&rtl837x_ind_lock);
+	if (port == gsw->cpu_port) {
+		host = rtl837x_host_fdb_find(gsw, addr, vid, &db);
+		if (host) {
+			ivl = host->ivl;
+			vid_fid = host->vid_fid;
+		}
+	}
+	if (port == gsw->cpu_port &&
+	    rtl837x_host_fdb_key_used(gsw, host, addr, ivl, vid_fid)) {
+		ret = RT_ERR_OK;
+	} else {
+		l2.ivl = ivl;
+		l2.vid_fid = vid_fid;
+		ret = rtk_l2_addr_del(&mac, &l2);
+	}
+	if (host && (ret == RT_ERR_OK || ret == RT_ERR_L2_ENTRY_NOTFOUND)) {
+		list_del(&host->list);
+		kfree(host);
+	}
+	mutex_unlock(&rtl837x_ind_lock);
 	if (ret == RT_ERR_L2_ENTRY_NOTFOUND)
 		return 0;
 
@@ -2621,8 +3410,11 @@ static int rtl837x_port_fdb_dump(struct dsa_switch *ds, int port,
 		rtk_l2_ucastAddr_t l2 = { 0 };
 		u16 vid;
 
+		/* Per entry, never across the netlink callback below. */
+		mutex_lock(&rtl837x_ind_lock);
 		ret = rtk_l2_addr_next_get(READMETHOD_NEXT_L2UCSPA, port,
 					   &address, &l2);
+		mutex_unlock(&rtl837x_ind_lock);
 		if (ret == RT_ERR_L2_ENTRY_NOTFOUND)
 			break;
 		if (ret != RT_ERR_OK)
@@ -2636,9 +3428,23 @@ static int rtl837x_port_fdb_dump(struct dsa_switch *ds, int port,
 		 * something the bridge configured, so report them as 0 the
 		 * way an unaware entry is reported.
 		 */
-		vid = l2.ivl ? l2.vid_fid : 0;
-		if (vid_is_dsa_8021q(vid))
-			vid = 0;
+		if (l2.ivl) {
+			vid = l2.vid_fid;
+			if (vid_is_dsa_8021q(vid))
+				vid = 0;
+			/* Likewise the IVL rtl8_4 base VLAN of an unaware port. */
+			if (vid == RTL837X_BASE_VID &&
+			    gsw->tag_proto == DSA_TAG_PROTO_RTL8_4 &&
+			    !dsa_port_is_vlan_filtering(dsa_to_port(ds, port)))
+				vid = 0;
+		} else {
+			/* SVL: the base VLAN's FID is VID 1 of a VLAN-aware
+			 * port; a port-based FID is VLAN-unaware (VID 0).
+			 */
+			vid = (l2.vid_fid == RTL837X_FID_VLAN &&
+			       dsa_port_is_vlan_filtering(dsa_to_port(ds, port))) ?
+				RTL837X_BASE_VID : 0;
+		}
 
 		ret = cb(l2.mac.octet, vid, l2.is_static, data);
 		if (ret)
@@ -2648,6 +3454,137 @@ static int rtl837x_port_fdb_dump(struct dsa_switch *ds, int port,
 	}
 
 	return 0;
+}
+
+/* Maximum frame length.
+ *
+ * MAC_L2_PORT_MAX_LEN_CTRL (0x1250 + port * 0x100) is the per-port RX limit:
+ * two 14-bit fields, one for 10/100M and one for 1G and faster links, plus
+ * MAX_LEN_TAG_INC, which decides whether CPU, C- and S-tags count towards
+ * the limit (dal_rtl8373_portMaxLenIncTag_set()). With TAG_INC clear the
+ * limit describes the frame without tags, so neither the rtl8_4 CPU tag, a
+ * tag_8021q VID nor a user's 802.1Q tag eats into the MTU. The VLAN_HLEN
+ * in the overhead is deliberate slack: it gives the conventional 1522 at the
+ * default MTU and absorbs any FCS accounting difference.
+ *
+ * MAC_L2_PORT_TX_MAX_LEN_CTRL (0x4E90 + port * 4) is a separate egress
+ * limit without an SDK accessor. Linux has no egress MTU for switch ports
+ * (the RX limit of the ingress port is the MTU check), so it is opened to
+ * the field maximum once at setup instead of being left to whatever the
+ * bootloader programmed, which would otherwise silently drop jumbo frames
+ * between ports.
+ */
+#define RTL837X_MAX_FRAME_LEN	0x3FFF
+#define RTL837X_FRAME_OVERHEAD	(ETH_HLEN + VLAN_HLEN + ETH_FCS_LEN)
+
+static int rtl837x_open_tx_max_len(struct rtk_gsw *gsw)
+{
+	int port, ret;
+
+	for (port = 0; port < RTK_MAX_NUM_OF_PORT; port++) {
+		if (!rtl837x_valid_port(gsw, port))
+			continue;
+
+		ret = rtl8373_setAsicRegBits(RTL8373_MAC_L2_PORT_TX_MAX_LEN_CTRL_ADDR(port),
+			RTL8373_MAC_L2_PORT_TX_MAX_LEN_CTRL_MAX_LEN_TX_100M_10M_SEL_MASK,
+			RTL837X_MAX_FRAME_LEN);
+		if (ret)
+			return rtl837x_to_errno(ret);
+
+		ret = rtl8373_setAsicRegBits(RTL8373_MAC_L2_PORT_TX_MAX_LEN_CTRL_ADDR(port),
+			RTL8373_MAC_L2_PORT_TX_MAX_LEN_CTRL_MAX_LEN_TX_1G_2P5G_5G_10G_SEL_MASK,
+			RTL837X_MAX_FRAME_LEN);
+		if (ret)
+			return rtl837x_to_errno(ret);
+	}
+
+	return 0;
+}
+
+static int rtl837x_save_boot_max_len(struct rtk_gsw *gsw)
+{
+	int port, ret;
+
+	if (gsw->boot_max_len_valid)
+		return 0;
+
+	for (port = 0; port < RTK_MAX_NUM_OF_PORT; port++) {
+		if (!rtl837x_valid_port(gsw, port))
+			continue;
+
+		ret = dal_rtl8373_portMaxLen_get(port, 0,
+						 &gsw->boot_max_len[port][0]);
+		if (!ret)
+			ret = dal_rtl8373_portMaxLen_get(port, 1,
+							 &gsw->boot_max_len[port][1]);
+		if (!ret)
+			ret = dal_rtl8373_portMaxLenIncTag_get(port,
+							       &gsw->boot_tag_inc[port]);
+		if (ret)
+			return rtl837x_to_errno(ret);
+	}
+
+	gsw->boot_max_len_valid = true;
+	return 0;
+}
+
+static int rtl837x_restore_boot_max_len(struct rtk_gsw *gsw, int port)
+{
+	int ret;
+
+	ret = dal_rtl8373_portMaxLenIncTag_set(port, gsw->boot_tag_inc[port]);
+	if (!ret)
+		ret = dal_rtl8373_portMaxLen_set(port, 0,
+						 gsw->boot_max_len[port][0]);
+	if (!ret)
+		ret = dal_rtl8373_portMaxLen_set(port, 1,
+						 gsw->boot_max_len[port][1]);
+	return rtl837x_to_errno(ret);
+}
+
+static int rtl837x_port_max_mtu(struct dsa_switch *ds, int port)
+{
+	return RTL837X_MAX_FRAME_LEN - RTL837X_FRAME_OVERHEAD;
+}
+
+static int rtl837x_port_change_mtu(struct dsa_switch *ds, int port,
+				   int new_mtu)
+{
+	struct rtk_gsw *gsw = ds->priv;
+	u32 len;
+	int ret;
+
+	if (!rtl837x_valid_port(gsw, port) || new_mtu < ETH_MIN_MTU ||
+	    new_mtu > rtl837x_port_max_mtu(ds, port))
+		return -EINVAL;
+
+	/* Back at the standard MTU a port returns to the bootloader's limits. */
+	if (new_mtu <= ETH_DATA_LEN)
+		return port == gsw->cpu_port ? 0 :
+		       rtl837x_restore_boot_max_len(gsw, port);
+
+	/* The CPU port's ingress is the conduit's egress, already sized by
+	 * the conduit MTU; it gets the largest length the field allows, so
+	 * that how the CPU tag is accounted for on that link cannot matter.
+	 */
+	if (port == gsw->cpu_port)
+		len = RTL837X_MAX_FRAME_LEN;
+	else
+		len = max3((u32)(new_mtu + RTL837X_FRAME_OVERHEAD),
+			   gsw->boot_max_len[port][0],
+			   gsw->boot_max_len[port][1]);
+
+	ret = dal_rtl8373_portMaxLenIncTag_set(port, 0);
+	if (ret)
+		return rtl837x_to_errno(ret);
+
+	/* Both speed buckets: a port can renegotiate between them. */
+	ret = dal_rtl8373_portMaxLen_set(port, 0, len);
+	if (ret)
+		return rtl837x_to_errno(ret);
+
+	ret = dal_rtl8373_portMaxLen_set(port, 1, len);
+	return rtl837x_to_errno(ret);
 }
 
 static const struct dsa_switch_ops rtl837x_dsa_ops = {
@@ -2688,6 +3625,13 @@ static const struct dsa_switch_ops rtl837x_dsa_ops = {
 	.tag_8021q_vlan_del = rtl837x_tag_8021q_vlan_del,
 };
 
+/* The ops with the port MTU implemented, for jumbo. Without it the MTU ops stay
+ * unregistered: DSA then returns before touching the conduit's MTU, nothing
+ * reads or writes the frame limits, and hosts that already exchange jumbo
+ * frames through the switch keep doing so.
+ */
+static struct dsa_switch_ops rtl837x_jumbo_dsa_ops;
+
 int rtl837x_dsa_register(struct rtk_gsw *gsw)
 {
 	struct dsa_switch *ds = &gsw->ds;
@@ -2695,10 +3639,18 @@ int rtl837x_dsa_register(struct rtk_gsw *gsw)
 
 	rtl837x_stats_init(gsw);
 	mutex_init(&gsw->isolation_lock);
+	INIT_LIST_HEAD(&gsw->host_fdb);
 
 	ds->dev = gsw->dev;
 	ds->priv = gsw;
-	ds->ops = &rtl837x_dsa_ops;
+	if (jumbo) {
+		rtl837x_jumbo_dsa_ops = rtl837x_dsa_ops;
+		rtl837x_jumbo_dsa_ops.port_change_mtu = rtl837x_port_change_mtu;
+		rtl837x_jumbo_dsa_ops.port_max_mtu = rtl837x_port_max_mtu;
+		ds->ops = &rtl837x_jumbo_dsa_ops;
+	} else {
+		ds->ops = &rtl837x_dsa_ops;
+	}
 	ds->num_ports = gsw->dsa_num_ports;
 	ds->phys_mii_mask = rtl837x_user_ports(gsw);
 	ds->configure_vlan_while_not_filtering = true;
@@ -2707,6 +3659,10 @@ int rtl837x_dsa_register(struct rtk_gsw *gsw)
 	ds->max_num_bridges = DSA_TAG_8021Q_MAX_NUM_BRIDGES;
 	ds->ageing_time_min = 14000;
 	ds->ageing_time_max = 800000;
+	/* The MTU is an RX length limit per port (rtl837x_port_change_mtu());
+	 * have DSA keep the ports of a bridge at a common MTU.
+	 */
+	ds->mtu_enforcement_ingress = jumbo;
 
 	ret = dsa_register_switch(ds);
 	if (ret)
