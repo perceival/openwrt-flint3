@@ -1,5 +1,5 @@
 REQUIRE_IMAGE_METADATA=1
-RAMFS_COPY_BIN='dumpimage fitblk fit_check_sign'
+RAMFS_COPY_BIN='df dumpimage fitblk fit_check_sign mktemp sha256sum'
 
 gl_be6500_remove_oem_rootfs() {
 	local mtdnum

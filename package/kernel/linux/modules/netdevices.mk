@@ -2160,7 +2160,7 @@ define KernelPackage/qcom-ppe
   TITLE:=Qualcomm PPE ethernet controller
   KCONFIG:= CONFIG_QCOM_PPE
   FILES:=$(LINUX_DIR)/drivers/net/ethernet/qualcomm/ppe/qcom-ppe.ko
-  AUTOLOAD:=$(call AutoProbe,qcom-ppe)
+  AUTOLOAD:=$(call AutoLoad,36,qcom-ppe,1)
 endef
 
 define KernelPackage/qcom-ppe/description
@@ -2216,7 +2216,7 @@ define KernelPackage/pcs-qcom-ipq9574
   DEPENDS:=@TARGET_qualcommbe +kmod-phylink
   KCONFIG:=CONFIG_PCS_QCOM_IPQ9574
   FILES:=$(LINUX_DIR)/drivers/net/pcs/pcs-qcom-ipq9574.ko
-  AUTOLOAD:=$(call AutoProbe,pcs-qcom-ipq9574)
+  AUTOLOAD:=$(call AutoLoad,35,pcs-qcom-ipq9574,1)
 endef
 
 $(eval $(call KernelPackage,pcs-qcom-ipq9574))

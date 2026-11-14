@@ -17,6 +17,10 @@
 
 	aliases {
 		serial0 = &blsp1_uart0;
+		led-boot = &led_system;
+		led-failsafe = &led_system;
+		led-running = &led_run;
+		led-upgrade = &led_system;
 	};
 
 	chosen {
@@ -105,13 +109,13 @@
 			pinctrl-names = "default";
 			status = "okay";
 
-			led@32 {
+			led_run: led@32 {
 				label = "blue:run";
 				gpios = <&tlmm 32 GPIO_ACTIVE_HIGH>;
 				default-state = "on";
 			};
 
-			led@33 {
+			led_system: led@33 {
 				label = "white:system";
 				gpios = <&tlmm 33 GPIO_ACTIVE_HIGH>;
 				default-state = "off";
@@ -587,6 +591,17 @@
 					#address-cells = <1>;
 					#size-cells = <1>;
 
+					/*
+					 * Wi-Fi base address. Stock gives its
+					 * three radios this address + 0, 1 and
+					 * 2 (wifi0/1/2 = 2.4/5/6 GHz).
+					 */
+					wifi_macaddr: mac-address@4 {
+						compatible = "mac-base";
+						reg = <0x4 0x6>;
+						#nvmem-cell-cells = <1>;
+					};
+
 					base_macaddr: mac-address@a {
 						compatible = "mac-base";
 						reg = <0xa 0x6>;
@@ -626,6 +641,9 @@
 			qcom,ath12k-fw-memory-mode = <1>;
 			qcom,board-id = <0x1019>;
 			qcom,num-radios = <2>;
+			/* 5 GHz radio; ath12k gives the 6 GHz MAC1 the next one */
+			nvmem-cells = <&wifi_macaddr 1>;
+			nvmem-cell-names = "mac-address";
 
 			ports {
 				#address-cells = <1>;
@@ -691,6 +709,9 @@
 	memory-region-names = "q6-region", "host-ddr-mem", "m3-dump", "q6-caldb",
 			      "mlo-global-mem", "q6-etr-dump";
 	qcom,board-id = <18>;
+	/* Radio 0 of the MLO wiphy: this becomes phy0's permanent address */
+	nvmem-cells = <&wifi_macaddr 0>;
+	nvmem-cell-names = "mac-address";
 	qcom,rproc = <&q6v5_wcss>;
 	qcom,wsi-controller;
 	status = "okay";

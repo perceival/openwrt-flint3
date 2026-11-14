@@ -36,9 +36,32 @@ ipq53xx_setup_interfaces()
 	esac
 }
 
+ipq53xx_setup_wlan()
+{
+	local board="$1"
+	local art country
+
+	case "$board" in
+	gl.inet,gl-be9300)
+		# Factory regulatory domain: two letters at ART 0x88, stock's
+		# gl-hw factory_data country_code. wifi config writes it into
+		# every radio section it creates, including radios that register
+		# long after boot, so no script has to wait for them.
+		art=$(find_mmc_part "0:ART")
+		[ -n "$art" ] || return
+		country=$(dd if="$art" bs=1 skip=136 count=2 2>/dev/null |
+			tr '[:lower:]' '[:upper:]' | tr -dc 'A-Z')
+		# Unprogrammed: leave the country unset (no fallback, as before);
+		# hotplug.d/ieee80211/40-gl-wireless-country logs what to do.
+		[ "${#country}" = 2 ] && ucidef_set_country "$country"
+		;;
+	esac
+}
+
 board_config_update
 board=$(board_name)
 ipq53xx_setup_interfaces $board
+ipq53xx_setup_wlan $board
 board_config_flush
 
 exit 0
