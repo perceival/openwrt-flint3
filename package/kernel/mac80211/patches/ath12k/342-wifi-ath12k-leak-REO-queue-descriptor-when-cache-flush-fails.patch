@@ -1,0 +1,33 @@
+From: CoolFreeze23 <34906576+CoolFreeze23@users.noreply.github.com>
+Date: Tue, 20 Oct 2026 12:00:00 +0900
+Subject: [PATCH] wifi: ath12k: leak REO queue descriptor when its cache flush fails
+
+ath12k_dp_reo_cmd_free() freed the REO queue descriptor even when the
+HAL_REO_CMD_FLUSH_CACHE command had failed. REO may still hold the
+descriptor in its cache and write it back later, into whatever object
+reuses the memory (kmalloc-2k, shared with netlink sockets). Leak the
+descriptor instead and say so in the (ratelimited) warning.
+---
+diff --git a/drivers/net/wireless/ath/ath12k/dp_rx.c b/drivers/net/wireless/ath/ath12k/dp_rx.c
+--- a/drivers/net/wireless/ath/ath12k/dp_rx.c
++++ b/drivers/net/wireless/ath/ath12k/dp_rx.c
+@@ -408,9 +408,16 @@ void ath12k_dp_reo_cmd_free(struct ath12k_dp *dp, void *ctx,
+ {
+ 	struct ath12k_dp_rx_tid_rxq *rx_tid = ctx;
+ 
+-	if (status != HAL_REO_CMD_SUCCESS)
+-		ath12k_warn(dp->ab, "failed to flush rx tid hw desc, tid %d status %d\n",
+-			    rx_tid->tid, status);
++	if (status != HAL_REO_CMD_SUCCESS) {
++		/* REO may still hold this descriptor in its cache and write
++		 * it back later. Freeing it would let that write land in
++		 * whatever object reuses the memory, so leak it instead.
++		 */
++		ath12k_warn(dp->ab,
++			    "failed to flush rx tid %d hw desc, status %d: leaking %u byte descriptor\n",
++			    rx_tid->tid, status, rx_tid->qbuf.size);
++		return;
++	}
+ 
+ 	ath12k_dp_rx_tid_cleanup(dp->ab, &rx_tid->qbuf);
+ }

@@ -1,0 +1,149 @@
+From: CoolFreeze23 <34906576+CoolFreeze23@users.noreply.github.com>
+Date: Tue, 20 Oct 2026 12:00:00 +0900
+Subject: [PATCH] wifi: ath12k: do not account TX completions to a station that reused the peer id
+
+Both TX completion paths look up the destination by the peer_id from
+the completion and report status for peer->sta. A completion can
+arrive after its station left and the peer_id was assigned to a new
+station. Its status, including rate and ACK, is then attributed to the
+wrong station.
+
+Give each ath12k_sta a non-zero tx_gen when it is created and copy it
+into the skb_cb of its frames (2 octets, ath12k_skb_cb still fits
+driver_data). On completion, read it before info->status is cleared
+(skb_cb shares that storage) and drop the status when the peer's
+station has a different generation. Frames without a station (sta_gen
+0) are unchanged.
+---
+diff --git a/drivers/net/wireless/ath/ath12k/core.h b/drivers/net/wireless/ath/ath12k/core.h
+--- a/drivers/net/wireless/ath/ath12k/core.h
++++ b/drivers/net/wireless/ath/ath12k/core.h
+@@ -133,6 +133,8 @@ struct ath12k_skb_cb {
+ 	u32 cipher;
+ 	u8 flags;
+ 	u8 link_id;
++	/* ath12k_sta::tx_gen of the destination station, 0 if none */
++	u16 sta_gen;
+ };
+ 
+ struct ath12k_skb_rxcb {
+@@ -541,6 +543,12 @@ struct ath12k_sta {
+ 
+ 	bool enable_4addr;
+ 
++	/* Non-zero tag of this station instance, copied into the skb_cb of
++	 * its frames so that a TX completion arriving after the peer_id was
++	 * reused by another station is not accounted to that station.
++	 */
++	u16 tx_gen;
++
+ 	/* MLO links that reported a firmware kickout since kickout_ts.
+ 	 * Updated with atomic bitops: kickout events of different links can
+ 	 * come from different devices (different ab->base_lock).
+diff --git a/drivers/net/wireless/ath/ath12k/mac.c b/drivers/net/wireless/ath/ath12k/mac.c
+--- a/drivers/net/wireless/ath/ath12k/mac.c
++++ b/drivers/net/wireless/ath/ath12k/mac.c
+@@ -7881,6 +7881,18 @@ static int ath12k_mac_select_links(struc
+ 	return 0;
+ }
+ 
++static u16 ath12k_mac_next_sta_tx_gen(void)
++{
++	static atomic_t tx_gen = ATOMIC_INIT(0);
++	u16 gen;
++
++	do {
++		gen = (u16)atomic_inc_return(&tx_gen);
++	} while (!gen);
++
++	return gen;
++}
++
+ int ath12k_mac_op_sta_state(struct ieee80211_hw *hw,
+ 			    struct ieee80211_vif *vif,
+ 			    struct ieee80211_sta *sta,
+@@ -7916,6 +7928,7 @@ int ath12k_mac_op_sta_state(struct ieee8
+ 	    new_state == IEEE80211_STA_NONE) {
+ 		memset(ahsta, 0, sizeof(*ahsta));
+ 		ahsta->free_logical_link_idx_map = U16_MAX;
++		ahsta->tx_gen = ath12k_mac_next_sta_tx_gen();
+ 
+ 		arsta = &ahsta->deflink;
+ 
+diff --git a/drivers/net/wireless/ath/ath12k/wifi7/dp_tx.c b/drivers/net/wireless/ath/ath12k/wifi7/dp_tx.c
+--- a/drivers/net/wireless/ath/ath12k/wifi7/dp_tx.c
++++ b/drivers/net/wireless/ath/ath12k/wifi7/dp_tx.c
+@@ -499,10 +499,13 @@ ath12k_dp_tx_htt_tx_complete_buf(struct
+ 	struct ieee80211_tx_status status = {};
+ 	struct ath12k_dp_link_peer *peer;
+ 	struct ath12k_pdev_dp *dp_pdev;
++	u16 sta_gen;
+ 	u8 pdev_id;
+ 
+ 	skb_cb = ATH12K_SKB_CB(msdu);
+ 	info = IEEE80211_SKB_CB(msdu);
++	/* skb_cb shares storage with info->status, which is cleared below */
++	sta_gen = skb_cb->sta_gen;
+ 
+ 	pdev_id = ath12k_hw_mac_id_to_pdev_id(dp->hw_params, desc_params->mac_id);
+ 
+@@ -566,6 +569,13 @@ ath12k_dp_tx_htt_tx_complete_buf(struct
+ 			   "dp_tx: failed to find the peer with peer_id %d\n", peer_id);
+ 		ieee80211_free_txskb(ath12k_pdev_dp_to_hw(dp_pdev), msdu);
+ 		goto exit;
++	} else if (unlikely(sta_gen &&
++			    ath12k_sta_to_ahsta(peer->sta)->tx_gen != sta_gen)) {
++		ath12k_dbg(ab, ATH12K_DBG_DATA,
++			   "dp_tx: peer_id %d now belongs to another station\n",
++			   peer_id);
++		ieee80211_free_txskb(ath12k_pdev_dp_to_hw(dp_pdev), msdu);
++		goto exit;
+ 	} else {
+ 		status.sta = peer->sta;
+ 	}
+@@ -764,6 +774,7 @@ static void ath12k_wifi7_dp_tx_complete_
+ 	struct ieee80211_rate_status status_rate = {};
+ 	struct ath12k_dp_link_peer *peer;
+ 	struct rate_info rate;
++	u16 sta_gen;
+ 
+ 	if (WARN_ON_ONCE(ts->buf_rel_source != HAL_WBM_REL_SRC_MODULE_TQM)) {
+ 		/* Must not happen */
+@@ -771,6 +782,8 @@ static void ath12k_wifi7_dp_tx_complete_
+ 	}
+ 
+ 	skb_cb = ATH12K_SKB_CB(msdu);
++	/* skb_cb shares storage with info->status, which is cleared below */
++	sta_gen = skb_cb->sta_gen;
+ 	dp->device_stats.tx_completed[ring]++;
+ 
+ 	dma_unmap_single(dp->dev, skb_cb->paddr, msdu->len, DMA_TO_DEVICE);
+@@ -865,6 +878,16 @@ static void ath12k_wifi7_dp_tx_complete_
+ 			   ts->peer_id);
+ 		ieee80211_free_txskb(ath12k_pdev_dp_to_hw(dp_pdev), msdu);
+ 		goto exit;
++	}
++
++	if (unlikely(sta_gen &&
++		     ath12k_sta_to_ahsta(peer->sta)->tx_gen != sta_gen)) {
++		/* the peer_id was reused before this completion arrived */
++		ath12k_dbg(ab, ATH12K_DBG_DP_TX,
++			   "dp_tx: peer_id %d now belongs to another station\n",
++			   ts->peer_id);
++		ieee80211_free_txskb(ath12k_pdev_dp_to_hw(dp_pdev), msdu);
++		goto exit;
+ 	}
+ 
+ 	status.sta = peer->sta;
+diff --git a/drivers/net/wireless/ath/ath12k/wifi7/hw.c b/drivers/net/wireless/ath/ath12k/wifi7/hw.c
+--- a/drivers/net/wireless/ath/ath12k/wifi7/hw.c
++++ b/drivers/net/wireless/ath/ath12k/wifi7/hw.c
+@@ -943,6 +943,8 @@ static void ath12k_wifi7_mac_op_tx(struc
+ 	link_id = u32_get_bits(info->control.flags, IEEE80211_TX_CTRL_MLO_LINK);
+ 	memset(skb_cb, 0, sizeof(*skb_cb));
+ 	skb_cb->vif = vif;
++	if (sta)
++		skb_cb->sta_gen = ath12k_sta_to_ahsta(sta)->tx_gen;
+ 
+ 	if (key) {
+ 		skb_cb->cipher = key->cipher;

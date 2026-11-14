@@ -1,0 +1,49 @@
+From: CoolFreeze23 <34906576+CoolFreeze23@users.noreply.github.com>
+Date: Tue, 20 Oct 2026 12:00:00 +0900
+Subject: [PATCH] wifi: ath12k: queue every device on a rootPD restart
+
+The AFTER_POWERUP notifier of a crashed rootPD queues group recovery
+through ath12k_ahb_queue_group_recovery(), but skipped a device whose
+reset work was busy. With the reset request of patch 350, a pending
+reset work can be a stale run that returns at once, so the request of
+the rootPD crash was lost and the group stayed down. Requesting the
+reset before the busy test is not enough: a running work that already
+consumed its request does not run again, and a plain set_bit() followed
+by the work_busy() read lacks the ordering that queue_work()'s PENDING
+test-and-set gives every other queueing path.
+
+Request the reset and queue the work for every device: a run whose
+request was answered by a later group power-up, or that finds no
+request, returns at once. Correct the comment.
+---
+diff --git a/drivers/net/wireless/ath/ath12k/ahb.c b/drivers/net/wireless/ath/ath12k/ahb.c
+--- a/drivers/net/wireless/ath/ath12k/ahb.c
++++ b/drivers/net/wireless/ath/ath12k/ahb.c
+@@ -967,7 +967,11 @@ static void ath12k_ahb_release_crashed_u
+  * was waiting for it holds ag->mutex and consumes rootpd_crashed, so the
+  * marker is re-checked under the mutex: if it is still set, no power-up
+  * picked the restart up (none ran yet, or it timed out) and recovery is
+- * still owed. Devices whose reset work is queued or running are skipped.
++ * still owed.
++ * In both cases every device's reset is requested and its work queued,
++ * also when it is queued or running already: a run whose request was
++ * answered by a later group power-up, or that finds no request, returns
++ * at once (ath12k_core_reset()), so an extra run costs nothing.
+  */
+ static void ath12k_ahb_queue_group_recovery(struct ath12k_base *ab,
+ 					    bool new_crash)
+@@ -993,9 +997,11 @@ static void ath12k_ahb_queue_group_recov
+ 		set_bit(ATH12K_FLAG_CRASH_FLUSH, &partner_ab->dev_flags);
+ 		set_bit(ATH12K_FLAG_RECOVERY, &partner_ab->dev_flags);
+ 
+-		if (!new_crash && work_busy(&partner_ab->reset_work))
+-			continue;
+-
++		/*
++		 * queue_work() also when the work is busy: its ordered PENDING
++		 * test-and-set makes the run that follows see the request, and
++		 * a queued work may be a stale run that would return without it.
++		 */
+ 		set_bit(ATH12K_FLAG_RESET_REQUESTED, &partner_ab->dev_flags);
+ 		queue_work(partner_ab->workqueue_aux, &partner_ab->reset_work);
+ 	}

@@ -1,0 +1,62 @@
+From: CoolFreeze23 <34906576+CoolFreeze23@users.noreply.github.com>
+Date: Tue, 20 Oct 2026 12:00:00 +0900
+Subject: [PATCH] wifi: ath12k: take the reset request and clear the answer atomically
+
+The reset work consumed ATH12K_FLAG_RESET_REQUESTED and then cleared
+ATH12K_FLAG_RESET_ANSWERED as two operations. A group power-up between
+them (clear the request, set the answer) had its answer cleared, so the
+run later reset a device that had been booted after its request.
+Swapping the two is not enough either: a boot between "clear the answer"
+and "consume the request" leaves an answer that predates a request made
+after it, and the run then skips a real crash.
+
+Take the request and clear the answer in one try_cmpxchg() on
+dev_flags.
+---
+diff --git a/drivers/net/wireless/ath/ath12k/core.c b/drivers/net/wireless/ath/ath12k/core.c
+--- a/drivers/net/wireless/ath/ath12k/core.c
++++ b/drivers/net/wireless/ath/ath12k/core.c
+@@ -1875,6 +1875,30 @@ static void ath12k_core_reset_skipped(st
+ 	mutex_unlock(&ag->mutex);
+ }
+ 
++/*
++ * Take the pending reset request, and clear the answer of earlier group
++ * power-ups, in one atomic step. As two steps either order loses: clear
++ * then consume keeps the answer of a boot made between the two, before a
++ * request that arrives after it; consume then clear drops the answer of a
++ * boot made in between, after the request. The group power-up clears the
++ * request and then sets the answer, so a boot is either before the take
++ * (the request is gone: stale run) or after it (its answer stays).
++ */
++static bool ath12k_core_reset_take_request(struct ath12k_base *ab)
++{
++	unsigned long old = READ_ONCE(ab->dev_flags);
++	unsigned long new;
++
++	do {
++		if (!(old & BIT(ATH12K_FLAG_RESET_REQUESTED)))
++			return false;
++		new = old & ~(BIT(ATH12K_FLAG_RESET_REQUESTED) |
++			      BIT(ATH12K_FLAG_RESET_ANSWERED));
++	} while (!try_cmpxchg(&ab->dev_flags, &old, new));
++
++	return true;
++}
++
+ static void ath12k_core_reset(struct work_struct *work)
+ {
+ 	struct ath12k_base *ab = container_of(work, struct ath12k_base, reset_work);
+@@ -1889,11 +1913,10 @@ static void ath12k_core_reset(struct wor
+ 	 * since. Resetting the device again would tear down a recovery in
+ 	 * progress or a group that is already up.
+ 	 */
+-	if (!test_and_clear_bit(ATH12K_FLAG_RESET_REQUESTED, &ab->dev_flags)) {
++	if (!ath12k_core_reset_take_request(ab)) {
+ 		ath12k_dbg(ab, ATH12K_DBG_BOOT, "no reset requested, stale reset work\n");
+ 		return;
+ 	}
+-	clear_bit(ATH12K_FLAG_RESET_ANSWERED, &ab->dev_flags);
+ 
+ 	/*
+ 	 * The MHI RDDM callback tests UNREGISTERING without ag->mutex, so a

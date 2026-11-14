@@ -1,0 +1,177 @@
+From: CoolFreeze23 <34906576+CoolFreeze23@users.noreply.github.com>
+Date: Tue, 20 Oct 2026 12:00:00 +0900
+Subject: [PATCH] wifi: ath12k: recover a crash during the reconfig of a recovery
+
+Recovery success is reported at the end of the mac80211 reconfig, which
+does not look at the firmware. A device that crashes again during that
+reconfig gets a reset run that finds the previous reset still counted,
+waits on reset_complete, is woken by the old reconfig's success and
+returned "to skip reset": the new crash was never reset. If instead the
+new reset had already set is_reset, the old reconfig's success cleared
+it for the newer reset.
+
+- ATH12K_FLAG_RESET_ANSWERED: set by the group power-up when it boots a
+  device, cleared when a reset run consumes its request. A run whose
+  wait is completed skips only if its request was answered by such a
+  boot; otherwise the device crashed since and is reset now.
+- reset_gen / boot_gen / ready_gen (under base_lock): reset_gen is
+  bumped where is_reset is set, the recovery power-up copies it to
+  boot_gen, and ath12k_core_to_group_ref_get(), called from
+  ath12k_core_start(), copies boot_gen to ready_gen. The reconfig
+  complete handler reports success only when ready_gen == reset_gen,
+  i.e. when the firmware that has started was booted for the current
+  reset.
+---
+diff --git a/drivers/net/wireless/ath/ath12k/core.c b/drivers/net/wireless/ath/ath12k/core.c
+--- a/drivers/net/wireless/ath/ath12k/core.c
++++ b/drivers/net/wireless/ath/ath12k/core.c
+@@ -700,6 +700,10 @@ void ath12k_core_to_group_ref_get(struct
+ 
+ 	ab->recovery_booting = false;
+ 
++	spin_lock_bh(&ab->base_lock);
++	ab->ready_gen = ab->boot_gen;
++	spin_unlock_bh(&ab->base_lock);
++
+ 	if (ab->hw_group_ref) {
+ 		ath12k_dbg(ab, ATH12K_DBG_BOOT, "core already attached to group %d\n",
+ 			   ag->id);
+@@ -1817,6 +1821,11 @@ static void ath12k_core_group_recovery_p
+ 		 * far: a reset work still queued for it is stale
+ 		 */
+ 		clear_bit(ATH12K_FLAG_RESET_REQUESTED, &ab->dev_flags);
++		set_bit(ATH12K_FLAG_RESET_ANSWERED, &ab->dev_flags);
++
++		spin_lock_bh(&ab->base_lock);
++		ab->boot_gen = ab->reset_gen;
++		spin_unlock_bh(&ab->base_lock);
+ 
+ 		ret = ath12k_hif_power_up(ab);
+ 		if (ret) {
+@@ -1884,6 +1893,7 @@ static void ath12k_core_reset(struct wor
+ 		ath12k_dbg(ab, ATH12K_DBG_BOOT, "no reset requested, stale reset work\n");
+ 		return;
+ 	}
++	clear_bit(ATH12K_FLAG_RESET_ANSWERED, &ab->dev_flags);
+ 
+ 	/*
+ 	 * The MHI RDDM callback tests UNREGISTERING without ag->mutex, so a
+@@ -1929,13 +1939,30 @@ static void ath12k_core_reset(struct wor
+ 		reinit_completion(&ab->reset_complete);
+ 		time_left = wait_for_completion_timeout(&ab->reset_complete,
+ 							ATH12K_RESET_TIMEOUT_HZ);
+-		if (time_left) {
++		if (time_left &&
++		    test_and_clear_bit(ATH12K_FLAG_RESET_ANSWERED, &ab->dev_flags)) {
++			/* the recovery that just completed booted this device
++			 * after the request: nothing left to reset
++			 */
+ 			ath12k_dbg(ab, ATH12K_DBG_BOOT, "to skip reset\n");
+ 			atomic_dec(&ab->reset_count);
+ 			ath12k_core_reset_skipped(ab);
+ 			return;
+ 		}
+ 
++		if (time_left) {
++			/*
++			 * The previous recovery completed, but this device was
++			 * not booted since the request: it crashed again, for
++			 * example during the mac80211 reconfig at the end of that
++			 * recovery. Reset it now; this is not a failed recovery,
++			 * and reset_count already counts only this run.
++			 */
++			ath12k_dbg(ab, ATH12K_DBG_BOOT,
++				   "previous reset completed, crashed since: reset again\n");
++			goto reset;
++		}
++
+ 		ab->reset_fail_timeout = jiffies + ATH12K_RESET_FAIL_TIMEOUT_HZ;
+ 		/* Record the continuous recovery fail count when recovery failed*/
+ 		fail_cont_count = atomic_inc_return(&ab->fail_cont_count);
+@@ -1949,9 +1976,13 @@ static void ath12k_core_reset(struct wor
+ 		atomic_dec(&ab->reset_count);
+ 	}
+ 
++reset:
+ 	ath12k_dbg(ab, ATH12K_DBG_BOOT, "reset starting\n");
+ 
++	spin_lock_bh(&ab->base_lock);
++	ab->reset_gen++;
+ 	ab->is_reset = true;
++	spin_unlock_bh(&ab->base_lock);
+ 	atomic_set(&ab->recovery_count, 0);
+ 
+ 	ath12k_coredump_collect(ab);
+diff --git a/drivers/net/wireless/ath/ath12k/core.h b/drivers/net/wireless/ath/ath12k/core.h
+--- a/drivers/net/wireless/ath/ath12k/core.h
++++ b/drivers/net/wireless/ath/ath12k/core.h
+@@ -289,6 +289,10 @@ enum ath12k_dev_flags {
+ 	 * power-up that booted the device, has consumed the request yet
+ 	 */
+ 	ATH12K_FLAG_RESET_REQUESTED,
++	/* a group power-up booted the device after its reset work consumed
++	 * the last request: that boot answered the request
++	 */
++	ATH12K_FLAG_RESET_ANSWERED,
+ };
+ 
+ struct ath12k_tx_conf {
+@@ -1111,6 +1115,15 @@ struct ath12k_base {
+ 	bool recovery_powered_down;
+ 	bool recovery_wait_power_down;
+ 	bool recovery_booting;
++	/* protected by base_lock. reset_gen counts resets (bumped where
++	 * is_reset is set); a recovery power-up records it in boot_gen, and
++	 * ath12k_core_to_group_ref_get() copies boot_gen to ready_gen.
++	 * ready_gen == reset_gen: the firmware that has started was booted for
++	 * the current reset, the only one whose success may be reported.
++	 */
++	u32 reset_gen;
++	u32 boot_gen;
++	u32 ready_gen;
+ 	struct completion reset_complete;
+ 	/* continuous recovery fail count */
+ 	atomic_t fail_cont_count;
+diff --git a/drivers/net/wireless/ath/ath12k/mac.c b/drivers/net/wireless/ath/ath12k/mac.c
+--- a/drivers/net/wireless/ath/ath12k/mac.c
++++ b/drivers/net/wireless/ath/ath12k/mac.c
+@@ -13825,13 +13825,32 @@ ath12k_mac_op_reconfig_complete(struct i
+ 			 * the recovery has to be done for each radio
+ 			 */
+ 			if (recovery_count == ab->num_radios) {
+-				/* not below 0: see ath12k_core_reset() */
+-				atomic_dec_if_positive(&ab->reset_count);
+-				ab->is_reset = false;
+-				atomic_set(&ab->fail_cont_count, 0);
+-				clear_bit(ATH12K_FLAG_RECOVERY, &ab->dev_flags);
+-				complete(&ab->reset_complete);
+-				ath12k_dbg(ab, ATH12K_DBG_BOOT, "reset success\n");
++				bool current_reset;
++
++				/*
++				 * Only if the firmware that has started was booted
++				 * for the current reset: if the device crashed
++				 * during this reconfig and a newer reset has started
++				 * (or its boot has not started yet), that reset
++				 * reports its own success, and is_reset must stay
++				 * set for it.
++				 */
++				spin_lock_bh(&ab->base_lock);
++				current_reset = ab->is_reset &&
++						ab->ready_gen == ab->reset_gen;
++				if (current_reset) {
++					/* not below 0: see ath12k_core_reset() */
++					atomic_dec_if_positive(&ab->reset_count);
++					ab->is_reset = false;
++					atomic_set(&ab->fail_cont_count, 0);
++					clear_bit(ATH12K_FLAG_RECOVERY, &ab->dev_flags);
++					complete(&ab->reset_complete);
++				}
++				spin_unlock_bh(&ab->base_lock);
++
++				ath12k_dbg(ab, ATH12K_DBG_BOOT, "%s\n",
++					   current_reset ? "reset success" :
++					   "reconfig of an older reset, newer reset in progress");
+ 			}
+ 		}
+ 

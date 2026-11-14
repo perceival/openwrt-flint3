@@ -1,0 +1,55 @@
+From: CoolFreeze23 <34906576+CoolFreeze23@users.noreply.github.com>
+Date: Tue, 20 Oct 2026 12:00:00 +0900
+Subject: [PATCH] wifi: ath12k: do not leave a freed REO queue published on tid setup failure
+
+When ath12k_dp_prepare_reo_update_elem() fails in
+ath12k_dp_rx_peer_tid_setup(), the descriptor is freed through the copy
+in rx_tid->qbuf, but the TID stays marked active and
+dp_peer->reoq_bufs[tid] still points at the freed memory. The next
+ADDBA for that TID takes the "already set up" branch and programs the
+freed DMA address into REO (UPDATE_RX_QUEUE) and, on IPQ5332, into
+firmware (WMI_PEER_REORDER_QUEUE_SETUP). The hardware then writes into
+a recycled object for the rest of the association.
+
+Clear the active bit, and free the buffer and its per-peer slot only if
+this call allocated it. The same code is in mainline.
+---
+diff --git a/drivers/net/wireless/ath/ath12k/dp_rx.c b/drivers/net/wireless/ath/ath12k/dp_rx.c
+--- a/drivers/net/wireless/ath/ath12k/dp_rx.c
++++ b/drivers/net/wireless/ath/ath12k/dp_rx.c
+@@ -607,6 +607,7 @@ int ath12k_dp_rx_peer_tid_setup(struct ath12k *ar, const u8 *peer_mac, int vdev_
+ 	struct ath12k_dp_link_peer *peer;
+ 	struct ath12k_dp_rx_tid *rx_tid;
+ 	dma_addr_t paddr_aligned;
++	bool new_qbuf;
+ 	int ret;
+ 
+ 	spin_lock_bh(&dp->dp_lock);
+@@ -669,6 +670,7 @@ int ath12k_dp_rx_peer_tid_setup(struct ath12k *ar, const u8 *peer_mac, int vdev_
+ 
+ 	rx_tid->ba_win_sz = ba_win_sz;
+ 
++	new_qbuf = !peer->dp_peer->reoq_bufs[tid].vaddr;
+ 	ret = ath12k_dp_arch_rx_assign_reoq(dp, peer->dp_peer, rx_tid, ssn, pn_type);
+ 	if (ret) {
+ 		spin_unlock_bh(&dp->dp_lock);
+@@ -686,7 +688,18 @@ int ath12k_dp_rx_peer_tid_setup(struct ath12k *ar, const u8 *peer_mac, int vdev_
+ 	ret = ath12k_dp_prepare_reo_update_elem(dp, peer, rx_tid);
+ 	if (ret) {
+ 		ath12k_warn(ab, "failed to alloc update_rxq_list for rx tid %u\n", tid);
+-		ath12k_dp_rx_tid_cleanup(ab, &rx_tid->qbuf);
++		/* Nothing has handed the queue to hardware yet.  Undo the
++		 * activation, and free the buffer only if this call allocated
++		 * it.  rx_tid->qbuf is a copy of dp_peer->reoq_bufs[tid], so
++		 * clear that slot too, or the next setup of this TID programs
++		 * the freed buffer into REO.
++		 */
++		peer->rx_tid_active_bitmask &= ~(1 << tid);
++		if (new_qbuf) {
++			ath12k_dp_rx_tid_cleanup(ab, &rx_tid->qbuf);
++			memset(&peer->dp_peer->reoq_bufs[tid], 0,
++			       sizeof(peer->dp_peer->reoq_bufs[tid]));
++		}
+ 		spin_unlock_bh(&dp->dp_lock);
+ 		return ret;
+ 	}

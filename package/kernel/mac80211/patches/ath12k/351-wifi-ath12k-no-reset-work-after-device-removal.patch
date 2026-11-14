@@ -1,0 +1,99 @@
+From: CoolFreeze23 <34906576+CoolFreeze23@users.noreply.github.com>
+Date: Tue, 20 Oct 2026 12:00:00 +0900
+Subject: [PATCH] wifi: ath12k: no reset work after device removal
+
+ath12k_ahb_remove_prepare() never cancelled reset_work. A reset work
+that was queued, or sleeping in its 20 s wait, during rmmod then ran
+after ath12k_core_deinit() had cleared ab->ag (and freed the group), and
+locked ab->ag->mutex. Set UNREGISTERING under ag->mutex, which the group
+recovery paths hold while they test it and queue reset_work, then cancel
+reset_work. Do the same in ath12k_pci_remove(), which cancelled the work
+but set the bit without the mutex, so a partner could still queue it
+after the cancel. The MHI RDDM callback tests the bit without the mutex;
+355 handles a run it queues after the cancel.
+
+The group power-up now does nothing once the group is being
+unregistered and skips devices being removed, instead of booting them
+again during removal. The early returns of the reset work lock the group
+mutex only when a recovery is actually waiting for this device, as
+before 348.
+---
+diff --git a/drivers/net/wireless/ath/ath12k/ahb.c b/drivers/net/wireless/ath/ath12k/ahb.c
+--- a/drivers/net/wireless/ath/ath12k/ahb.c
++++ b/drivers/net/wireless/ath/ath12k/ahb.c
+@@ -1396,7 +1396,17 @@ static void ath12k_ahb_remove_prepare(st
+ 			ath12k_warn(ab, "failed to receive recovery response completion\n");
+ 	}
+ 
++	/*
++	 * Under ag->mutex, which the group recovery paths hold while they
++	 * test this bit and queue reset_work, so they cannot queue it after
++	 * the cancel below. A reset work must not outlive the device: it
++	 * locks ab->ag->mutex, and ath12k_core_deinit() clears ab->ag.
++	 */
++	mutex_lock(&ab->ag->mutex);
+ 	set_bit(ATH12K_FLAG_UNREGISTERING, &ab->dev_flags);
++	mutex_unlock(&ab->ag->mutex);
++
++	cancel_work_sync(&ab->reset_work);
+ 	cancel_work_sync(&ab->restart_work);
+ 	cancel_work_sync(&ab->qmi.event_work);
+ }
+diff --git a/drivers/net/wireless/ath/ath12k/core.c b/drivers/net/wireless/ath/ath12k/core.c
+--- a/drivers/net/wireless/ath/ath12k/core.c
++++ b/drivers/net/wireless/ath/ath12k/core.c
+@@ -1765,7 +1765,9 @@ static void ath12k_core_group_recovery_p
+ 
+ 	lockdep_assert_held(&ag->mutex);
+ 
+-	if (ag->num_started > 0)
++	/* nothing to boot while the group is being torn down */
++	if (ag->num_started > 0 ||
++	    test_bit(ATH12K_GROUP_FLAG_UNREGISTER, &ag->flags))
+ 		return;
+ 
+ 	for (i = 0; i < ag->num_devices; i++) {
+@@ -1804,9 +1806,11 @@ static void ath12k_core_group_recovery_p
+ 	for (i = 0; i < ag->num_devices; i++) {
+ 		ab = ag->ab[i];
+ 		/* A device that did not power down for this recovery is still
+-		 * up or has given up; powering it up would boot it twice.
++		 * up or has given up; powering it up would boot it twice. A
++		 * device being removed is not booted again.
+ 		 */
+-		if (!ab || !ab->recovery_powered_down)
++		if (!ab || !ab->recovery_powered_down ||
++		    test_bit(ATH12K_FLAG_UNREGISTERING, &ab->dev_flags))
+ 			continue;
+ 		ab->recovery_powered_down = false;
+ 		/* this boot answers every reset requested for the device so
+@@ -1843,6 +1847,15 @@ static void ath12k_core_reset_skipped(st
+ {
+ 	struct ath12k_hw_group *ag = ab->ag;
+ 
++	/*
++	 * The flag is set under ag->mutex before the work is queued, so a
++	 * run that reads it clear here is followed by another run that sees
++	 * it set. Not touching ag otherwise keeps these early returns as
++	 * they were before group recovery tracked them.
++	 */
++	if (!READ_ONCE(ab->recovery_wait_power_down))
++		return;
++
+ 	mutex_lock(&ag->mutex);
+ 	if (ab->recovery_wait_power_down) {
+ 		WRITE_ONCE(ab->recovery_wait_power_down, false);
+diff --git a/drivers/net/wireless/ath/ath12k/pci.c b/drivers/net/wireless/ath/ath12k/pci.c
+--- a/drivers/net/wireless/ath/ath12k/pci.c
++++ b/drivers/net/wireless/ath/ath12k/pci.c
+@@ -1710,7 +1710,10 @@ static void ath12k_pci_remove(struct pci
+ 		goto qmi_fail;
+ 	}
+ 
++	/* see ath12k_ahb_remove_prepare(): no reset work queued after cancel */
++	mutex_lock(&ab->ag->mutex);
+ 	set_bit(ATH12K_FLAG_UNREGISTERING, &ab->dev_flags);
++	mutex_unlock(&ab->ag->mutex);
+ 
+ 	cancel_work_sync(&ab->reset_work);
+ 	cancel_work_sync(&ab->dump_work);
