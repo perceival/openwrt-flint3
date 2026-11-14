@@ -289,7 +289,7 @@ Signed-off-by: Kamil Bienkiewicz <perceivalpercy@gmail.com>
  #include <linux/list.h>
  #include <linux/mutex.h>
  #include <linux/netdevice.h>
-@@ -164,6 +197,8 @@
+@@ -164,6 +197,8 @@ struct ppe_offload_flow_entry {
  	u32 nexthop_index;
  	u32 pub_ip_index;
  	bool flow_valid;
@@ -298,7 +298,7 @@ Signed-off-by: Kamil Bienkiewicz <perceivalpercy@gmail.com>
  	/* Hardware counters are cumulative and not clear-on-read, so keep the
  	 * previous reading and report the difference. lastused is refreshed only
  	 * when the packet count actually moves, which is what tells the flowtable
-@@ -265,8 +300,8 @@
+@@ -265,8 +300,8 @@ static __be32 ppe_offload_apply_ip4_mang
   * layout) and so can be covered by a single mangle at offset 0.
   * Seeded from the original match ports, not zero: unlike the Ethernet
   * header, only one of source/dest is ever actually being rewritten
@@ -309,7 +309,7 @@ Signed-off-by: Kamil Bienkiewicz <perceivalpercy@gmail.com>
   */
  struct ppe_offload_l4_ports {
  	__be16 source;
-@@ -303,8 +338,8 @@
+@@ -303,8 +338,8 @@ static int ppe_offload_apply_l4_mangle(s
   * compiles to nothing and leaves "offload silently does not happen"
   * indistinguishable from "offload is not enabled" -- that cost a full
   * hardware-test cycle to diagnose. But a ratelimited print is far too loud
@@ -320,7 +320,7 @@ Signed-off-by: Kamil Bienkiewicz <perceivalpercy@gmail.com>
   * flow_offload_refresh() retries an unoffloaded flow about once a second for
   * as long as it lives. A handful of ordinary connections would sit at the
   * ratelimit ceiling forever and push everything else out of the ring buffer.
-@@ -319,6 +354,228 @@
+@@ -319,6 +354,228 @@ static int ppe_offload_apply_l4_mangle(s
  			 ##__VA_ARGS__); \
  	   pr_debug("ppe_offload: declined - " fmt "\n", ##__VA_ARGS__); -EOPNOTSUPP; })
  
@@ -549,7 +549,7 @@ Signed-off-by: Kamil Bienkiewicz <perceivalpercy@gmail.com>
  /* Resolve the device a flow's packets arrive on down to the EDMA port
   * whose ingress L3 interface hardware will match against, mirroring
   * the redirect-target resolution done for egress. A VLAN upper or a
-@@ -366,6 +623,7 @@
+@@ -366,6 +623,7 @@ static int ppe_offload_flow_replace(stru
  {
  	struct ppe_offload_l4_ports l4 = {};
  	struct ppe_offload_eth_mangle eth = {};
@@ -557,7 +557,7 @@ Signed-off-by: Kamil Bienkiewicz <perceivalpercy@gmail.com>
  	struct flow_rule *rule = flow_cls_offload_flow_rule(cls);
  	struct ppe_offload_flow_entry *entry;
  	struct ppe_host_ipv4_entry host_ipv4;
-@@ -381,11 +639,16 @@
+@@ -381,11 +639,16 @@ static int ppe_offload_flow_replace(stru
  	__be16 match_sport, match_dport;
  	u32 flow_words[PPE_FLOW_TBL_ENTRY_WORDS];
  	u32 host_words[PPE_HOST_TBL_IPV4_ENTRY_WORDS];
@@ -575,7 +575,7 @@ Signed-off-by: Kamil Bienkiewicz <perceivalpercy@gmail.com>
  	u8 ip_proto;
  	int action;
  	const char *stage = NULL;
-@@ -412,6 +675,13 @@
+@@ -412,6 +675,13 @@ static int ppe_offload_flow_replace(stru
  			return ppe_offload_decline("addr_type=%d not ipv4", ctrl.key->addr_type);
  
  		flow_rule_match_basic(rule, &basic);
@@ -589,7 +589,7 @@ Signed-off-by: Kamil Bienkiewicz <perceivalpercy@gmail.com>
  		switch (basic.key->ip_proto) {
  		case IPPROTO_TCP:
  			/* Fail closed. Keyed on the protocol, not on the presence of
-@@ -496,17 +766,84 @@
+@@ -496,17 +766,84 @@ static int ppe_offload_flow_replace(stru
  		return ppe_offload_decline("ingress ifindex %d not an exact match",
  					    meta.key->ingress_ifindex);
  
@@ -674,7 +674,7 @@ Signed-off-by: Kamil Bienkiewicz <perceivalpercy@gmail.com>
  	if (ingress_l3_if == PPE_OFFLOAD_L3_IF_NONE)
  		return ppe_offload_decline("ingress ifindex %d not on an edma netdev",
  					    meta.key->ingress_ifindex);
-@@ -574,6 +911,14 @@
+@@ -574,6 +911,14 @@ static int ppe_offload_flow_replace(stru
  			vlan_push_seen = true;
  			vlan_push_vid = act->vlan.vid;
  			break;
@@ -689,7 +689,7 @@ Signed-off-by: Kamil Bienkiewicz <perceivalpercy@gmail.com>
  		default:
  			return ppe_offload_decline("action id=%d unsupported", act->id);
  		}
-@@ -582,6 +927,10 @@
+@@ -582,6 +927,10 @@ static int ppe_offload_flow_replace(stru
  	if (!odev || !eth.seen)
  		return ppe_offload_decline("odev=%d eth.seen=%d", !!odev, eth.seen);
  
@@ -700,7 +700,7 @@ Signed-off-by: Kamil Bienkiewicz <perceivalpercy@gmail.com>
  	/* Hardware checks each packet's L3 length against the flow's
  	 * PMTU and redirects oversized ones to the CPU. Take it from the
  	 * redirect target itself (before any VLAN unwrap below), as the
-@@ -630,47 +979,81 @@
+@@ -630,47 +979,81 @@ static int ppe_offload_flow_replace(stru
  		odev = vlan_dev_real_dev(odev);
  	}
  
@@ -810,7 +810,7 @@ Signed-off-by: Kamil Bienkiewicz <perceivalpercy@gmail.com>
  	 */
  	if (ingress_l3_if == port_priv->l3_if_index)
  		return ppe_offload_decline("odev=%s hairpin to its own ingress port",
-@@ -680,16 +1067,21 @@
+@@ -684,16 +1067,21 @@ static int ppe_offload_flow_replace(stru
  		goto unlock;
  	}
  
@@ -840,7 +840,7 @@ Signed-off-by: Kamil Bienkiewicz <perceivalpercy@gmail.com>
  	 */
  	memset(&nexthop, 0, sizeof(nexthop));
  	nexthop.port_valid = true;
-@@ -701,12 +1093,15 @@
+@@ -705,12 +1093,15 @@ static int ppe_offload_flow_replace(stru
  	 */
  	nexthop.port = port_priv->ppe_port->port_id;
  	nexthop.post_l3_if = port_priv->l3_if_index;
@@ -861,7 +861,7 @@ Signed-off-by: Kamil Bienkiewicz <perceivalpercy@gmail.com>
  
  	ret = ppe_nexthop_pool_get_and_ref(priv->ppe_dev, &priv->nexthop_pool, &nexthop,
  					    &nexthop_index);
-@@ -715,12 +1110,24 @@
+@@ -719,12 +1110,24 @@ static int ppe_offload_flow_replace(stru
  		goto deref_pub_ip;
  	}
  
@@ -889,7 +889,7 @@ Signed-off-by: Kamil Bienkiewicz <perceivalpercy@gmail.com>
  	host_ipv4.ip_addr = match_src;
  	ppe_host_ipv4_entry_encode(&host_ipv4, host_words);
  
-@@ -736,9 +1143,9 @@
+@@ -740,9 +1143,9 @@ static int ppe_offload_flow_replace(stru
  	flow_ipv4.host_addr_is_dst = false;
  	flow_ipv4.host_addr_index = host_index;
  	flow_ipv4.protocol = ip_proto;
@@ -901,7 +901,7 @@ Signed-off-by: Kamil Bienkiewicz <perceivalpercy@gmail.com>
  	flow_ipv4.match_ip = match_dst;
  	flow_ipv4.match_sport = be16_to_cpu(match_sport);
  	flow_ipv4.match_dport = be16_to_cpu(match_dport);
-@@ -780,6 +1187,7 @@
+@@ -784,6 +1187,7 @@ static int ppe_offload_flow_replace(stru
  	entry->host_index = host_index;
  	entry->nexthop_index = nexthop_index;
  	entry->pub_ip_index = pub_ip_index;
@@ -909,7 +909,7 @@ Signed-off-by: Kamil Bienkiewicz <perceivalpercy@gmail.com>
  	entry->flow_valid = true;
  
  	ret = rhashtable_insert_fast(&priv->flow_table, &entry->node, ppe_offload_flow_ht_params);
-@@ -793,9 +1201,10 @@
+@@ -797,9 +1201,10 @@ static int ppe_offload_flow_replace(stru
  
  	mutex_unlock(&priv->lock);
  
@@ -923,7 +923,7 @@ Signed-off-by: Kamil Bienkiewicz <perceivalpercy@gmail.com>
  
  	return 0;
  
-@@ -808,20 +1217,34 @@
+@@ -812,20 +1217,34 @@ deref_host:
  deref_nexthop:
  	ppe_nexthop_pool_deref(priv->ppe_dev, &priv->nexthop_pool, nexthop_index);
  deref_pub_ip:
@@ -967,7 +967,7 @@ Signed-off-by: Kamil Bienkiewicz <perceivalpercy@gmail.com>
  
  	return ret;
  }
-@@ -860,7 +1283,8 @@
+@@ -864,7 +1283,8 @@ static int ppe_offload_flow_destroy(stru
  		ppe_flow_entry_del(priv->ppe_dev, entry->flow_index);
  	ppe_host_pool_deref(priv->ppe_dev, &priv->host_pool, entry->host_index);
  	ppe_nexthop_pool_deref(priv->ppe_dev, &priv->nexthop_pool, entry->nexthop_index);
@@ -977,7 +977,7 @@ Signed-off-by: Kamil Bienkiewicz <perceivalpercy@gmail.com>
  
  	mutex_unlock(&priv->lock);
  
-@@ -1496,7 +1920,8 @@
+@@ -1500,7 +1920,8 @@ static void ppe_offload_flow_free_fn(voi
  		ppe_flow_entry_del(priv->ppe_dev, entry->flow_index);
  	ppe_host_pool_deref(priv->ppe_dev, &priv->host_pool, entry->host_index);
  	ppe_nexthop_pool_deref(priv->ppe_dev, &priv->nexthop_pool, entry->nexthop_index);
@@ -989,7 +989,7 @@ Signed-off-by: Kamil Bienkiewicz <perceivalpercy@gmail.com>
  
 --- a/drivers/net/ethernet/qualcomm/ppe/edma_port.c
 +++ b/drivers/net/ethernet/qualcomm/ppe/edma_port.c
-@@ -137,8 +137,10 @@
+@@ -137,8 +137,10 @@ static u16 __maybe_unused edma_port_sele
   * the (non-conduit) WAN port still reaches the CPU intact (ARP requests to
   * the WAN address answered 10/10), and a VLAN-tagged WAN (wan.10) behaves
   * exactly as under the 802.1Q tagger. With the ingress C-TPID at 0x0000 an
@@ -1002,7 +1002,7 @@ Signed-off-by: Kamil Bienkiewicz <perceivalpercy@gmail.com>
   */
  #if IS_ENABLED(CONFIG_NET_DSA)
  /* PPE port that owns the chip-wide alias, or -1. One PPE per SoC. */
-@@ -151,6 +153,10 @@
+@@ -151,6 +153,10 @@ static int edma_port_parser_alias_progra
  	u32 in_tpid, eg_tpid, cpu_eg;
  	int ret;
  
@@ -1013,7 +1013,7 @@ Signed-off-by: Kamil Bienkiewicz <perceivalpercy@gmail.com>
  	if (rtl8_4) {
  		in_tpid = FIELD_PREP(PPE_VLAN_TPID_STAG, ETH_P_REALTEK) |
  			  FIELD_PREP(PPE_VLAN_TPID_CTAG, 0);
-@@ -191,13 +197,44 @@
+@@ -191,13 +197,44 @@ static int edma_port_parser_alias_progra
  		return ret;
  
  	/* PPE port 0 is the CPU port (EDMA_CPU_PORT_PROFILE_ID). */
@@ -1063,7 +1063,7 @@ Signed-off-by: Kamil Bienkiewicz <perceivalpercy@gmail.com>
  }
  #endif
  
-@@ -213,15 +250,6 @@
+@@ -213,15 +250,6 @@ static int edma_port_parser_role(struct
  				  core ? PPE_PORT_PARSING_PORT_ROLE : 0);
  }
  
@@ -1079,7 +1079,7 @@ Signed-off-by: Kamil Bienkiewicz <perceivalpercy@gmail.com>
  /* Called from ndo_open (before the link comes up) and again from the
   * netdevice notifier whenever DSA may have attached or changed the tagger
   * behind an already-running port. Idempotent: nothing is written unless
-@@ -257,7 +285,7 @@
+@@ -257,7 +285,7 @@ static int edma_port_parser_dsa_setup(st
  		ret = edma_port_parser_alias_program(ppe_port, false);
  		if (ret)
  			return ret;
@@ -1088,7 +1088,7 @@ Signed-off-by: Kamil Bienkiewicz <perceivalpercy@gmail.com>
  	}
  
  	if (dsa) {
-@@ -278,7 +306,7 @@
+@@ -278,7 +306,7 @@ static int edma_port_parser_dsa_setup(st
  			return ret;
  		}
  
@@ -1097,7 +1097,7 @@ Signed-off-by: Kamil Bienkiewicz <perceivalpercy@gmail.com>
  	}
  #endif
  
-@@ -287,7 +315,7 @@
+@@ -287,7 +315,7 @@ static int edma_port_parser_dsa_setup(st
  #if IS_ENABLED(CONFIG_NET_DSA)
  		if (edma_parser_alias_owner == ppe_port->port_id) {
  			edma_port_parser_alias_program(ppe_port, false);
@@ -1106,7 +1106,7 @@ Signed-off-by: Kamil Bienkiewicz <perceivalpercy@gmail.com>
  		}
  #endif
  		return ret;
-@@ -314,7 +342,7 @@
+@@ -314,7 +342,7 @@ static void edma_port_parser_dsa_teardow
  		ret = edma_port_parser_alias_program(ppe_port, false);
  		if (ret)
  			netdev_err(netdev, "failed to restore the PPE parser TPIDs: %d\n", ret);
@@ -1117,7 +1117,7 @@ Signed-off-by: Kamil Bienkiewicz <perceivalpercy@gmail.com>
  
 --- a/drivers/net/ethernet/qualcomm/ppe/edma_port.h
 +++ b/drivers/net/ethernet/qualcomm/ppe/edma_port.h
-@@ -93,6 +93,28 @@
+@@ -93,6 +93,28 @@ struct edma_port_pcpu_stats {
   * packet out through this port, and by a flow entry's src_l3_if when
   * the packet arrives on it.
   */
@@ -1146,7 +1146,7 @@ Signed-off-by: Kamil Bienkiewicz <perceivalpercy@gmail.com>
  struct edma_port_priv {
  	struct ppe_port *ppe_port;
  	struct net_device *netdev;
-@@ -106,4 +128,12 @@
+@@ -106,4 +128,12 @@ struct edma_port_priv {
  void edma_port_destroy(struct ppe_port *port);
  int edma_port_setup(struct ppe_port *port);
  bool edma_port_is_edma_netdev(const struct net_device *netdev);
@@ -1161,7 +1161,7 @@ Signed-off-by: Kamil Bienkiewicz <perceivalpercy@gmail.com>
  #endif
 --- a/drivers/net/ethernet/qualcomm/Kconfig
 +++ b/drivers/net/ethernet/qualcomm/Kconfig
-@@ -64,6 +64,8 @@
+@@ -64,6 +64,8 @@ config QCOM_PPE
  	tristate "Qualcomm Technologies, Inc. PPE Ethernet support"
  	depends on COMMON_CLK && HAS_IOMEM && OF
  	depends on NET_DSA || NET_DSA=n

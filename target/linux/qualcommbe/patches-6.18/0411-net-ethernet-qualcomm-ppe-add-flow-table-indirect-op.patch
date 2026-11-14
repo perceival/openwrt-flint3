@@ -37,17 +37,17 @@ Signed-off-by: Kamil Bienkiewicz <perceivalpercy@gmail.com>
 +++ b/drivers/net/ethernet/qualcomm/ppe/Makefile
 @@ -4,7 +4,7 @@
  #
-
+ 
  obj-$(CONFIG_QCOM_PPE) += qcom-ppe.o
 -qcom-ppe-objs := ppe.o ppe_config.o ppe_debugfs.o ppe_port.o ppe_api.o
 +qcom-ppe-objs := ppe.o ppe_config.o ppe_debugfs.o ppe_port.o ppe_api.o ppe_flow.o
-
+ 
  #EDMA
  qcom-ppe-objs += edma.o edma_cfg_rx.o edma_cfg_tx.o edma_debugfs.o edma_port.o edma_rx.o edma_tx.o edma_ethtool.o
 --- a/drivers/net/ethernet/qualcomm/ppe/ppe_regs.h
 +++ b/drivers/net/ethernet/qualcomm/ppe/ppe_regs.h
 @@ -1113,4 +1113,29 @@
-
+ 
  #define PPE_P1_MULTICAST_DROP_CNT_TBL_ADDR	\
  	(PPE_P0_MULTICAST_DROP_CNT_TBL_ADDR + PPE_MULTICAST_QUEUE_PORT_ADDR_INC)
 +

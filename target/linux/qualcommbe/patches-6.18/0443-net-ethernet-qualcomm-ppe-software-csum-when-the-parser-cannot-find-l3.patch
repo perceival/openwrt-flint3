@@ -80,7 +80,7 @@ Signed-off-by: Kamil Bienkiewicz <perceivalpercy@gmail.com>
  #include <linux/net.h>
  #include <linux/netdevice.h>
  #include <linux/of_net.h>
-@@ -191,10 +192,97 @@
+@@ -191,10 +192,97 @@ static int edma_port_change_mtu(struct n
  	return 0;
  }
  

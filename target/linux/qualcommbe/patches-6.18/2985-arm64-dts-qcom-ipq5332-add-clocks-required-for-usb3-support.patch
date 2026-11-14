@@ -15,11 +15,9 @@ Signed-off-by: George Moussalem <george.moussalem@outlook.com>
  arch/arm64/boot/dts/qcom/ipq5332.dtsi | 8 ++++++--
  1 file changed, 6 insertions(+), 2 deletions(-)
 
-diff --git a/arch/arm64/boot/dts/qcom/ipq5332.dtsi b/arch/arm64/boot/dts/qcom/ipq5332.dtsi
-index 1dd1fe76272b..382691a77d61 100644
 --- a/arch/arm64/boot/dts/qcom/ipq5332.dtsi
 +++ b/arch/arm64/boot/dts/qcom/ipq5332.dtsi
-@@ -515,10 +515,14 @@ usb: usb@8a00000 {
+@@ -727,10 +727,14 @@
  
  			clocks = <&gcc GCC_USB0_MASTER_CLK>,
  				 <&gcc GCC_USB0_SLEEP_CLK>,
@@ -36,6 +34,3 @@ index 1dd1fe76272b..382691a77d61 100644
  
  			resets = <&gcc GCC_USB_BCR>;
  
-
--- 
-2.53.0

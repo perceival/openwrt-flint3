@@ -24,7 +24,7 @@ Signed-off-by: Kamil Bienkiewicz <perceivalpercy@gmail.com>
 ---
 --- a/drivers/net/ethernet/qualcomm/ppe/ppe_offload.c
 +++ b/drivers/net/ethernet/qualcomm/ppe/ppe_offload.c
-@@ -864,6 +864,15 @@
+@@ -864,6 +864,15 @@ static void ppe_offload_flow_disown(stru
   */
  #define PPE_OFFLOAD_FLOW_FULL_QUIET	(60 * HZ)
  
@@ -40,7 +40,7 @@ Signed-off-by: Kamil Bienkiewicz <perceivalpercy@gmail.com>
  /* Hardware refuses a hash-mode add (-ENOSPC) when every way of the key's
   * bucket is taken. Report it with the table's occupancy, counted from the
   * driver's own slot bookkeeping, so a full table can be told apart from a
-@@ -871,8 +880,7 @@
+@@ -871,8 +880,7 @@ static void ppe_offload_flow_disown(stru
   */
  static void ppe_offload_flow_tbl_full(struct ppe_offload_priv *priv)
  {
@@ -50,7 +50,7 @@ Signed-off-by: Kamil Bienkiewicz <perceivalpercy@gmail.com>
  	unsigned int i, used = 0;
  
  	priv->flow_full_last = jiffies ?: 1;
-@@ -1470,8 +1478,18 @@
+@@ -1470,8 +1478,18 @@ static int ppe_offload_flow_replace(stru
  			stage = "exists";
  			goto unlock;
  		}

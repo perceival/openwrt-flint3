@@ -16,11 +16,9 @@ Signed-off-by: George Moussalem <george.moussalem@outlook.com>
  .../devicetree/bindings/usb/qcom,snps-dwc3.yaml      | 20 +++++++++++++++++++-
  1 file changed, 19 insertions(+), 1 deletion(-)
 
-diff --git a/Documentation/devicetree/bindings/usb/qcom,snps-dwc3.yaml b/Documentation/devicetree/bindings/usb/qcom,snps-dwc3.yaml
-index ea60f7220afe..ce36109f5df7 100644
 --- a/Documentation/devicetree/bindings/usb/qcom,snps-dwc3.yaml
 +++ b/Documentation/devicetree/bindings/usb/qcom,snps-dwc3.yaml
-@@ -173,7 +173,6 @@ allOf:
+@@ -167,7 +167,6 @@ allOf:
            contains:
              enum:
                - qcom,ipq4019-dwc3
@@ -28,12 +26,10 @@ index ea60f7220afe..ce36109f5df7 100644
      then:
        properties:
          clocks:
-@@ -185,6 +184,25 @@ allOf:
-             - const: sleep
-             - const: mock_utmi
+@@ -180,6 +179,25 @@ allOf:
  
-+  - if:
-+      properties:
+   - if:
+       properties:
 +        compatible:
 +          contains:
 +            enum:
@@ -51,9 +47,8 @@ index ea60f7220afe..ce36109f5df7 100644
 +            - const: aux
 +            - const: lfps
 +
-   - if:
-       properties:
++  - if:
++      properties:
          compatible:
-
--- 
-2.53.0
+           contains:
+             enum:

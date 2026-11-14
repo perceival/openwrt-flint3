@@ -39,7 +39,7 @@ Signed-off-by: Francois Guerraz <kubrick@fgv6.net>
 ---
 --- a/drivers/net/ethernet/qualcomm/ppe/edma_cfg_rx.c
 +++ b/drivers/net/ethernet/qualcomm/ppe/edma_cfg_rx.c
-@@ -405,10 +405,15 @@ void edma_cfg_rx_ring_mappings(void)
+@@ -413,10 +413,15 @@ void edma_cfg_rx_ring_mappings(void)
  static void edma_cfg_rx_fill_ring_cleanup(struct edma_rxfill_ring *rxfill_ring)
  {
  	struct ppe_device *ppe_dev = edma_ctx->ppe_dev;
@@ -55,7 +55,7 @@ Signed-off-by: Francois Guerraz <kubrick@fgv6.net>
  
  	/* Get RxFill ring producer index */
  	curr_idx = rxfill_ring->prod_idx & EDMA_RXFILL_PROD_IDX_MASK;
-@@ -421,6 +426,7 @@ static void edma_cfg_rx_fill_ring_cleanu
+@@ -429,6 +434,7 @@ static void edma_cfg_rx_fill_ring_cleanu
  	while (curr_idx != cons_idx) {
  		struct edma_rxfill_desc *rxfill_desc;
  		struct sk_buff *skb;
@@ -63,7 +63,7 @@ Signed-off-by: Francois Guerraz <kubrick@fgv6.net>
  
  		/* Get RxFill descriptor */
  		rxfill_desc = EDMA_RXFILL_DESC(rxfill_ring, cons_idx);
-@@ -435,6 +441,14 @@ static void edma_cfg_rx_fill_ring_cleanu
+@@ -443,6 +449,14 @@ static void edma_cfg_rx_fill_ring_cleanu
  			continue;
  		}
  
@@ -78,7 +78,7 @@ Signed-off-by: Francois Guerraz <kubrick@fgv6.net>
  		dev_kfree_skb_any(skb);
  	}
  
-@@ -490,10 +504,15 @@ static int edma_cfg_rx_desc_ring_dma_all
+@@ -498,10 +512,15 @@ static int edma_cfg_rx_desc_ring_dma_all
  
  static void edma_cfg_rx_desc_ring_cleanup(struct edma_rxdesc_ring *rxdesc_ring)
  {
@@ -94,7 +94,7 @@ Signed-off-by: Francois Guerraz <kubrick@fgv6.net>
  
  	/* Get Rxdesc consumer & producer indices */
  	cons_idx = rxdesc_ring->cons_idx & EDMA_RXDESC_CONS_IDX_MASK;
-@@ -507,6 +526,7 @@ static void edma_cfg_rx_desc_ring_cleanu
+@@ -515,6 +534,7 @@ static void edma_cfg_rx_desc_ring_cleanu
  		struct edma_rxdesc_pri *rxdesc_pri =
  			EDMA_RXDESC_PRI_DESC(rxdesc_ring, cons_idx);
  		struct sk_buff *skb;
@@ -102,7 +102,7 @@ Signed-off-by: Francois Guerraz <kubrick@fgv6.net>
  
  		/* Update consumer index */
  		cons_idx = (cons_idx + 1) & EDMA_RX_RING_SIZE_MASK;
-@@ -519,6 +539,14 @@ static void edma_cfg_rx_desc_ring_cleanu
+@@ -527,6 +547,14 @@ static void edma_cfg_rx_desc_ring_cleanu
  			continue;
  		}
  

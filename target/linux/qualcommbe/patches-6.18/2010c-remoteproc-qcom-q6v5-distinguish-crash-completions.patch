@@ -18,7 +18,7 @@ Signed-off-by: JiaY-shi <shi05275@163.com>
 ---
 --- a/drivers/remoteproc/qcom_q6v5.c
 +++ b/drivers/remoteproc/qcom_q6v5.c
-@@ -61,6 +61,8 @@
+@@ -61,6 +61,8 @@ int qcom_q6v5_prepare(struct qcom_q6v5 *
  	reinit_completion(&q6v5->start_done);
  	reinit_completion(&q6v5->stop_done);
  
@@ -27,7 +27,7 @@ Signed-off-by: JiaY-shi <shi05275@163.com>
  	q6v5->running = true;
  	q6v5->handover_issued = false;
  
-@@ -96,6 +98,7 @@
+@@ -96,6 +98,7 @@ static irqreturn_t q6v5_wdog_interrupt(i
  
  	/* Sometimes the stop triggers a watchdog rather than a stop-ack */
  	if (!q6v5->running) {
@@ -35,7 +35,7 @@ Signed-off-by: JiaY-shi <shi05275@163.com>
  		complete(&q6v5->stop_done);
  		return IRQ_HANDLED;
  	}
-@@ -108,6 +111,10 @@
+@@ -108,6 +111,10 @@ static irqreturn_t q6v5_wdog_interrupt(i
  		dev_err(q6v5->dev, "watchdog without message\n");
  
  	q6v5->running = false;
@@ -46,7 +46,7 @@ Signed-off-by: JiaY-shi <shi05275@163.com>
  	rproc_report_crash(q6v5->rproc, RPROC_WATCHDOG);
  
  	return IRQ_HANDLED;
-@@ -130,6 +137,10 @@
+@@ -130,6 +137,10 @@ static irqreturn_t q6v5_fatal_interrupt(
  		dev_err(q6v5->dev, "fatal error without message\n");
  
  	q6v5->running = false;
@@ -57,7 +57,7 @@ Signed-off-by: JiaY-shi <shi05275@163.com>
  	rproc_report_crash(q6v5->rproc, RPROC_FATAL_ERROR);
  
  	return IRQ_HANDLED;
-@@ -139,6 +150,7 @@
+@@ -139,6 +150,7 @@ static irqreturn_t q6v5_ready_interrupt(
  {
  	struct qcom_q6v5 *q6v5 = data;
  
@@ -65,7 +65,7 @@ Signed-off-by: JiaY-shi <shi05275@163.com>
  	complete(&q6v5->start_done);
  
  	return IRQ_HANDLED;
-@@ -151,14 +163,19 @@
+@@ -151,14 +163,19 @@ static irqreturn_t q6v5_ready_interrupt(
   *
   * qcom_q6v5_unprepare() should not be called when this function fails.
   *
@@ -87,7 +87,7 @@ Signed-off-by: JiaY-shi <shi05275@163.com>
  }
  EXPORT_SYMBOL_GPL(qcom_q6v5_wait_for_start);
  
-@@ -185,6 +201,7 @@
+@@ -185,6 +202,7 @@ static irqreturn_t q6v5_stop_interrupt(i
  {
  	struct qcom_q6v5 *q6v5 = data;
  
@@ -95,15 +95,15 @@ Signed-off-by: JiaY-shi <shi05275@163.com>
  	complete(&q6v5->stop_done);
  
  	return IRQ_HANDLED;
-@@ -202,6 +219,7 @@
+@@ -201,6 +219,7 @@ int qcom_q6v5_request_stop(struct qcom_q
+ {
  	int ret;
  
 +	WRITE_ONCE(q6v5->stop_ack, false);
  	q6v5->running = false;
  
  	/* Don't perform SMP2P dance if remote isn't running */
- 	if (q6v5->rproc->state != RPROC_RUNNING || qcom_sysmon_shutdown_acked(sysmon))
-@@ -214,7 +232,10 @@
+@@ -214,7 +233,10 @@ int qcom_q6v5_request_stop(struct qcom_q
  
  	qcom_smem_state_update_bits(q6v5->state, BIT(q6v5->stop_bit), 0);
  
@@ -117,7 +117,7 @@ Signed-off-by: JiaY-shi <shi05275@163.com>
  
 --- a/drivers/remoteproc/qcom_q6v5.h
 +++ b/drivers/remoteproc/qcom_q6v5.h
-@@ -34,6 +34,8 @@
+@@ -34,6 +34,8 @@ struct qcom_q6v5 {
  	struct completion start_done;
  	struct completion stop_done;
  
@@ -128,7 +128,7 @@ Signed-off-by: JiaY-shi <shi05275@163.com>
  
 --- a/drivers/remoteproc/qcom_q6v5_wcss_sec.c
 +++ b/drivers/remoteproc/qcom_q6v5_wcss_sec.c
-@@ -103,15 +103,18 @@
+@@ -103,15 +103,18 @@ static int wcss_sec_stop(struct rproc *r
  {
  	struct wcss_sec *wcss = rproc->priv;
  	struct device *dev = wcss->dev;
@@ -151,5 +151,3 @@ Signed-off-by: JiaY-shi <shi05275@163.com>
  
  	qcom_q6v5_unprepare(&wcss->q6);
  
--- 
-2.51.0

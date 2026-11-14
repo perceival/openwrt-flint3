@@ -18,7 +18,7 @@ Signed-off-by: Francois Guerraz <kubrick@fgv6.net>
 ---
 --- a/drivers/net/ethernet/qualcomm/ppe/ppe_config.c
 +++ b/drivers/net/ethernet/qualcomm/ppe/ppe_config.c
-@@ -1716,7 +1716,7 @@
+@@ -1716,7 +1716,7 @@ static int ppe_config_qm(struct ppe_devi
  {
  	const struct ppe_qm_queue_config *queue_cfg;
  	int ret, i, queue_id, queue_cfg_count;
@@ -27,7 +27,7 @@ Signed-off-by: Francois Guerraz <kubrick@fgv6.net>
  	u32 unicast_queue_cfg[4];
  	u32 group_cfg[3];
  	int group_limit;
-@@ -1781,8 +1781,12 @@
+@@ -1781,8 +1781,12 @@ static int ppe_config_qm(struct ppe_devi
  				if (ret)
  					goto qm_config_fail;
  			} else {

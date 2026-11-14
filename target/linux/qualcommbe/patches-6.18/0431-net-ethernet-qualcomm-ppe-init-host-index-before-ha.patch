@@ -31,12 +31,12 @@ Signed-off-by: Kamil Bienkiewicz <perceivalpercy@gmail.com>
 ---
 --- a/drivers/net/ethernet/qualcomm/ppe/ppe_host_pool.c
 +++ b/drivers/net/ethernet/qualcomm/ppe/ppe_host_pool.c
-@@ -78,7 +78,7 @@
+@@ -78,7 +78,7 @@ int ppe_host_pool_get_and_ref(struct ppe
  			       unsigned int num_words, u32 *index)
  {
  	struct ppe_host_pool_entry *e;
 -	u32 idx;
 +	u32 idx = 0;
  	int ret;
-
+ 
  	ret = ppe_host_entry_add(ppe_dev, mode, entry, num_words, &idx);

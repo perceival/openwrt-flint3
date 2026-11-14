@@ -44,7 +44,7 @@ Signed-off-by: Kamil Bienkiewicz <perceivalpercy@gmail.com>
 ---
 --- a/drivers/net/ethernet/qualcomm/ppe/edma_tx.h
 +++ b/drivers/net/ethernet/qualcomm/ppe/edma_tx.h
-@@ -158,6 +158,8 @@
+@@ -158,6 +158,8 @@ enum edma_tx_gso_status {
   * @errors: Other Tx complete descriptor errors indicated by the hardware.
   * @desc_with_more_bit: Packet's segment transmit count.
   * @no_pending_desc: No descriptor is pending for processing.
@@ -53,7 +53,7 @@ Signed-off-by: Kamil Bienkiewicz <perceivalpercy@gmail.com>
   * @syncp: Synchronization pointer.
   */
  struct edma_txcmpl_stats {
-@@ -165,6 +167,7 @@
+@@ -165,6 +167,7 @@ struct edma_txcmpl_stats {
  	u64 errors;
  	u64 desc_with_more_bit;
  	u64 no_pending_desc;
@@ -63,7 +63,7 @@ Signed-off-by: Kamil Bienkiewicz <perceivalpercy@gmail.com>
  
 --- a/drivers/net/ethernet/qualcomm/ppe/edma_tx.c
 +++ b/drivers/net/ethernet/qualcomm/ppe/edma_tx.c
-@@ -173,10 +173,31 @@
+@@ -173,10 +173,31 @@ u32 edma_tx_complete(u32 work_to_do, str
  						 skb_headlen(skb), DMA_TO_DEVICE);
  			} else {
  				u8 frag_index = (EDMA_TXCOMP_POOL_ID_GET(txcmpl) - 1);

@@ -36,7 +36,7 @@ Signed-off-by: Kamil Bienkiewicz <perceivalpercy@gmail.com>
  
  /* MDIO clock source frequency is fixed to 100M */
  #define IPQ_MDIO_CLK_RATE	100000000
-@@ -60,6 +65,14 @@
+@@ -60,6 +65,14 @@ static int ipq4019_mdio_wait_busy(struct
  	struct ipq4019_mdio_data *priv = bus->priv;
  	unsigned int busy;
  

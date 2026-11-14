@@ -31,7 +31,7 @@ Signed-off-by: Kamil Bienkiewicz <perceivalpercy@gmail.com>
 ---
 --- a/drivers/net/ethernet/qualcomm/ppe/ppe_offload.c
 +++ b/drivers/net/ethernet/qualcomm/ppe/ppe_offload.c
-@@ -268,6 +268,11 @@
+@@ -268,6 +268,11 @@ struct ppe_offload_flow_entry {
  	u64 stats_packets;
  	u64 stats_bytes;
  	unsigned long lastused;
@@ -43,7 +43,7 @@ Signed-off-by: Kamil Bienkiewicz <perceivalpercy@gmail.com>
  };
  
  static const struct rhashtable_params ppe_offload_flow_ht_params = {
-@@ -837,6 +842,52 @@
+@@ -837,6 +842,52 @@ static void ppe_offload_flow_disown(stru
  			priv->flow_owner[entry->flow_index + i] = NULL;
  }
  
@@ -96,7 +96,7 @@ Signed-off-by: Kamil Bienkiewicz <perceivalpercy@gmail.com>
  static int ppe_offload_flow_replace(struct net_device *netdev,
  				     struct ppe_offload_priv *priv,
  				     struct flow_cls_offload *cls)
-@@ -1364,10 +1415,17 @@
+@@ -1364,10 +1415,17 @@ static int ppe_offload_flow_replace(stru
  
  	mutex_lock(&priv->lock);
  
@@ -118,7 +118,7 @@ Signed-off-by: Kamil Bienkiewicz <perceivalpercy@gmail.com>
  	}
  
  	/* Public IP entry for the translated (post-SNAT) source address.
-@@ -1816,6 +1874,7 @@
+@@ -1816,6 +1874,7 @@ static int ppe_offload_flow_repoint(stru
  	WRITE_ONCE(entry->dsa_ifindex, dev->ifindex);
  	entry->dsa_index = dp->index;
  	entry->stats_packets = 0;

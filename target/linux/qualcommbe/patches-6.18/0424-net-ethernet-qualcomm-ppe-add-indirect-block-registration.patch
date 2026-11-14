@@ -56,7 +56,7 @@ Signed-off-by: Kamil Bienkiewicz <perceivalpercy@gmail.com>
  #include <linux/in.h>
  #include <linux/ip.h>
  #include <linux/list.h>
-@@ -190,6 +191,13 @@
+@@ -190,6 +191,13 @@ static int ppe_offload_apply_l4_mangle(s
  	return 0;
  }
  
@@ -70,7 +70,7 @@ Signed-off-by: Kamil Bienkiewicz <perceivalpercy@gmail.com>
  static int ppe_offload_flow_replace(struct net_device *netdev,
  				     struct ppe_offload_priv *priv,
  				     struct flow_cls_offload *cls)
-@@ -218,7 +226,11 @@
+@@ -218,7 +226,11 @@ static int ppe_offload_flow_replace(stru
  	    !flow_rule_match_key(rule, FLOW_DISSECTOR_KEY_BASIC) ||
  	    !flow_rule_match_key(rule, FLOW_DISSECTOR_KEY_IPV4_ADDRS) ||
  	    !flow_rule_match_key(rule, FLOW_DISSECTOR_KEY_PORTS))
@@ -83,7 +83,7 @@ Signed-off-by: Kamil Bienkiewicz <perceivalpercy@gmail.com>
  
  	{
  		struct flow_match_control ctrl;
-@@ -228,7 +240,7 @@
+@@ -228,7 +240,7 @@ static int ppe_offload_flow_replace(stru
  
  		flow_rule_match_control(rule, &ctrl);
  		if (ctrl.key->addr_type != FLOW_DISSECTOR_KEY_IPV4_ADDRS)
@@ -92,7 +92,7 @@ Signed-off-by: Kamil Bienkiewicz <perceivalpercy@gmail.com>
  
  		flow_rule_match_basic(rule, &basic);
  		switch (basic.key->ip_proto) {
-@@ -242,7 +254,7 @@
+@@ -242,7 +254,7 @@ static int ppe_offload_flow_replace(stru
  			ip_proto = PPE_FLOW_PROTO_UDPLITE;
  			break;
  		default:
@@ -101,7 +101,7 @@ Signed-off-by: Kamil Bienkiewicz <perceivalpercy@gmail.com>
  		}
  
  		flow_rule_match_ipv4_addrs(rule, &ip4);
-@@ -274,16 +286,19 @@
+@@ -274,16 +286,19 @@ static int ppe_offload_flow_replace(stru
  				else if (act->mangle.offset == offsetof(struct iphdr, daddr))
  					new_dst = ppe_offload_apply_ip4_mangle(new_dst, act);
  				else
@@ -124,7 +124,7 @@ Signed-off-by: Kamil Bienkiewicz <perceivalpercy@gmail.com>
  			}
  			break;
  		case FLOW_ACTION_REDIRECT:
-@@ -293,22 +308,23 @@
+@@ -293,22 +308,23 @@ static int ppe_offload_flow_replace(stru
  			/* Hardware recomputes checksums on rewrite. */
  			break;
  		default:
@@ -152,7 +152,7 @@ Signed-off-by: Kamil Bienkiewicz <perceivalpercy@gmail.com>
  
  	/* eth.bytes is {h_dest[6], h_source[6]}. The new source half
  	 * must be this egress port's own MAC -- if it isn't, either
-@@ -317,7 +333,8 @@
+@@ -317,7 +333,8 @@ static int ppe_offload_flow_replace(stru
  	 * with the wrong source MAC either way is worse than declining.
  	 */
  	if (!ether_addr_equal(eth.bytes + ETH_ALEN, odev->dev_addr))
@@ -162,7 +162,7 @@ Signed-off-by: Kamil Bienkiewicz <perceivalpercy@gmail.com>
  
  	port_priv = netdev_priv(odev);
  
-@@ -404,6 +421,10 @@
+@@ -404,6 +421,10 @@ static int ppe_offload_flow_replace(stru
  
  	mutex_unlock(&priv->lock);
  
@@ -173,7 +173,7 @@ Signed-off-by: Kamil Bienkiewicz <perceivalpercy@gmail.com>
  	return 0;
  
  free_entry:
-@@ -451,6 +472,9 @@
+@@ -451,6 +472,9 @@ static int ppe_offload_flow_destroy(stru
  static int ppe_offload_flow_cmd(struct net_device *netdev, struct ppe_offload_priv *priv,
  				 struct flow_cls_offload *cls)
  {
@@ -183,7 +183,7 @@ Signed-off-by: Kamil Bienkiewicz <perceivalpercy@gmail.com>
  	switch (cls->command) {
  	case FLOW_CLS_REPLACE:
  		return ppe_offload_flow_replace(netdev, priv, cls);
-@@ -492,6 +516,9 @@
+@@ -492,6 +516,9 @@ static int ppe_offload_setup_tc_block(st
  {
  	struct flow_block_cb *block_cb;
  
@@ -193,7 +193,7 @@ Signed-off-by: Kamil Bienkiewicz <perceivalpercy@gmail.com>
  	if (f->binder_type != FLOW_BLOCK_BINDER_TYPE_CLSACT_INGRESS)
  		return -EOPNOTSUPP;
  
-@@ -506,12 +533,16 @@
+@@ -506,12 +533,16 @@ static int ppe_offload_setup_tc_block(st
  
  		block_cb = flow_block_cb_alloc(ppe_offload_setup_tc_block_cb, netdev,
  						netdev, NULL);
@@ -211,7 +211,7 @@ Signed-off-by: Kamil Bienkiewicz <perceivalpercy@gmail.com>
  		return 0;
  	case FLOW_BLOCK_UNBIND:
  		block_cb = flow_block_cb_lookup(f->block, ppe_offload_setup_tc_block_cb,
-@@ -548,6 +579,135 @@
+@@ -548,6 +579,135 @@ int ppe_offload_setup_tc(struct net_devi
  	}
  }
  
@@ -347,7 +347,7 @@ Signed-off-by: Kamil Bienkiewicz <perceivalpercy@gmail.com>
  /**
   * ppe_offload_init() - Initialize PPE hardware flow-offload state.
   * @ppe_dev: PPE device.
-@@ -573,6 +733,12 @@
+@@ -573,6 +733,12 @@ int ppe_offload_init(struct ppe_device *
  	if (ret)
  		return ret;
  
@@ -360,7 +360,7 @@ Signed-off-by: Kamil Bienkiewicz <perceivalpercy@gmail.com>
  	ppe_dev->offload = priv;
  
  	return 0;
-@@ -589,6 +755,8 @@
+@@ -589,6 +755,8 @@ void ppe_offload_destroy(struct ppe_devi
  	if (!priv)
  		return;
  

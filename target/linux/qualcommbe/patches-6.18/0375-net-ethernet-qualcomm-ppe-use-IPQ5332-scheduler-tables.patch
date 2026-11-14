@@ -39,7 +39,7 @@ Signed-off-by: Francois Guerraz <kubrick@fgv6.net>
  
  struct device;
  struct regmap;
-@@ -40,4 +42,13 @@
+@@ -40,4 +42,13 @@ struct ppe_device {
  	unsigned int num_icc_paths;
  	struct icc_bulk_data icc_paths[] __counted_by(num_icc_paths);
  };
@@ -55,7 +55,7 @@ Signed-off-by: Francois Guerraz <kubrick@fgv6.net>
  #endif
 --- a/drivers/net/ethernet/qualcomm/ppe/ppe_config.c
 +++ b/drivers/net/ethernet/qualcomm/ppe/ppe_config.c
-@@ -372,6 +372,49 @@
+@@ -372,6 +372,49 @@ static const struct ppe_scheduler_bm_con
  	{true, PPE_SCH_EGRESS,  7, false, 0},
  };
  
@@ -105,7 +105,7 @@ Signed-off-by: Francois Guerraz <kubrick@fgv6.net>
  /* PPE scheduler configuration for QM includes multiple entries. Each entry
   * contains ports to be dispatched for enqueueing and dequeueing. The backup
   * port for dequeueing is supported to be used when the primary port for
-@@ -439,6 +482,22 @@
+@@ -439,6 +482,22 @@ static const struct ppe_scheduler_qm_con
  	{0x98, 6, 5, true, 2},
  };
  
@@ -128,7 +128,7 @@ Signed-off-by: Francois Guerraz <kubrick@fgv6.net>
  static const struct ppe_scheduler_port_config ppe_port_sch_config[] = {
  	{
  		.port		= 0,
-@@ -1743,11 +1802,17 @@
+@@ -1743,11 +1802,17 @@ static int ppe_config_scheduler(struct p
  	const struct ppe_scheduler_port_config *port_cfg;
  	const struct ppe_scheduler_qm_config *qm_cfg;
  	const struct ppe_scheduler_bm_config *bm_cfg;
@@ -148,7 +148,7 @@ Signed-off-by: Francois Guerraz <kubrick@fgv6.net>
  
  	/* Configure the depth of BM scheduler entries. */
  	val = FIELD_PREP(PPE_BM_SCH_CTRL_SCH_DEPTH, count);
-@@ -1777,8 +1842,13 @@
+@@ -1777,8 +1842,13 @@ static int ppe_config_scheduler(struct p
  			goto sch_config_fail;
  	}
  

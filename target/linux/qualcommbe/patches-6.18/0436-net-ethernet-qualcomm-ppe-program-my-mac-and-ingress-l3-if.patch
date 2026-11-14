@@ -134,7 +134,7 @@ Signed-off-by: Kamil Bienkiewicz <perceivalpercy@gmail.com>
   * struct ppe_l3_if_in_entry - PPE ingress L3 interface table entry.
   * @mru: Maximum receive unit enforced on this L3 interface, in bytes.
   * @mtu: Maximum transmit unit enforced on this L3 interface, in bytes.
-@@ -60,6 +74,10 @@
+@@ -60,6 +74,10 @@ struct ppe_l3_if_eg_entry {
  	bool pppoe_en;
  };
  
@@ -147,7 +147,7 @@ Signed-off-by: Kamil Bienkiewicz <perceivalpercy@gmail.com>
  int ppe_l3_if_in_entry_get(struct ppe_device *ppe_dev, u32 index,
 --- a/drivers/net/ethernet/qualcomm/ppe/ppe_l3_if.c
 +++ b/drivers/net/ethernet/qualcomm/ppe/ppe_l3_if.c
-@@ -43,6 +43,13 @@
+@@ -43,6 +43,13 @@ int ppe_l3_if_in_entry_set(struct ppe_de
  	if (index >= PPE_IN_L3_IF_TBL_ENTRIES)
  		return -EINVAL;
  
@@ -161,7 +161,7 @@ Signed-off-by: Kamil Bienkiewicz <perceivalpercy@gmail.com>
  	val[0] = FIELD_PREP(PPE_IN_L3_IF_TBL_MRU, entry->mru);
  	val[0] |= FIELD_PREP(PPE_IN_L3_IF_TBL_MTU, entry->mtu);
  	val[0] |= entry->ttl_dec_bypass ? PPE_IN_L3_IF_TBL_TTL_DEC_BYPASS : 0;
-@@ -182,3 +189,77 @@
+@@ -182,3 +189,77 @@ int ppe_l3_if_eg_entry_get(struct ppe_de
  
  	return 0;
  }
@@ -259,7 +259,7 @@ Signed-off-by: Kamil Bienkiewicz <perceivalpercy@gmail.com>
  /* Total number of hardware-addressable flow-table slots, derived from
   * the width of the index field hardware reports a HASH-mode add's
   * result in -- used to size priv->flow_owner (see struct
-@@ -234,6 +238,47 @@
+@@ -234,6 +238,47 @@ static int ppe_offload_apply_l4_mangle(s
  #define ppe_offload_decline(fmt, ...) \
  	({ pr_info_ratelimited("ppe_offload: declined - " fmt "\n", ##__VA_ARGS__); -EOPNOTSUPP; })
  
@@ -307,7 +307,7 @@ Signed-off-by: Kamil Bienkiewicz <perceivalpercy@gmail.com>
  static int ppe_offload_flow_replace(struct net_device *netdev,
  				     struct ppe_offload_priv *priv,
  				     struct flow_cls_offload *cls)
-@@ -247,6 +292,9 @@
+@@ -247,6 +292,9 @@ static int ppe_offload_flow_replace(stru
  	struct ppe_nexthop_entry nexthop;
  	struct edma_port_priv *port_priv;
  	struct net_device *odev = NULL;
@@ -317,7 +317,7 @@ Signed-off-by: Kamil Bienkiewicz <perceivalpercy@gmail.com>
  	__be32 match_src, match_dst;
  	__be32 new_src, new_dst;
  	__be16 match_sport, match_dport;
-@@ -306,6 +354,39 @@
+@@ -306,6 +354,39 @@ static int ppe_offload_flow_replace(stru
  		match_dport = ports.key->dst;
  	}
  
@@ -357,7 +357,7 @@ Signed-off-by: Kamil Bienkiewicz <perceivalpercy@gmail.com>
  	new_src = match_src;
  	new_dst = match_dst;
  	l4.source = match_sport;
-@@ -485,6 +566,8 @@
+@@ -485,6 +566,8 @@ static int ppe_offload_flow_replace(stru
  	flow_ipv4.match_ip = match_dst;
  	flow_ipv4.match_sport = be16_to_cpu(match_sport);
  	flow_ipv4.match_dport = be16_to_cpu(match_dport);
@@ -368,7 +368,7 @@ Signed-off-by: Kamil Bienkiewicz <perceivalpercy@gmail.com>
  	ppe_flow_ipv4_snat_entry_encode(&flow_ipv4, flow_words);
 --- a/drivers/net/ethernet/qualcomm/ppe/edma_port.h
 +++ b/drivers/net/ethernet/qualcomm/ppe/edma_port.h
-@@ -84,10 +84,12 @@
+@@ -84,10 +84,12 @@ struct edma_port_pcpu_stats {
   * @pcpu_stats: Per CPU netdev statistics
   * @txr_map: Tx ring per-core mapping
   * @flags: Feature flags
@@ -387,7 +387,7 @@ Signed-off-by: Kamil Bienkiewicz <perceivalpercy@gmail.com>
  	struct ppe_port *ppe_port;
 --- a/drivers/net/ethernet/qualcomm/ppe/edma_port.c
 +++ b/drivers/net/ethernet/qualcomm/ppe/edma_port.c
-@@ -167,16 +167,28 @@
+@@ -167,16 +167,28 @@ static int edma_port_ioctl(struct net_de
  	return ret;
  }
  
@@ -417,7 +417,7 @@ Signed-off-by: Kamil Bienkiewicz <perceivalpercy@gmail.com>
  }
  
  static netdev_features_t edma_port_feature_check(__maybe_unused struct sk_buff *skb,
-@@ -301,24 +313,85 @@
+@@ -301,24 +313,85 @@ static void edma_port_get_stats64(struct
  	ppe_port_get_stats64(port_priv->ppe_port, stats);
  }
  
@@ -511,7 +511,7 @@ Signed-off-by: Kamil Bienkiewicz <perceivalpercy@gmail.com>
  }
  
  static int edma_port_set_mac_address(struct net_device *netdev, void *macaddr)
-@@ -394,7 +467,11 @@
+@@ -394,7 +467,11 @@ void edma_port_destroy(struct ppe_port *
  	struct net_device *netdev = edma_ctx->netdev_arr[port_id - 1];
  	struct edma_port_priv *port_priv = netdev_priv(netdev);
  	struct ppe_l3_if_eg_entry zero = {};
@@ -522,8 +522,8 @@ Signed-off-by: Kamil Bienkiewicz <perceivalpercy@gmail.com>
 +	ppe_my_mac_entry_set(edma_ctx->ppe_dev, port_priv->l3_if_index - 1, NULL, false);
  	ppe_l3_if_eg_entry_set(edma_ctx->ppe_dev, port_priv->l3_if_index, &zero);
  
- 	edma_port_deconfigure(netdev);
-@@ -473,8 +550,6 @@
+ 	unregister_netdev(netdev);
+@@ -473,8 +550,6 @@ int edma_port_setup(struct ppe_port *por
  			    port_id, netdev->dev_addr);
  	}
  
@@ -532,7 +532,7 @@ Signed-off-by: Kamil Bienkiewicz <perceivalpercy@gmail.com>
  	ret = edma_port_stats_alloc(netdev);
  	if (ret) {
  		netdev_dbg(netdev, "EDMA port stats alloc failed\n");
-@@ -503,6 +578,12 @@
+@@ -503,6 +578,12 @@ int edma_port_setup(struct ppe_port *por
  		goto register_netdev_fail;
  	}
  

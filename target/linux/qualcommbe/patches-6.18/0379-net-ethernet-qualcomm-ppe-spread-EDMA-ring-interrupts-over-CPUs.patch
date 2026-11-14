@@ -43,7 +43,7 @@ Signed-off-by: Francois Guerraz <kubrick@fgv6.net>
  #include <linux/kernel.h>
  #include <linux/module.h>
  #include <linux/netdevice.h>
-@@ -400,6 +402,35 @@
+@@ -400,6 +402,35 @@ static irqreturn_t edma_misc_handle_irq(
  	return IRQ_HANDLED;
  }
  
@@ -79,7 +79,7 @@ Signed-off-by: Francois Guerraz <kubrick@fgv6.net>
  static int edma_irq_register(void)
  {
  	struct edma_hw_info *hw_info = edma_ctx->hw_info;
-@@ -438,6 +469,7 @@
+@@ -438,6 +469,7 @@ static int edma_irq_register(void)
  			goto txcmpl_irq_fail;
  		}
  		txcmpl_irqs++;
@@ -87,7 +87,7 @@ Signed-off-by: Francois Guerraz <kubrick@fgv6.net>
  
  		pr_debug("TXCMPL ring: %d IRQ:%d request success: %s\n",
  			 txcmpl->ring_start + i,
-@@ -476,6 +508,7 @@
+@@ -476,6 +508,7 @@ static int edma_irq_register(void)
  			goto rx_irq_fail;
  		}
  		rx_irqs++;
@@ -95,7 +95,7 @@ Signed-off-by: Francois Guerraz <kubrick@fgv6.net>
  
  		pr_debug("RXDESC ring: %d IRQ:%d request success: %s\n",
  			 rx->ring_start + i,
-@@ -501,6 +534,7 @@
+@@ -501,6 +534,7 @@ rx_irq_fail:
  	 */
  	for (i = 0; i < rx_irqs; i++) {
  		synchronize_irq(edma_ctx->intr_info.intr_rx[i]);
@@ -103,7 +103,7 @@ Signed-off-by: Francois Guerraz <kubrick@fgv6.net>
  		free_irq(edma_ctx->intr_info.intr_rx[i],
  			 (void *)&edma_ctx->rx_rings[i]);
  	}
-@@ -510,6 +544,7 @@
+@@ -510,6 +544,7 @@ rx_irq_fail:
  txcmpl_irq_fail:
  	for (i = 0; i < txcmpl_irqs; i++) {
  		synchronize_irq(edma_ctx->intr_info.intr_txcmpl[i]);
@@ -111,7 +111,7 @@ Signed-off-by: Francois Guerraz <kubrick@fgv6.net>
  		free_irq(edma_ctx->intr_info.intr_txcmpl[i],
  			 (void *)&edma_ctx->txcmpl_rings[i]);
  	}
-@@ -829,6 +864,7 @@
+@@ -829,6 +864,7 @@ void edma_destroy(struct ppe_device *ppe
  	for (i = 0; i < txcmpl->num_rings; i++) {
  		synchronize_irq(edma_ctx->intr_info.intr_txcmpl[i]);
  
@@ -119,7 +119,7 @@ Signed-off-by: Francois Guerraz <kubrick@fgv6.net>
  		free_irq(edma_ctx->intr_info.intr_txcmpl[i],
  			 (void *)&edma_ctx->txcmpl_rings[i]);
  		kfree(edma_txcmpl_irq_name[i]);
-@@ -838,6 +874,7 @@
+@@ -838,6 +874,7 @@ void edma_destroy(struct ppe_device *ppe
  	/* Free IRQ for Rx DESC rings */
  	for (i = 0; i < rx->num_rings; i++) {
  		synchronize_irq(edma_ctx->intr_info.intr_rx[i]);

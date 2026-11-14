@@ -12,10 +12,9 @@ probe) that has been dropped from the series.
 
 Signed-off-by: Kamil Bienkiewicz <perceivalpercy@gmail.com>
 ---
-diff --color -ruN base/drivers/net/ethernet/qualcomm/ppe/ppe_flow.c w1/drivers/net/ethernet/qualcomm/ppe/ppe_flow.c
 --- a/drivers/net/ethernet/qualcomm/ppe/ppe_flow.c
 +++ b/drivers/net/ethernet/qualcomm/ppe/ppe_flow.c
-@@ -27,6 +27,11 @@
+@@ -27,6 +27,11 @@ enum ppe_flow_tbl_op_type {
  	PPE_FLOW_TBL_OP_FLUSH,
  };
  
@@ -27,7 +26,7 @@ diff --color -ruN base/drivers/net/ethernet/qualcomm/ppe/ppe_flow.c w1/drivers/n
  /* Trigger the given flow table operation and wait for hardware to
   * complete it. *index is the entry index to operate on for
   * PPE_FLOW_OP_MODE_INDEX (input); for PPE_FLOW_OP_MODE_HASH it is
-@@ -39,7 +44,8 @@
+@@ -39,7 +44,8 @@ static int ppe_flow_tbl_op_wait(struct p
  	u32 val, rslt;
  	int ret;
  
@@ -37,10 +36,9 @@ diff --color -ruN base/drivers/net/ethernet/qualcomm/ppe/ppe_flow.c w1/drivers/n
  	val |= FIELD_PREP(PPE_IN_FLOW_TBL_OP_HASH_BLOCK_BITMAP, 3);
  	val |= FIELD_PREP(PPE_IN_FLOW_TBL_OP_OP_MODE, mode);
  	val |= FIELD_PREP(PPE_IN_FLOW_TBL_OP_ENTRY_INDEX, *index);
-diff --color -ruN base/drivers/net/ethernet/qualcomm/ppe/ppe_host.c w1/drivers/net/ethernet/qualcomm/ppe/ppe_host.c
 --- a/drivers/net/ethernet/qualcomm/ppe/ppe_host.c
 +++ b/drivers/net/ethernet/qualcomm/ppe/ppe_host.c
-@@ -26,6 +26,12 @@
+@@ -26,6 +26,12 @@ enum ppe_host_tbl_op_type {
  	PPE_HOST_TBL_OP_FLUSH,
  };
  
@@ -53,7 +51,7 @@ diff --color -ruN base/drivers/net/ethernet/qualcomm/ppe/ppe_host.c w1/drivers/n
  /* Trigger the given host table operation and wait for hardware to
   * complete it. *index is the entry index to operate on for
   * PPE_FLOW_OP_MODE_INDEX (input); for PPE_FLOW_OP_MODE_HASH it is
-@@ -38,7 +44,8 @@
+@@ -38,7 +44,8 @@ static int ppe_host_tbl_op_wait(struct p
  	u32 val, rslt;
  	int ret;
  

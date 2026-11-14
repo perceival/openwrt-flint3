@@ -22,7 +22,7 @@ Signed-off-by: Akshay Kakatkar <claude@akshaykakatkar.tech>
 ---
 --- a/drivers/net/ethernet/qualcomm/ppe/edma_tx.c
 +++ b/drivers/net/ethernet/qualcomm/ppe/edma_tx.c
-@@ -125,7 +125,7 @@
+@@ -100,7 +100,7 @@ u32 edma_tx_complete(u32 work_to_do, str
  	struct edma_txcmpl_stats *txcmpl_stats = &txcmpl_ring->txcmpl_stats;
  	struct ppe_device *ppe_dev = edma_ctx->ppe_dev;
  	struct regmap *regmap = ppe_dev->regmap;
@@ -31,7 +31,7 @@ Signed-off-by: Akshay Kakatkar <claude@akshaykakatkar.tech>
  	struct device *dev = ppe_dev->dev;
  	u32 avail, count, txcmpl_errors;
  	struct edma_txcmpl_desc *txcmpl;
-@@ -235,17 +235,24 @@
+@@ -210,17 +210,24 @@ u32 edma_tx_complete(u32 work_to_do, str
  	regmap_write(regmap, reg, cons_idx);
  
  	/* If tx_requeue_stop disabled (tx_requeue_stop = 0)

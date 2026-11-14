@@ -119,7 +119,7 @@ Signed-off-by: Kamil Bienkiewicz <perceivalpercy@gmail.com>
  struct ppe_offload_flow_entry {
  	struct rhash_head node;
  	unsigned long cookie;
-@@ -97,6 +116,7 @@
+@@ -97,6 +116,7 @@ struct ppe_offload_flow_entry {
  	u32 host_index;
  	u32 nexthop_index;
  	u32 pub_ip_index;
@@ -127,7 +127,7 @@ Signed-off-by: Kamil Bienkiewicz <perceivalpercy@gmail.com>
  };
  
  static const struct rhashtable_params ppe_offload_flow_ht_params = {
-@@ -113,6 +133,13 @@
+@@ -113,6 +133,13 @@ static const struct rhashtable_params pp
   * @nexthop_pool: Refcounted nexthop table allocator.
   * @pub_ip_pool: Refcounted public IP address table allocator.
   * @flow_table: Offloaded flows, keyed by TC flow cookie.
@@ -141,7 +141,7 @@ Signed-off-by: Kamil Bienkiewicz <perceivalpercy@gmail.com>
   * @lock: Serializes the whole replace/destroy sequence -- looking up
   * @flow_table, allocating from the pools, and programming hardware --
   * against concurrent calls for different flows, mirroring
-@@ -124,6 +151,7 @@
+@@ -124,6 +151,7 @@ struct ppe_offload_priv {
  	struct ppe_nexthop_pool nexthop_pool;
  	struct ppe_pub_ip_pool pub_ip_pool;
  	struct rhashtable flow_table;
@@ -149,7 +149,7 @@ Signed-off-by: Kamil Bienkiewicz <perceivalpercy@gmail.com>
  	struct mutex lock;
  };
  
-@@ -443,6 +471,20 @@
+@@ -443,6 +471,20 @@ static int ppe_offload_flow_replace(stru
  	if (ret)
  		goto deref_host;
  
@@ -170,7 +170,7 @@ Signed-off-by: Kamil Bienkiewicz <perceivalpercy@gmail.com>
  	entry = kzalloc(sizeof(*entry), GFP_KERNEL);
  	if (!entry) {
  		ret = -ENOMEM;
-@@ -454,11 +496,14 @@
+@@ -454,11 +496,14 @@ static int ppe_offload_flow_replace(stru
  	entry->host_index = host_index;
  	entry->nexthop_index = nexthop_index;
  	entry->pub_ip_index = pub_ip_index;
@@ -185,7 +185,7 @@ Signed-off-by: Kamil Bienkiewicz <perceivalpercy@gmail.com>
  	mutex_unlock(&priv->lock);
  
  	pr_info_ratelimited("ppe_offload: accepted flow_index=%u host_index=%u nexthop_index=%u pub_ip_index=%u src=%pI4->%pI4 odev=%s\n",
-@@ -497,7 +542,24 @@
+@@ -497,7 +542,24 @@ static int ppe_offload_flow_destroy(stru
  
  	rhashtable_remove_fast(&priv->flow_table, &entry->node, ppe_offload_flow_ht_params);
  
@@ -211,7 +211,7 @@ Signed-off-by: Kamil Bienkiewicz <perceivalpercy@gmail.com>
  	ppe_host_pool_deref(priv->ppe_dev, &priv->host_pool, entry->host_index);
  	ppe_nexthop_pool_deref(priv->ppe_dev, &priv->nexthop_pool, entry->nexthop_index);
  	ppe_pub_ip_pool_deref(priv->ppe_dev, &priv->pub_ip_pool, entry->pub_ip_index);
-@@ -769,6 +831,11 @@
+@@ -769,6 +831,11 @@ int ppe_offload_init(struct ppe_device *
  	ppe_pub_ip_pool_init(&priv->pub_ip_pool);
  	mutex_init(&priv->lock);
  
