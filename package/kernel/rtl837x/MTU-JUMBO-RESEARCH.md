@@ -1,7 +1,9 @@
-# RTL8373 MTU and jumbo-frame offload research
+# Historical RTL8373 MTU and jumbo-frame research
 
-Status: research-only. This note deliberately does not add a DSA MTU callback
-or change any RTL8373 register.
+Status: historical research only. This note was written for the former
+RTL8373 SDK-based driver and does not describe the RTL8372N P0 candidate. It is
+not evidence for that candidate's MTU/register behavior. It deliberately does
+not add a DSA MTU callback or change any RTL8373 register.
 
 ## Question
 

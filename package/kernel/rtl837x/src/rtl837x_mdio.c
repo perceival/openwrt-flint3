@@ -1,1169 +1,352 @@
-/* SPDX-License-Identifier: GPL-2.0 */
-/*
- * Copyright (C) 2025 StarField Xu <air_jinkela@163.com>
- */
-
+// SPDX-License-Identifier: GPL-2.0-or-later
+/* Copyright (C) 2025 StarField Xu <air_jinkela@163.com> */
+#include <linux/delay.h>
+#include <linux/device.h>
+#include <linux/bitops.h>
+#include <linux/errno.h>
+#include <linux/gpio/consumer.h>
 #include <linux/kernel.h>
 #include <linux/module.h>
-#include <linux/init.h>
-#include <linux/version.h>
-#include <linux/bits.h>
-#include <linux/device.h>
-#include <linux/delay.h>
 #include <linux/of.h>
-#include <linux/of_mdio.h>
-#include <linux/of_gpio.h>
 #include <linux/of_net.h>
-#include <linux/gpio/consumer.h>
-#include <linux/mutex.h>
-#include <linux/jiffies.h>
-#include <linux/errno.h>
-#include <linux/sfp.h>
-#include <net/rtnetlink.h>
+#include <linux/overflow.h>
+#include <linux/regmap.h>
+#include <linux/slab.h>
 
-#include "./rtl837x_common.h"
+#include "rtl837x.h"
 
-#include <linux/printk.h>
-
-const uint8_t rtl8373_port_map[16] = {
-    0, 1, 2, 3, 4, 5, 6, 7, 8, // 物理端口0-8
-    0, 0, 0, 0, 0, 0, 0        // 填充
-};
-
-const uint8_t rtl8372_port_map[16] = {
-    3, 4, 5, 6, 7, 8, // 物理端口3-8
-    0, 0, 0, 0, 0, 0, 0, 0, 0, 0 // 填充
-};
-
-static struct rtl837x_mib_counter rtl837x_mib_counters[] ={
-	{0,"ifInOctets"},
-	{2,"ifOutOctets"},
-	{4,"ifInUcastPkts"},
-	{6,"ifInMulticastPkts"},
-	{8,"ifInBroadcastPkts"},
-	{0xA,"ifOutUcastPkts"},
-	{0xC,"ifOutMulticastPkts"},
-	{0xE,"ifOutBroadcastPkts"},
-	{0x10,"ifOutDiscards"},
-	{0x19,"InPauseFrames"},
-	{0x1A,"OutPauseFrames"},
-	{0x1C,"TxBroadcastPkts"},
-	{0x1D,"TxMulticastPkts"},
-	{0x20,"TxUndersizePkts"},
-	{0x21,"RxUndersizePkts"},
-	{0x22,"TxOversizePkts"},
-	{0x23,"RxOversizePkts"},
-	{0x24,"TxFragments"},
-	{0x25,"RxFragments"},
-	{0x26,"TxJabbers"},
-	{0x27,"RxJabbers"},
-	{0x28,"TxCollisions"},
-	{0x29,"Tx64Octets"},
-	{0x2A,"Rx64Octets"},
-	{0x2B,"Tx65to127Bytes"},
-	{0x2C,"Rx65to127Bytes"},
-	{0x2D,"Tx128to255Bytes"},
-	{0x2E,"Rx128to255Bytes"},
-	{0x2F,"Tx256to511Bytes"},
-	{0x30,"Rx256to511Bytes"},
-	{0x31,"Tx512to1023Bytes"},
-	{0x32,"Rx512to1023Bytes"},
-	{0x33,"Tx1024to1518Bytes"},
-	{0x34,"Rx1024to1518Bytes"},
-	{0x36,"RxUndersizedropPkts"},
-	{0x37,"Tx1519toMaxBytes"},
-	{0x38,"Rx1519toMaxBytes"},
-	{0x39,"TxOverMaxBytes"},
-	{0x3A,"RxOverMaxBytes"}
-};
-
-static int rtl837x_mdio_write(void *ctx, u32 reg, u32 val)
+static int rtl837x_mdio_wait_idle(struct mii_bus *bus, int addr)
 {
-	struct rtk_gsw *priv = ctx;
+	int value, i;
+
+	for (i = 0; i < 1000; i++) {
+		value = bus->read(bus, addr, MDC_MDIO_CTRL_REG);
+		if (value < 0)
+			return value;
+		if (!(value & RTL837X_SMI_MDIO_BUSY))
+			return 0;
+
+		usleep_range(10, 20);
+	}
+
+	return -ETIMEDOUT;
+}
+
+static int rtl837x_mdio_write_command(struct rtl837x_priv *priv, u32 reg,
+				      u32 val, bool wait)
+{
 	struct mii_bus *bus = priv->bus;
 	int ret;
 
-	mutex_lock(&bus->mdio_lock);
-
-	// check busy
-	ret = bus->read(bus, priv->mdio_addr, MDC_MDIO_CTRL_REG);
-	if (ret < 0)
-		goto out_unlock;
-
-	if (ret & 0x4) {
-		ret = -ETIMEDOUT;
-		goto out_unlock;
-	}
-
+	mutex_lock_nested(&bus->mdio_lock, MDIO_MUTEX_NESTED);
+	ret = rtl837x_mdio_wait_idle(bus, priv->mdio_addr);
+	if (ret)
+		goto out;
 	ret = bus->write(bus, priv->mdio_addr, MDC_MDIO_ADDR_REG, reg);
-	if (ret)
-		goto out_unlock;
-
-	ret = bus->write(bus, priv->mdio_addr, MDC_MDIO_DATA_LOW, (val & 0xFFFF));
-	if (ret)
-		goto out_unlock;
-
-	ret = bus->write(bus, priv->mdio_addr, MDC_MDIO_DATA_HIGH, ((val >> 16) & 0xFFFF));
-	if (ret)
-		goto out_unlock;
-
-	ret = bus->write(bus, priv->mdio_addr, MDC_MDIO_CTRL_REG, MDC_MDIO_WRITE_CMD);
-	if (ret)
-		goto out_unlock;
-
-	// check busy
-	ret = bus->read(bus, priv->mdio_addr, MDC_MDIO_CTRL_REG);
 	if (ret < 0)
-		goto out_unlock;
-
-	if (ret & 0x4) {
-		ret = -ETIMEDOUT;
-		goto out_unlock;
-	}
-	ret = 0;
-out_unlock:
+		goto out;
+	ret = bus->write(bus, priv->mdio_addr, MDC_MDIO_DATA_LOW, val & 0xffff);
+	if (ret < 0)
+		goto out;
+	ret = bus->write(bus, priv->mdio_addr, MDC_MDIO_DATA_HIGH,
+			 (val >> 16) & 0xffff);
+	if (ret < 0)
+		goto out;
+	ret = bus->write(bus, priv->mdio_addr, MDC_MDIO_CTRL_REG,
+			 MDC_MDIO_WRITE_CMD);
+	if (ret < 0)
+		goto out;
+	if (wait)
+		ret = rtl837x_mdio_wait_idle(bus, priv->mdio_addr);
+out:
 	mutex_unlock(&bus->mdio_lock);
-	// printk("rtl837x_mdio_write ret:%d\n", ret);
+	return ret;
+}
+
+static int rtl837x_mdio_write(void *ctx, u32 reg, u32 val)
+{
+	return rtl837x_mdio_write_command(ctx, reg, val, true);
+}
+
+static int rtl837x_mdio_write_reset(struct rtl837x_priv *priv)
+{
+	int ret;
+
+	/* A reset may stop the register engine before its completion poll.
+	 * Serialize with regmap users, issue the command, then let chip setup
+	 * wait for reset readiness. MDIO staging errors are still returned.
+	 */
+	mutex_lock(&priv->map_lock);
+	ret = rtl837x_mdio_write_command(priv, RTL837X_REG_RESET,
+					RTL837X_RESET_SOC, false);
+	mutex_unlock(&priv->map_lock);
 	return ret;
 }
 
 static int rtl837x_mdio_read(void *ctx, u32 reg, u32 *val)
 {
-	struct rtk_gsw *priv = ctx;
+	struct rtl837x_priv *priv = ctx;
 	struct mii_bus *bus = priv->bus;
-	int ret, val_l, val_h;
+	int low, high, ret;
 
-	mutex_lock(&bus->mdio_lock);
-
-	// check busy
-	ret = bus->read(bus, priv->mdio_addr, MDC_MDIO_CTRL_REG);
-	if (ret < 0)
-		goto out_unlock;
-
-	if (ret & 0x4) {
-		ret = -ETIMEDOUT;
-		goto out_unlock;
-	}
-
+	mutex_lock_nested(&bus->mdio_lock, MDIO_MUTEX_NESTED);
+	ret = rtl837x_mdio_wait_idle(bus, priv->mdio_addr);
+	if (ret)
+		goto out;
 	ret = bus->write(bus, priv->mdio_addr, MDC_MDIO_ADDR_REG, reg);
-	if (ret)
-		goto out_unlock;
-
-	ret = bus->write(bus, priv->mdio_addr, MDC_MDIO_CTRL_REG, MDC_MDIO_READ_CMD);
-	if (ret)
-		goto out_unlock;
-
-	// check busy
-	ret = bus->read(bus, priv->mdio_addr, MDC_MDIO_CTRL_REG);
 	if (ret < 0)
-		goto out_unlock;
+		goto out;
+	ret = bus->write(bus, priv->mdio_addr, MDC_MDIO_CTRL_REG,
+			 MDC_MDIO_READ_CMD);
+	if (ret < 0)
+		goto out;
+	ret = rtl837x_mdio_wait_idle(bus, priv->mdio_addr);
+	if (ret)
+		goto out;
 
-	if (ret & 0x4) {
-		ret = -ETIMEDOUT;
-		goto out_unlock;
+	low = bus->read(bus, priv->mdio_addr, MDC_MDIO_DATA_LOW);
+	if (low < 0) {
+		ret = low;
+		goto out;
+	}
+	high = bus->read(bus, priv->mdio_addr, MDC_MDIO_DATA_HIGH);
+	if (high < 0) {
+		ret = high;
+		goto out;
 	}
 
-
-	val_l = bus->read(bus, priv->mdio_addr, MDC_MDIO_DATA_LOW);
-	if (val_l < 0) {
-		ret = val_l;
-		goto out_unlock;
-	}
-
-	val_h = bus->read(bus, priv->mdio_addr, MDC_MDIO_DATA_HIGH);
-	if (val_h < 0) {
-		ret = val_h;
-		goto out_unlock;
-	}
-
-    *val = val_l & 0xffff;
-    *val |= (val_h & 0xffff) << 16;
+	*val = (low & 0xffff) | ((u32)(high & 0xffff) << 16);
 	ret = 0;
-
-out_unlock:
+out:
 	mutex_unlock(&bus->mdio_lock);
-	// printk("rtl837x_mdio_read ret:%d\n", ret);
 	return ret;
 }
 
 static void rtl837x_mdio_lock(void *ctx)
 {
-	struct rtk_gsw *priv = ctx;
+	struct rtl837x_priv *priv = ctx;
 
 	mutex_lock(&priv->map_lock);
 }
 
 static void rtl837x_mdio_unlock(void *ctx)
 {
-	struct rtk_gsw *priv = ctx;
+	struct rtl837x_priv *priv = ctx;
 
 	mutex_unlock(&priv->map_lock);
 }
 
-static const struct regmap_config rtl837x_mdio_regmap_config = {
-	.reg_bits = 16,
-	.val_bits = 32,
-	.reg_stride = 4,
-
-	.max_register = 0xffff,
-	.reg_format_endian = REGMAP_ENDIAN_BIG,
-	.reg_read = rtl837x_mdio_read,
-	.reg_write = rtl837x_mdio_write,
-	.cache_type = REGCACHE_NONE,
-	.lock = rtl837x_mdio_lock,
-	.unlock = rtl837x_mdio_unlock,
-};
-
-static const struct regmap_config rtl837x_mdio_nolock_regmap_config = {
-	.reg_bits = 16,
-	.val_bits = 32,
-	.reg_stride = 4,
-
-	.max_register = 0xffff,
-	.reg_format_endian = REGMAP_ENDIAN_BIG,
-	.reg_read = rtl837x_mdio_read,
-	.reg_write = rtl837x_mdio_write,
-	.cache_type = REGCACHE_NONE,
-	.disable_locking = true,
-};
-
-static char* chipid_to_chip_name(switch_chip_t id)
+static void rtl837x_assert_reset(void *data)
 {
-	switch (id)
-	{
-	case CHIP_RTL8373:
-		return "RTL8373";
-	case CHIP_RTL8372:
-		return "RTL8372";
-	case CHIP_RTL8224:
-		return "RTL8224";
-	case CHIP_RTL8373N:
-		return "RTL8373N";
-	case CHIP_RTL8372N:
-		return "RTL8372N";
-	case CHIP_RTL8224N:
-		return "RTL8224N";
-	case CHIP_RTL8366U:
-		return "RTL8366U";
-	default:
-		return "Unknow";
-	}
+	struct rtl837x_priv *priv = data;
+
+	gpiod_set_value_cansleep(priv->reset, 1);
 }
 
-static int rtl837x_switch_probe(struct rtk_gsw *gsw)
+/* Reject unsupported wiring before asserting a board reset GPIO. */
+static int rtl8372n_check_dt(struct device *dev)
 {
-	switch_chip_t sw_chip;
-
-	for(int i = 0;; i++)
-	{
-		if(i>3)
-			goto CHIP_NOT_SUPPORTED;
-
-		if (switch_probe(&sw_chip) != RT_ERR_OK) {
-			dev_warn(gsw->dev , "Error: Detect switch type failed\n");
-			msleep(50);
-		}else
-			break;
-	}
-
-	switch (sw_chip)
-	{
-	case CHIP_RTL8372:
-	case CHIP_RTL8372N:
-		gsw->chip_name = chipid_to_chip_name(sw_chip);
-		gsw->num_ports = 6;
-		gsw->port_map = rtl8372_port_map;
-		gsw->valid_port_mask = GENMASK(8, 3);
-		gsw->dsa_num_ports = 9;
-		goto END_DETECT_CHIP;
-	case CHIP_RTL8373:
-	case CHIP_RTL8373N:
-		gsw->chip_name = chipid_to_chip_name(sw_chip);
-		gsw->num_ports = 9;
-		gsw->port_map = rtl8373_port_map;
-		gsw->valid_port_mask = GENMASK(8, 0);
-		gsw->dsa_num_ports = 9;
-		goto END_DETECT_CHIP;
-	default:
-		goto CHIP_NOT_SUPPORTED;
-	}
-
-CHIP_NOT_SUPPORTED:
-	//未知芯片ID
-	rtk_uint32 regValue;
-	rtk_api_ret_t ret;
-
-	ret = rtl8373_getAsicReg(0x4, &regValue);
-	if (ret != RT_ERR_OK) {
-		dev_err(gsw->dev,
-			"Error: Can not read device ID, error:%d\n", ret);
-		return ret;
-	}
-
-	dev_err(gsw->dev, "Error: Can not support this device, devid 0x%x\n", regValue);
-	return RT_ERR_CHIP_NOT_SUPPORTED;
-
-END_DETECT_CHIP:
-	gsw->pMapper = dal_rtl8373_mapper_get();
-	gsw->chip_id = sw_chip;
-
-	if (!gsw->cpu_port_from_dsa) {
-		if (gsw->legacy_cpu_port >= gsw->num_ports) {
-			dev_err(gsw->dev, "legacy CPU port %u is out of logical range\n",
-				gsw->legacy_cpu_port);
-			return RT_ERR_INPUT;
-		}
-
-		gsw->cpu_port = PORT_MAPPED(gsw->legacy_cpu_port);
-	}
-
-	if (!(gsw->valid_port_mask & BIT(gsw->cpu_port))) {
-		dev_err(gsw->dev, "CPU port %u is not valid for %s\n",
-			gsw->cpu_port, gsw->chip_name);
-		return RT_ERR_PORT_ID;
-	}
-
-	dev_info(gsw->dev, "Found Realtek RTL chip %s\n", gsw->chip_name);
-	return RT_ERR_OK;
-}
-
-static int rtl837x_hw_reset(struct rtk_gsw *gsw)
-{
-	if (!IS_ERR_OR_NULL(gsw->reset_pin)) {
-		dev_info(gsw->dev, "START HW RESET");
-		gpiod_set_value_cansleep(gsw->reset_pin, 1);
-		msleep(100);
-		gpiod_set_value_cansleep(gsw->reset_pin, 0);
-		msleep(100);
-		gpiod_set_value_cansleep(gsw->reset_pin, 1);
-		msleep(100);
-		dev_info(gsw->dev, "FINISH HW RESET");
-	}
-
-	return 0;
-}
-
-static const struct rtl837x_sdsmode_map _rtl837x_sdsmode[] = {
-	{ SERDES_10GQXG, "10g-qxg" },
-	{ SERDES_10GUSXG, "10g-usxg" },
-	{ SERDES_10GR, "10g-kr" },
-	{ SERDES_HSG, "hsgmii" },
-	{ SERDES_2500BASEX, "2500base-x" },
-	{ SERDES_SG, "sgmii" },
-	{ SERDES_1000BASEX, "1000base-x" },
-	{ SERDES_100FX, "100base-fx" },
-	{ SERDES_8221B, "8221b" },
-};
-
-static int rtl837x_sdsmode(const char *name, rtk_sds_mode_t *mode)
-{
-	int i;
-
-	for (i=0; i<ARRAY_SIZE(_rtl837x_sdsmode); i++)
-	{
-		if (!strcmp(name, _rtl837x_sdsmode[i].name))
-		{
-			*mode = _rtl837x_sdsmode[i].mode;
-			return 0;
-		}
-	}
-
-	return -EINVAL;
-}
-
-static int rtl837x_parse_sdsmode(struct device_node *np, const char *propname,
-				 rtk_sds_mode_t *mode)
-{
-	const char *name;
-	int ret;
-
-	ret = of_property_read_string(np, propname, &name);
-	if (ret == -EINVAL)
-		return 0;
-	if (ret)
-		return ret;
-
-	return rtl837x_sdsmode(name, mode);
-}
-
-static int rtl8372n_igmp_init(struct rtk_gsw *gsw)
-{
-
-	int ret;
-	ret = rtk_igmp_init();
-	if (ret) return ret;
-
-	ret = rtk_igmp_state_set(TRUE);
-	if (ret) return ret;
-
-	ret = rtk_igmp_fastLeave_set(TRUE);
-	if (ret) return ret;
-
-	if(gsw->num_ports > 0)
-	{
-		for(int port = 0;port < gsw->num_ports;port++){
-			rtk_uint32 phy_port = PORT_MAPPED(port);
-			ret = rtk_igmp_maxGroup_set(phy_port, 255);
-			if (ret)
-			{
-				dev_err(gsw->dev, "rtk_igmp_maxGroup_set failed, error:%d\n",ret);
-				return ret;
-			}
-		}
-		
-	}
-	return rtk_igmp_suppressionEnable_set(TRUE, TRUE);
-}
-
-static int of_extra_init(struct rtk_gsw *gsw)
-{
-	struct device_node *node = gsw->dev->of_node;
-	const __be32 *list;
-	int size, data_len, ret;
-	u32 reg, mask, val;
-
-	list = of_get_property(node, "extra-init", &size);
-	if (!list || !size) return 0;
-
-	data_len = of_property_count_elems_of_size(node, "extra-init",
-						  3 * sizeof(*list));
-	if (data_len < 0) {
-		dev_err(gsw->dev,
-			"invalid extra-init property length: %d bytes\n", size);
-		return data_len;
-	}
-
-	for (int i=0; i<data_len; i++)
-	{
-		reg = be32_to_cpu(*list);
-		list++;
-		mask = be32_to_cpu(*list);
-		list++;
-		val = be32_to_cpu(*list);
-		list++;
-		// dev_info(gsw->dev, "of_extra_init: reg:0x%X mask:0x%X val:0x%X\n", 
-		// 					reg, mask, val);
-		ret = rtl8373_setAsicRegBits(reg, mask, val);
-		if (ret) {
-			dev_err(gsw->dev,
-				"extra-init register write failed: reg 0x%04x mask 0x%08x value 0x%08x, error:%d\n",
-				reg, mask, val, ret);
-			return ret;
-		}
-	}
-	return 0;
-}
-
-int rtl8372n_hw_init(struct rtk_gsw *gsw, rtl837x_pnswap_cfg_t swap_cfg)
-{
-
-	unsigned int ret;
-	rtl837x_hw_reset(gsw);
-	ret = rtl837x_switch_probe(gsw);
-	if(ret){
-		dev_err(gsw->dev, "rtl837x_switch_probe Fail, error:%d\n", ret);
-		return -EPERM;
-	}
-
-	// Sx PN swap:
-    // 	RX:
-    // 		page0 reg0 bit9:1
-    // 		page6 reg2 bit13:1
-    // 	TX:
-    // 		page0 reg0 bit8:1
-    // 		page6 reg2 bit14:1
-	if (swap_cfg.sds0_rx_swap)
-	{
-		/* SDS0 RX PN swap */
-		ret = gsw->pMapper->rtl8373_sds_regbits_write(
-			0, 0, 0, 0x200, 1);
-		if (ret) {
-			dev_warn(gsw->dev,
-				 "SDS0 RX PN swap configuration failed, continuing, error:%d\n",
-				 ret);
-		}
-
-		ret = gsw->pMapper->rtl8373_sds_regbits_write(0, 6, 2, 0x2000, 1);
-		if (ret) {
-			dev_warn(gsw->dev,
-				 "SDS0 RX PN swap page 6 configuration failed, continuing, error:%d\n",
-				 ret);
-		}
-	}
-
-	if (swap_cfg.sds0_tx_swap)
-	{
-		/* SDS0 TX PN swap */
-		ret = gsw->pMapper->rtl8373_sds_regbits_write(
-			0, 0, 0, 1 << 8, 1);
-		if (ret) {
-			dev_warn(gsw->dev,
-				 "SDS0 TX PN swap configuration failed, continuing, error:%d\n",
-				 ret);
-		}
-
-		ret = gsw->pMapper->rtl8373_sds_regbits_write(0, 6, 2, 1 << 14, 1);
-		if (ret) {
-			dev_warn(gsw->dev,
-				 "SDS0 TX PN swap page 6 configuration failed, continuing, error:%d\n",
-				 ret);
-		}
-	}
-
-	if (swap_cfg.sds1_rx_swap)
-	{
-		/* SDS1 RX PN swap */
-		ret = gsw->pMapper->rtl8373_sds_regbits_write(
-			1, 0, 0, 0x200, 1);
-		if (ret) {
-			dev_warn(gsw->dev,
-				 "SDS1 RX PN swap configuration failed, continuing, error:%d\n",
-				 ret);
-		}
-
-		ret = gsw->pMapper->rtl8373_sds_regbits_write(1, 6, 2, 0x2000, 1);
-		if (ret) {
-			dev_warn(gsw->dev,
-				 "SDS1 RX PN swap page 6 configuration failed, continuing, error:%d\n",
-				 ret);
-		}
-	}
-
-	if (swap_cfg.sds1_tx_swap)
-	{
-		/* SDS1 TX PN swap */
-		ret = gsw->pMapper->rtl8373_sds_regbits_write(
-			1, 0, 0, 1 << 8, 1);
-		if (ret) {
-			dev_warn(gsw->dev,
-				 "SDS1 TX PN swap configuration failed, continuing, error:%d\n",
-				 ret);
-		}
-
-		ret = gsw->pMapper->rtl8373_sds_regbits_write(1, 6, 2, 1 << 14, 1);
-		if (ret) {
-			dev_warn(gsw->dev,
-				 "SDS1 TX PN swap page 6 configuration failed, continuing, error:%d\n",
-				 ret);
-		}
-	}
-
-    // ##MDI reverse configuration for Demo Tap UP RJ45, RTL8366U/RTL8373N/RTL8372N
-	if (swap_cfg.phy_mdi_reverse) {
-		ret = gsw->pMapper->rtl8373_setAsicRegBits(
-			RTL8373_CFG_PHY_MDI_REVERSE_ADDR, 0xF, 0xC);
-		if (ret) {
-			dev_warn(gsw->dev,
-				 "PHY MDI reverse configuration failed, continuing, error:%d\n",
-				 ret);
-		}
-	}
-
-	if (swap_cfg.phy_tx_polarity_swap) {
-		/* PHY TX polarity swap */
-		ret = gsw->pMapper->rtl8373_setAsicRegBits(
-			RTL8373_CFG_PHY_TX_POLARITY_SWAP_ADDR, 0xFFFF, 0x596A);
-		if (ret) {
-			dev_warn(gsw->dev,
-				 "PHY TX polarity swap configuration failed, continuing, error:%d\n",
-				 ret);
-		}
-	}
-
-	ret = rtk_switch_init();
-	if(ret){
-		dev_err(gsw->dev, "rtk_switch_init Fail, error:%d\n", ret);
-		return -EPERM;
-	}
-
-	ret = of_extra_init(gsw);
-	if (ret) {
-		dev_err(gsw->dev, "extra-init failed, error:%d\n", ret);
-		return -EPERM;
-	}
-
-	ret = rtk_vlan_reset();
-	if (ret)
-	{
-		dev_err(gsw->dev, "rtk_vlan_reset failed, error:%d\n", ret);
-		return -EPERM;
-	}
-
-	ret = rtk_vlan_init();
-	if (ret)
-	{
-		dev_err(gsw->dev, "rtk_vlan_init failed, error:%d\n", ret);
-		return -EPERM;
-	}
-
-	ret = rtl8372n_igmp_init(gsw);
-	if (ret)
-	{
-		dev_err(gsw->dev, "rtl8372n_igmp_init failed, error:%d\n", ret);
-		return -EPERM;
-	}
-
-	rtk_rmaParam_t pRmacfg;
-	ret = rtk_rma_get(2, &pRmacfg);
-	if ( ret )
-	{
-		dev_err(gsw->dev, "rtk_rma_get get rma failed, error:%d\n", ret);
-	return -EPERM;
-	}
-
-	pRmacfg.operation = RMAOP_FORWARD; // 清零配置
-	ret = rtk_rma_set(2, &pRmacfg);
-	if ( ret )
-	{
-		dev_err(gsw->dev, "rtk_rma_get set rma failed, error:%d\n", ret);
-		return -EPERM;
-	}
-
-	for(int port = 0;port < gsw->num_ports;port++){
-		ret = rtk_eee_portTxRxEn_set(PORT_MAPPED(port), 0u, 0u);
-		if (ret)
-		{
-			dev_err(gsw->dev, "rtk_eee_portTxRxEn_set failed, error:%d\n",ret);
-			return -EPERM;
-		}
-	}
-
-	ret = rtk_sdsMode_set(0, SERDES_10GR);
-	if (ret) return -EPERM;
-	ret = rtk_sdsMode_set(0, gsw->sds0mode);
-	if (ret) return -EPERM;
-
-	ret = rtk_sdsMode_set(1, SERDES_10GR);
-	if (ret) return -EPERM;
-	ret = rtk_sdsMode_set(1, gsw->sds1mode);
-	if (ret) return -EPERM;
-
-	ret = rtk_cpu_externalCpuPort_set(gsw->cpu_port);
-	if (ret)
-	{
-		dev_err(gsw->dev, "rtk_cpu_externalCpuPort_set failed, error:%d\n",ret);
-		return -EPERM;
-	}
-
-	// TODO
-	// res = rtl8372n_igrAcl_init();
-	// if (res != RT_ERR_OK){
-	// 	dev_err(gsw->dev, "ACL init failed, ret=%d\n", res);
-	// 	return res;
-	// }
-
-	// TODO
-	// res = rtl837x_acl_add_u(a1);
-	// if (res != RT_ERR_OK){
-	// 	dev_err(gsw->dev, "rtl837x_acl_add failed, ret=%d\n", res);
-	// 	return res;
-	// }
-
-	return 0;
-}
-
-static void rtl837x_status_check_work_func(struct work_struct *work)
-{
-	struct rtk_gsw *gsw = container_of(work, struct rtk_gsw, status_check_work.work);
-
-	rtk_port_status_t port_status = { 0 };
-	int ret;
-
-	if (!gsw->ethernet_master)
-		return;
-
-	ret = rtk_port_macStatus_get(gsw->cpu_port, &port_status);
-	if (ret) {
-		dev_warn_ratelimited(gsw->dev,
-				     "failed to read CPU port status: %d\n", ret);
-		goto reschedule;
-	}
-
-	if (!port_status.link)
-	{
-		if (gsw->cpu_port != UTP_PORT3 && gsw->cpu_port != UTP_PORT8)
-		{
-			dev_warn(gsw->dev, "CPU Port Down, But the CPU port is not Serdes Port, Skip Reset and stop CPU port check work\n");
-			return;
-		}
-
-		dev_info(gsw->dev, "CPU Port Down, Try to reset Serdes, mode: 0x%x\n", gsw->sds0mode);
-
-		rtnl_lock();
-		dev_close(gsw->ethernet_master);
-		rtnl_unlock();
-		ret = rtk_sdsMode_set(0, SERDES_OFF);
-		if (ret)
-			dev_warn_ratelimited(gsw->dev,
-					     "failed to disable CPU SerDes: %d\n", ret);
-		msleep(200);
-
-		rtnl_lock();
-		ret = dev_open(gsw->ethernet_master, NULL);
-		rtnl_unlock();
-		if (ret)
-			dev_warn_ratelimited(gsw->dev,
-					     "failed to reopen ethernet master: %d\n", ret);
-
-		ret = rtk_sdsMode_set(0, gsw->sds0mode);
-		if (ret)
-			dev_warn_ratelimited(gsw->dev,
-					     "failed to restore CPU SerDes mode: %d\n", ret);
-
-		msleep(2000);
-	}
-
-reschedule:
-	queue_delayed_work(system_wq, &gsw->status_check_work,
-				   msecs_to_jiffies(gsw->default_work_delay_ms));
-}
-
-/* unused */
-static void rtl837x_sfp_attach(void *upstream, struct sfp_bus *bus)
-{
-	struct rtk_gsw *gsw = upstream;
-	dev_info(gsw->dev, "SFP module attach\n");
-}
-
-/* unused */
-static void rtl837x_sfp_detach(void *upstream, struct sfp_bus *bus)
-{
-	struct rtk_gsw *gsw = upstream;
-	dev_info(gsw->dev, "SFP module detach\n");
-}
-
-static int rtl837x_sfp_module_insert(void *upstream, const struct sfp_eeprom_id *id)
-{
-	struct rtk_gsw *gsw = upstream;
-	phy_interface_t iface;
-	rtk_sds_mode_t old_mode = gsw->sds1mode;
-	rtk_api_ret_t ret;
-
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(6,18,0)
-	const struct sfp_module_caps *caps;
-	caps = sfp_get_module_caps(gsw->sfp_bus);
-	iface = sfp_select_interface(gsw->sfp_bus, caps->link_modes);
-#else
-	__ETHTOOL_DECLARE_LINK_MODE_MASK(support) = { 0, };
-	DECLARE_PHY_INTERFACE_MASK(interfaces);
-	sfp_parse_support(gsw->sfp_bus, id, support, interfaces);
-	iface = sfp_select_interface(gsw->sfp_bus, support);
-#endif
-
-	dev_info(gsw->dev, "%s SFP module inserted\n", phy_modes(iface));
-
-	switch (iface) {
-	case PHY_INTERFACE_MODE_10GBASER:
-		USE_SERDESMODE(1, SERDES_10GR);
-		break;
-	case PHY_INTERFACE_MODE_2500BASEX:
-		USE_SERDESMODE(1, SERDES_2500BASEX);
-		break;
-	case PHY_INTERFACE_MODE_1000BASEX:
-		USE_SERDESMODE(1, SERDES_1000BASEX);
-		break;
-	case PHY_INTERFACE_MODE_SGMII:
-		USE_SERDESMODE(1, SERDES_SG);
-		break;
-	case PHY_INTERFACE_MODE_100BASEX:
-		USE_SERDESMODE(1, SERDES_100FX);
-		break;
-	default:
-		dev_err(gsw->dev, "Incompatible SFP module inserted\n");
+	struct device_node *ports, *port, *fixed;
+	phy_interface_t interface;
+	u32 index, speed;
+	unsigned int cpus = 0, users = 0;
+	u16 seen = 0;
+	int ret = -EOPNOTSUPP;
+
+	ports = of_get_child_by_name(dev->of_node, "ports");
+	if (!ports)
 		return -EINVAL;
-	}
-
-	ret = rtk_sdsMode_set(1, gsw->sds1mode);
-	if (ret) {
-		gsw->sds1mode = old_mode;
-		dev_err(gsw->dev, "failed to set SFP SerDes mode: %d\n", ret);
-		return -EIO;
-	}
-
-	return 0;
-}
-
-static void rtl837x_sfp_module_remove(void *upstream)
-{
-	struct rtk_gsw *gsw = upstream;
-	rtk_sds_mode_t old_mode = gsw->sds1mode;
-	rtk_api_ret_t ret;
-	dev_info(gsw->dev, "SFP module remove\n");
-
-	USE_SERDESMODE(1, SERDES_OFF);
-	ret = rtk_sdsMode_set(1, gsw->sds1mode);
-	if (ret) {
-		gsw->sds1mode = old_mode;
-		dev_err(gsw->dev, "failed to disable SFP SerDes: %d\n", ret);
-	}
-}
-
-static const struct sfp_upstream_ops sfp_ops = {
-	.attach = rtl837x_sfp_attach,
-	.detach = rtl837x_sfp_detach,
-	.module_insert = rtl837x_sfp_module_insert,
-	.module_remove = rtl837x_sfp_module_remove,
-	// .module_start = rtl837x_sfp_module_start,
-	// .module_stop = rtl837x_sfp_module_stop,
-	// .link_up = rtl837x_sfp_link_up,
-	// .link_down = rtl837x_sfp_link_down,
-	// .connect_phy = rtl837x_sfp_connect_phy,
-	// .disconnect_phy = rtl837x_sfp_disconnect_phy,
-};
-
-static int rtl837x_sfp_probe(struct rtk_gsw *gsw)
-{
-	int ret;
-
-	struct sfp_bus *bus = sfp_bus_find_fwnode(gsw->dev->fwnode);
-	if (IS_ERR(bus))
-	{
-		dev_err(gsw->dev, "unable to attach SFP bus: %pe\n", bus);
-		return PTR_ERR(bus);
-	}
-
-	gsw->sfp_bus = bus;
-
-	ret = sfp_bus_add_upstream(bus, gsw, &sfp_ops);
-	if (ret)
-		gsw->sfp_bus = NULL;
-	sfp_bus_put(bus);
-
-	return ret;
-}
-
-static int rtl837x_status_check_work_init(struct rtk_gsw *gsw)
-{
-	gsw->default_work_delay_ms = 1000;
-	INIT_DELAYED_WORK(&gsw->status_check_work, rtl837x_status_check_work_func);
-	queue_delayed_work(system_wq, &gsw->status_check_work,
-				   msecs_to_jiffies(gsw->default_work_delay_ms));
-	return 0;
-}
-
-static int rtl837x_of_get_dsa_cpu_port(struct device_node *np, u32 *port,
-				       struct device_node **ethernet)
-{
-	struct device_node *ports, *child;
-	int ret;
-
-	*ethernet = NULL;
-
-	ports = of_get_child_by_name(np, "ports");
-	if (!ports)
-		ports = of_get_child_by_name(np, "ethernet-ports");
-	if (!ports)
-		return -ENOENT;
-
-	for_each_available_child_of_node(ports, child) {
-		struct device_node *eth;
-
-		eth = of_parse_phandle(child, "ethernet", 0);
-		if (!eth)
-			continue;
-
-		ret = of_property_read_u32(child, "reg", port);
-		if (ret) {
-			of_node_put(eth);
-			of_node_put(child);
-			of_node_put(ports);
-			return ret;
+	for_each_available_child_of_node(ports, port) {
+		if (of_property_read_u32(port, "reg", &index) ||
+		    index >= RTL8372N_NUM_PORTS || (seen & BIT(index)) ||
+		    of_get_phy_mode(port, &interface) ||
+		    of_find_property(port, "link", NULL))
+			goto out_port;
+		if (of_find_property(port, "ethernet", NULL)) {
+			if ((index != 3 && index != 8) ||
+			    interface != PHY_INTERFACE_MODE_10GBASER)
+				goto out_port;
+			fixed = of_get_child_by_name(port, "fixed-link");
+			if (!fixed)
+				goto out_port;
+			ret = of_property_read_u32(fixed, "speed", &speed);
+			if (!ret && (speed != SPEED_10000 ||
+				     !of_property_read_bool(fixed, "full-duplex")))
+				ret = -EOPNOTSUPP;
+			of_node_put(fixed);
+			if (ret)
+				goto out_port;
+			cpus++;
+		} else {
+			if (index < 4 || index > 7 ||
+			    interface != PHY_INTERFACE_MODE_INTERNAL)
+				goto out_port;
+			users++;
 		}
-
-		*ethernet = eth;
-		of_node_put(child);
-		of_node_put(ports);
-		return 0;
+		seen |= BIT(index);
+		ret = -EOPNOTSUPP;
 	}
-
+	ret = cpus == 1 && users ? 0 : -EOPNOTSUPP;
+	goto out;
+out_port:
+	of_node_put(port);
+out:
 	of_node_put(ports);
-	return -ENOENT;
-}
-
-// below are platform driver
-static const struct of_device_id rtk_gsw_match[] = {
-	{ .compatible = "realtek,rtl837x" },
-	{},
-};
-
-MODULE_DEVICE_TABLE(of, rtk_gsw_match);
-
-static DEFINE_MUTEX(rtl837x_instance_lock);
-
-static int rtl837x_claim_global_priv(struct rtk_gsw *gsw)
-{
-	int ret = 0;
-
-	mutex_lock(&rtl837x_instance_lock);
-	if (rtl_gbl_priv)
-		ret = -EBUSY;
-	else
-		rtl_gbl_priv = gsw;
-	mutex_unlock(&rtl837x_instance_lock);
-
 	return ret;
 }
 
-static void rtl837x_clear_global_priv(struct rtk_gsw *gsw)
+static int rtl837x_mdio_probe(struct mdio_device *mdiodev)
 {
-	mutex_lock(&rtl837x_instance_lock);
-	if (rtl_gbl_priv == gsw)
-		rtl_gbl_priv = NULL;
-	mutex_unlock(&rtl837x_instance_lock);
-}
-
-static int rtl837x_dsa_probe(struct mdio_device *mdiodev)
-{
-	struct device *dev =&mdiodev->dev;
-	struct device_node *np = dev->of_node;
-	struct rtk_gsw *gsw;
-	struct device_node *ethernet;
-	struct net_device *master;
-	struct regmap_config rc;
-	u32 cpu_port;
-	bool cpu_port_from_dsa = false;
-	
+	struct device *dev = &mdiodev->dev;
+	const struct rtl837x_variant *variant;
+	struct rtl837x_priv *priv;
+	const struct regmap_config regmap_template = {
+		.reg_bits = 16,
+		.val_bits = 32,
+		.reg_stride = 4,
+		.max_register = 0xffff,
+		.reg_format_endian = REGMAP_ENDIAN_BIG,
+		.reg_read = rtl837x_mdio_read,
+		.reg_write = rtl837x_mdio_write,
+		.cache_type = REGCACHE_NONE,
+		.lock = rtl837x_mdio_lock,
+		.unlock = rtl837x_mdio_unlock,
+	};
+	struct regmap_config regmap_config = regmap_template;
 	int ret;
-	dev_info(dev, "start rtl837x_dsa_probe");
 
-	ret = rtl837x_of_get_dsa_cpu_port(np, &cpu_port, &ethernet);
-	if (ret == -ENOENT) {
-		ethernet = of_parse_phandle(np, "ethernet", 0);
-
-		ret = of_property_read_u32(np, "rtl837x,cpu-port", &cpu_port);
-		if (ret) {
-			dev_err(dev, "failed to get DSA CPU port or legacy rtl837x,cpu-port\n");
-			if (ethernet)
-				of_node_put(ethernet);
-			return -EINVAL;
-		}
-	} else if (ret) {
-		dev_err(dev, "failed to parse DSA CPU port: %d\n", ret);
-		return ret;
-	} else {
-		cpu_port_from_dsa = true;
-	}
-
-	if (ethernet)
-	{
-		rtnl_lock();
-		master = of_find_net_device_by_node(ethernet);
-		of_node_put(ethernet);
-		if (!master) {
-			rtnl_unlock();
-			return -EPROBE_DEFER;
-		}
-
-		/* of_find_net_device_by_node() returns a reference to the
-		 * embedded struct device, not a netdev reference, while every
-		 * release of this pointer below is a dev_put().  Convert it
-		 * the way DSA does for its own copy of the conduit, and do so
-		 * under RTNL: free_netdev() releases the per-CPU refcount
-		 * storage before the final device reference is dropped, so
-		 * the netdev must not be unregistered between the lookup and
-		 * the hold.
-		 */
-		dev_hold(master);
-		put_device(&master->dev);
-		rtnl_unlock();
-	}else
-	{
-		master = NULL;
-		dev_warn(dev, "node 'ethernet' is not set\n");
-	}
-
-	gsw = devm_kzalloc(dev, sizeof(struct rtk_gsw), GFP_KERNEL);
-	if (!gsw) {
-		if (master)
-			dev_put(master);
-		return -ENOMEM;	
-	}
-
-	mutex_init(&gsw->map_lock);
-	mutex_init(&gsw->flood_lock);
-	
-	rc = rtl837x_mdio_regmap_config;
-	rc.lock_arg = gsw;
-	gsw->map = devm_regmap_init(dev, NULL, gsw, &rc);
-	if (IS_ERR(gsw->map)) {
-		ret = PTR_ERR(gsw->map);
-		dev_err(dev, "regmap init failed: %d\n", ret);
-		if (master)
-			dev_put(master);
-		return ret;
-	}
-
-	rc = rtl837x_mdio_nolock_regmap_config;
-	gsw->map_nolock = devm_regmap_init(dev, NULL, gsw, &rc);
-	if (IS_ERR(gsw->map_nolock)) {
-		ret = PTR_ERR(gsw->map_nolock);
-		dev_err(dev, "regmap init failed: %d\n", ret);
-		if (master)
-			dev_put(master);
-		return ret;
-	}
-
-	gsw->dev = dev;
-	gsw->bus = mdiodev->bus;
-	gsw->ethernet_master = master;
-	gsw->sds0mode = SERDES_OFF;
-	gsw->sds1mode = SERDES_OFF;
-	gsw->cpu_port = cpu_port;
-	gsw->legacy_cpu_port = cpu_port;
-	gsw->cpu_port_from_dsa = cpu_port_from_dsa;
-
-	gsw->reset_pin = devm_gpiod_get_optional(dev, "reset", GPIOD_OUT_LOW);
-	if (IS_ERR(gsw->reset_pin)) {
-		ret = PTR_ERR(gsw->reset_pin);
-		if (ret == -EPROBE_DEFER) {
-			dev_err_probe(dev, ret, "failed to get reset GPIO\n");
-			if (master)
-				dev_put(master);
-			return ret;
-		}
-
-		dev_warn(dev,
-			 "failed to get reset GPIO: %d; "
-			 "continuing without reset GPIO\n", ret);
-		gsw->reset_pin = NULL;
-	}
-
-	ret = rtl837x_parse_sdsmode(np, "rtl837x,sds0mode", &gsw->sds0mode);
-	if (ret) {
-		dev_warn(dev,
-			 "invalid rtl837x,sds0mode property: %d; "
-			 "leaving SerDes disabled\n", ret);
-	}
-
-	ret = rtl837x_parse_sdsmode(np, "rtl837x,sds1mode", &gsw->sds1mode);
-	if (ret) {
-		dev_warn(dev,
-			 "invalid rtl837x,sds1mode property: %d; "
-			 "leaving SerDes disabled\n", ret);
-	}
-
-	memset(&(gsw->swap_cfg),0,sizeof(rtl837x_pnswap_cfg_t));
-	if (of_property_read_bool(np, "sds0-rx-swap"))
-		gsw->swap_cfg.sds0_rx_swap = 1;
-	if (of_property_read_bool(np, "sds0-tx-swap"))
-		gsw->swap_cfg.sds0_tx_swap = 1;
-	if (of_property_read_bool(np, "sds1-rx-swap"))
-		gsw->swap_cfg.sds1_rx_swap = 1;
-	if (of_property_read_bool(np, "sds1-tx-swap"))
-		gsw->swap_cfg.sds1_tx_swap = 1;
-
-	if (of_property_read_bool(np, "phy-mdi-reverse"))
-		gsw->swap_cfg.phy_mdi_reverse = 1;
-	if (of_property_read_bool(np, "phy-tx-polarity-swap"))
-		gsw->swap_cfg.phy_tx_polarity_swap = 1;
-
-	gsw->mdio_addr = mdiodev->addr;
-	gsw->mib_counters = rtl837x_mib_counters;
-	gsw->num_mib_counters = ARRAY_SIZE(rtl837x_mib_counters);
-
-	dev_info(gsw->dev, "rtl837x dev info:smi-addr:%d configured-cpu-port:%u serdes-mode:%d swap_cfg:0x%x\n",
-						 gsw->mdio_addr, gsw->cpu_port, gsw->sds0mode, *(uint8_t*)&(gsw->swap_cfg));
-
-	ret = rtl837x_claim_global_priv(gsw);
-	if (ret) {
-		dev_err(dev, "another RTL837x switch instance is already active\n");
-		if (master)
-			dev_put(master);
-		return ret;
-	}
-
-	dev_set_drvdata(dev, gsw);
-
-	ret = rtl8372n_hw_init(gsw, gsw->swap_cfg);
+	variant = of_device_get_match_data(dev);
+	if (!variant)
+		return -EINVAL;
+	ret = rtl8372n_check_dt(dev);
 	if (ret)
-	{
-		dev_err(gsw->dev, "rtl8372n_hw_init failed, ret=%d\n",ret);
-		rtl837x_clear_global_priv(gsw);
-		dev_set_drvdata(dev, NULL);
-		if (master)
-			dev_put(master);
-		return -ENODEV;
-	}
+		return dev_err_probe(dev, ret, "unsupported P0 device tree\n");
 
-	dev_info(gsw->dev, "rtl837x DSA cpu-port:%u valid-port-mask:0x%x\n",
-		 gsw->cpu_port, gsw->valid_port_mask);
+	priv = devm_kzalloc(dev, size_add(sizeof(*priv), variant->chip_data_sz),
+			    GFP_KERNEL);
+	if (!priv)
+		return -ENOMEM;
 
-	ret = rtl837x_dsa_register(gsw);
-	if (ret){
-		dev_err(gsw->dev, "rtl837x_dsa_register failed, ret=%d\n", ret);
-		rtl837x_clear_global_priv(gsw);
-		dev_set_drvdata(dev, NULL);
-		if (master)
-			dev_put(master);
+	regmap_config.lock_arg = priv;
+	mutex_init(&priv->map_lock);
+	mutex_init(&priv->sds_lock);
+	mutex_init(&priv->phy_lock);
+	priv->map = devm_regmap_init(dev, NULL, priv, &regmap_config);
+	if (IS_ERR(priv->map)) {
+		ret = PTR_ERR(priv->map);
+		dev_err(dev, "regmap init failed: %d\n", ret);
 		return ret;
 	}
 
-#ifdef CONFIG_GPIOLIB
-	if (of_property_read_bool(np, "gpio-controller")) {
-		ret = rtl837x_gpiochip_init(gsw);
-		if (ret)
-			dev_err_probe(dev, ret,
-				      "failed to register GPIO controller; "
-				      "continuing without GPIO\n");
+	priv->mdio_addr = mdiodev->addr;
+	priv->bus = mdiodev->bus;
+	priv->dev = dev;
+	priv->chip_data = (void *)(priv + 1);
+	priv->ops = variant->ops;
+	priv->write_reset = rtl837x_mdio_write_reset;
+
+	/* Logical active means asserted, including active-low GPIOs. */
+	priv->reset = devm_gpiod_get_optional(dev, "reset", GPIOD_OUT_HIGH);
+	if (IS_ERR(priv->reset)) {
+		ret = PTR_ERR(priv->reset);
+		dev_err(dev, "failed to get reset GPIO: %d\n", ret);
+		return ret;
 	}
-#endif /* CONFIG_GPIOLIB */
+	if (priv->reset) {
+		ret = devm_add_action_or_reset(dev, rtl837x_assert_reset, priv);
+		if (ret)
+			return ret;
+		usleep_range(50000, 51100);
+		gpiod_set_value_cansleep(priv->reset, 0);
+		usleep_range(50000, 51100);
+	}
 
-	/* SFP is optional; keep a registration failure from tearing down DSA. */
-	rtl837x_sfp_probe(gsw);
+	ret = priv->ops->detect(priv);
+	if (ret) {
+		dev_err(dev, "unable to detect RTL8372N: %d\n", ret);
+		return ret;
+	}
 
-	rtl837x_debug_proc_init(gsw);
-	rtl837x_status_check_work_init(gsw);
+	priv->ds = devm_kzalloc(dev, sizeof(*priv->ds), GFP_KERNEL);
+	if (!priv->ds)
+		return -ENOMEM;
+
+	priv->ds->dev = dev;
+	priv->ds->num_ports = priv->num_ports;
+	priv->ds->priv = priv;
+	priv->ds->ops = variant->ds_ops_mdio;
+	priv->ds->phylink_mac_ops = variant->pl_mac_ops;
+
+	ret = dsa_register_switch(priv->ds);
+	if (ret) {
+		if (priv->reset)
+			gpiod_set_value_cansleep(priv->reset, 1);
+		return dev_err_probe(dev, ret, "unable to register switch\n");
+	}
+
+	dev_set_drvdata(dev, priv);
 	return 0;
 }
 
-static void rtl837x_dsa_remove(struct mdio_device *mdiodev)
+static void rtl837x_mdio_remove(struct mdio_device *mdiodev)
 {
-	struct rtk_gsw *gsw = dev_get_drvdata(&mdiodev->dev);;
+	struct rtl837x_priv *priv = dev_get_drvdata(&mdiodev->dev);
 
-	if (!gsw)
+	if (!priv)
 		return;
 
-	cancel_delayed_work_sync(&gsw->status_check_work);
-	if (gsw->sfp_bus)
-		sfp_bus_del_upstream(gsw->sfp_bus);
-
-	rtl837x_dsa_unregister(gsw);
-	rtl837x_debug_proc_deinit(gsw);
-	if (gsw->ethernet_master) {
-		dev_put(gsw->ethernet_master);
-		gsw->ethernet_master = NULL;
-	}
-	rtl837x_clear_global_priv(gsw);
+	dsa_unregister_switch(priv->ds);
+	if (priv->reset)
+		gpiod_set_value_cansleep(priv->reset, 1);
 }
 
 static void rtl837x_mdio_shutdown(struct mdio_device *mdiodev)
 {
-	struct rtk_gsw *gsw = dev_get_drvdata(&mdiodev->dev);
+	struct rtl837x_priv *priv = dev_get_drvdata(&mdiodev->dev);
 
-	if (!gsw)
-		return;
-
-	cancel_delayed_work_sync(&gsw->status_check_work);
-	rtl837x_dsa_shutdown(gsw);
-	if (gsw->ethernet_master) {
-		dev_put(gsw->ethernet_master);
-		gsw->ethernet_master = NULL;
+	if (priv) {
+		dsa_switch_shutdown(priv->ds);
+		dev_set_drvdata(&mdiodev->dev, NULL);
 	}
-
-	dev_set_drvdata(&mdiodev->dev, NULL);
 }
+
+static const struct of_device_id rtl837x_mdio_match[] = {
+	{ .compatible = "realtek,rtl8372n", .data = &rtl8372n_variant },
+	{ }
+};
+MODULE_DEVICE_TABLE(of, rtl837x_mdio_match);
 
 static struct mdio_driver rtl837x_mdio_driver = {
 	.mdiodrv.driver = {
-		.name = "rtl837x-dsa",
-		.of_match_table = rtk_gsw_match,
+		.name = "rtl8372n-mdio",
+		.of_match_table = rtl837x_mdio_match,
 	},
-	.probe  = rtl837x_dsa_probe,
-	.remove = rtl837x_dsa_remove,
+	.probe = rtl837x_mdio_probe,
+	.remove = rtl837x_mdio_remove,
 	.shutdown = rtl837x_mdio_shutdown,
 };
-mdio_module_driver(rtl837x_mdio_driver);
+static int __init rtl8372n_init(void)
+{
+	int ret;
+
+	/* Register the private PHY driver before creating its child bus. */
+	ret = phy_drivers_register(&rtl8372n_phy_driver, 1, THIS_MODULE);
+	if (ret)
+		return ret;
+	ret = mdio_driver_register(&rtl837x_mdio_driver);
+	if (ret)
+		phy_drivers_unregister(&rtl8372n_phy_driver, 1);
+	return ret;
+}
+module_init(rtl8372n_init);
+
+static void __exit rtl8372n_exit(void)
+{
+	mdio_driver_unregister(&rtl837x_mdio_driver);
+	phy_drivers_unregister(&rtl8372n_phy_driver, 1);
+}
+module_exit(rtl8372n_exit);
 
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("StarField Xu <air_jinkela@163.com>");
-MODULE_DESCRIPTION("RTL837x DSA switch driver");
+MODULE_DESCRIPTION("RTL8372N DSA switch driver");
