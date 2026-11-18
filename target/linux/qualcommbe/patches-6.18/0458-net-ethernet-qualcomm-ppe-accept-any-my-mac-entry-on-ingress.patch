@@ -1,0 +1,33 @@
+From: Benoit Masson <yahoo@perenite.com>
+Subject: [PATCH] net: ethernet: qualcomm: ppe: accept any MY_MAC entry on
+ ingress
+
+Each port ingress L3 interface selected only its own MY_MAC entry, so a
+frame addressed to any other address of this router fell through to L2
+forwarding by the FDB and never reached software. On a board whose
+ports sit under a software bridge that happens for the bridge address
+whenever the frame arrives on a different member.
+
+Accept all MY_MAC entries: every one is by construction an address of
+this router, so routing such frames to the CPU is always correct. The
+qca-ssdk accumulates the same bitmap per interface and its bridge
+manager adds group addresses to every member.
+
+Reproducer and measurement on TP-Link Archer BE800 (IPQ9574, lan1
+cabled to lan4, lan4 in a network namespace): before, a namespace peer
+saw 100 percent RX loss and unreachable routes; after, ping 0.2 ms and
+NAT hardware offload unchanged at 2.35 Gbit/s.
+
+Signed-off-by: Benoit Masson <yahoo@perenite.com>
+---
+--- a/drivers/net/ethernet/qualcomm/ppe/edma_port.c	2026-10-02 08:00:46.540002523 +0000
++++ b/drivers/net/ethernet/qualcomm/ppe/edma_port.c	2026-10-02 08:00:46.560002523 +0000
+@@ -798,7 +798,7 @@
+ 	in.mtu = mtu;
+ 	in.mru_ipv6 = mtu;
+ 	in.mtu_ipv6 = mtu;
+-	in.mac_bitmap = BIT(my_mac);
++	in.mac_bitmap = GENMASK(PPE_MY_MAC_TBL_ENTRIES - 1, 0);
+ 	in.ipv4_uc_route_en = true;
+ 	in.ipv6_uc_route_en = true;
+ 	/* Hardware decrements the TTL, so an expired one must come back
