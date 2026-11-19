@@ -25,12 +25,12 @@
 
 #include <linux/printk.h>
 
-const uint8_t rtl8373_port_map[16] = {
+static const uint8_t rtl8373_port_map[16] = {
     0, 1, 2, 3, 4, 5, 6, 7, 8, // 物理端口0-8
     0, 0, 0, 0, 0, 0, 0        // 填充
 };
 
-const uint8_t rtl8372_port_map[16] = {
+static const uint8_t rtl8372_port_map[16] = {
     3, 4, 5, 6, 7, 8, // 物理端口3-8
     0, 0, 0, 0, 0, 0, 0, 0, 0, 0 // 填充
 };
@@ -253,6 +253,8 @@ static char* chipid_to_chip_name(switch_chip_t id)
 static int rtl837x_switch_probe(struct rtk_gsw *gsw)
 {
 	switch_chip_t sw_chip;
+	rtk_uint32 regValue;
+	rtk_api_ret_t ret;
 
 	for(int i = 0;; i++)
 	{
@@ -290,9 +292,6 @@ static int rtl837x_switch_probe(struct rtk_gsw *gsw)
 
 CHIP_NOT_SUPPORTED:
 	//未知芯片ID
-	rtk_uint32 regValue;
-	rtk_api_ret_t ret;
-
 	ret = rtl8373_getAsicReg(0x4, &regValue);
 	if (ret != RT_ERR_OK) {
 		dev_err(gsw->dev,
@@ -662,6 +661,39 @@ int rtl8372n_hw_init(struct rtk_gsw *gsw, rtl837x_pnswap_cfg_t swap_cfg)
 	return 0;
 }
 
+/* The conduit the CPU-port work closed is up again: end the reset and reopen
+ * the user ports that closing it took down. A port that fails stays in
+ * cpu_reset_users for the next run. Does nothing while the conduit is down,
+ * so it never reopens a conduit an administrator closed afterwards. Caller
+ * holds rtnl.
+ */
+static void rtl837x_cpu_reset_finish(struct rtk_gsw *gsw)
+{
+	struct dsa_port *dp;
+	int ret;
+
+	if (!(gsw->ethernet_master->flags & IFF_UP))
+		return;
+
+	gsw->cpu_reset_pending = false;
+	dsa_switch_for_each_user_port(dp, &gsw->ds) {
+		if (!(gsw->cpu_reset_users & BIT(dp->index)))
+			continue;
+
+		if (dp->user && !netif_running(dp->user)) {
+			ret = dev_open(dp->user, NULL);
+			if (ret) {
+				dev_warn_ratelimited(gsw->dev,
+						     "failed to reopen %s after CPU SerDes reset: %d\n",
+						     netdev_name(dp->user), ret);
+				continue;
+			}
+		}
+
+		gsw->cpu_reset_users &= ~BIT(dp->index);
+	}
+}
+
 static void rtl837x_status_check_work_func(struct work_struct *work)
 {
 	struct rtk_gsw *gsw = container_of(work, struct rtk_gsw, status_check_work.work);
@@ -679,20 +711,67 @@ static void rtl837x_status_check_work_func(struct work_struct *work)
 		goto reschedule;
 	}
 
+	/* Only this work item touches cpu_reset_pending. The link coming back
+	 * does not end a reset by itself: the conduit may have failed to
+	 * reopen, and user ports may still be waiting either way.
+	 */
+	if (port_status.link && (gsw->cpu_reset_pending || gsw->cpu_reset_users)) {
+		rtnl_lock();
+		if (gsw->cpu_reset_pending) {
+			ret = dev_open(gsw->ethernet_master, NULL);
+			if (ret)
+				dev_warn_ratelimited(gsw->dev,
+						     "failed to reopen ethernet master: %d\n", ret);
+		}
+		rtl837x_cpu_reset_finish(gsw);
+		rtnl_unlock();
+	}
+
 	if (!port_status.link)
 	{
+		struct dsa_port *dp;
+
 		if (gsw->cpu_port != UTP_PORT3 && gsw->cpu_port != UTP_PORT8)
 		{
 			dev_warn(gsw->dev, "CPU Port Down, But the CPU port is not Serdes Port, Skip Reset and stop CPU port check work\n");
 			return;
 		}
 
-		dev_info(gsw->dev, "CPU Port Down, Try to reset Serdes, mode: 0x%x\n", gsw->sds0mode);
-
 		rtnl_lock();
+		/* A conduit the administrator took down (for instance to
+		 * change the tag protocol, which DSA only allows with the
+		 * conduit down) drops the SerDes link on purpose: that is not
+		 * a fault to repair, and reopening it would undo the admin.
+		 */
+		/* ...unless this work closed it and failed to reopen it: then
+		 * keep retrying, as the work always did.
+		 */
+		if (!(gsw->ethernet_master->flags & IFF_UP) &&
+		    !gsw->cpu_reset_pending) {
+			rtnl_unlock();
+			goto reschedule;
+		}
+
+		dev_warn(gsw->dev, "CPU Port Down, Try to reset Serdes, mode: 0x%x\n", gsw->sds0mode);
+
+		/* Closing the conduit makes DSA close every user port, and
+		 * opening it again does not reopen them: remember which ones
+		 * were running so the LAN does not stay down afterwards. Kept
+		 * across retries, along with any port still waiting from an
+		 * earlier reset.
+		 */
+		if (!gsw->cpu_reset_pending) {
+			dsa_switch_for_each_user_port(dp, &gsw->ds)
+				if (dp->user && netif_running(dp->user))
+					gsw->cpu_reset_users |= BIT(dp->index);
+			gsw->cpu_reset_pending = true;
+		}
+
 		dev_close(gsw->ethernet_master);
 		rtnl_unlock();
+		mutex_lock(&rtl837x_ind_lock);
 		ret = rtk_sdsMode_set(0, SERDES_OFF);
+		mutex_unlock(&rtl837x_ind_lock);
 		if (ret)
 			dev_warn_ratelimited(gsw->dev,
 					     "failed to disable CPU SerDes: %d\n", ret);
@@ -705,10 +784,16 @@ static void rtl837x_status_check_work_func(struct work_struct *work)
 			dev_warn_ratelimited(gsw->dev,
 					     "failed to reopen ethernet master: %d\n", ret);
 
+		mutex_lock(&rtl837x_ind_lock);
 		ret = rtk_sdsMode_set(0, gsw->sds0mode);
+		mutex_unlock(&rtl837x_ind_lock);
 		if (ret)
 			dev_warn_ratelimited(gsw->dev,
 					     "failed to restore CPU SerDes mode: %d\n", ret);
+
+		rtnl_lock();
+		rtl837x_cpu_reset_finish(gsw);
+		rtnl_unlock();
 
 		msleep(2000);
 	}
@@ -773,7 +858,9 @@ static int rtl837x_sfp_module_insert(void *upstream, const struct sfp_eeprom_id 
 		return -EINVAL;
 	}
 
+	mutex_lock(&rtl837x_ind_lock);
 	ret = rtk_sdsMode_set(1, gsw->sds1mode);
+	mutex_unlock(&rtl837x_ind_lock);
 	if (ret) {
 		gsw->sds1mode = old_mode;
 		dev_err(gsw->dev, "failed to set SFP SerDes mode: %d\n", ret);
@@ -791,7 +878,9 @@ static void rtl837x_sfp_module_remove(void *upstream)
 	dev_info(gsw->dev, "SFP module remove\n");
 
 	USE_SERDESMODE(1, SERDES_OFF);
+	mutex_lock(&rtl837x_ind_lock);
 	ret = rtk_sdsMode_set(1, gsw->sds1mode);
+	mutex_unlock(&rtl837x_ind_lock);
 	if (ret) {
 		gsw->sds1mode = old_mode;
 		dev_err(gsw->dev, "failed to disable SFP SerDes: %d\n", ret);
@@ -1122,6 +1211,11 @@ static void rtl837x_dsa_remove(struct mdio_device *mdiodev)
 
 	if (!gsw)
 		return;
+
+#ifdef CONFIG_GPIOLIB
+	/* Before anything below clears the global state it relies on. */
+	rtl837x_gpiochip_exit(gsw);
+#endif /* CONFIG_GPIOLIB */
 
 	cancel_delayed_work_sync(&gsw->status_check_work);
 	if (gsw->sfp_bus)
