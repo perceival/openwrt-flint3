@@ -1,0 +1,38 @@
+From: Zakk <zakk@gentoozh.org>
+Date: Thu, 19 Nov 2026 20:40:00 +1100
+Subject: [PATCH] wifi: ath12k: look up the link vif in flush_sta
+
+flush_sta() took the link vif from arsta->arvif. Removing a link from
+an AP MLD frees that vif, but the link sta of an ML station stays in
+links_map, so stopping the AP afterwards dereferenced the freed vif and
+oopsed in ath12k_wmi_send_peer_flush_tids_cmd(). Take the vif from
+ahvif->link[] and skip links whose vdev is gone, as change_sta_links()
+does.
+
+Signed-off-by: Zakk <zakk@gentoozh.org>
+---
+ drivers/net/wireless/ath/ath12k/mac.c | 6 ++++--
+ 1 file changed, 4 insertions(+), 2 deletions(-)
+
+--- a/drivers/net/wireless/ath/ath12k/mac.c
++++ b/drivers/net/wireless/ath/ath12k/mac.c
+@@ -12657,6 +12657,7 @@ void ath12k_mac_op_flush_sta(struct ieee
+ 			     struct ieee80211_vif *vif,
+ 			     struct ieee80211_sta *sta)
+ {
++	struct ath12k_vif *ahvif = ath12k_vif_to_ahvif(vif);
+ 	struct ath12k_sta *ahsta = ath12k_sta_to_ahsta(sta);
+ 	struct ath12k_link_sta *arsta;
+ 	struct ath12k_link_vif *arvif;
+@@ -12671,8 +12672,9 @@ void ath12k_mac_op_flush_sta(struct ieee
+ 		if (!arsta)
+ 			continue;
+ 
+-		arvif = arsta->arvif;
+-		if (!arvif || !arvif->ar)
++		/* arsta->arvif is stale once the link vif is removed */
++		arvif = wiphy_dereference(hw->wiphy, ahvif->link[link_id]);
++		if (!arvif || !arvif->is_created)
+ 			continue;
+ 
+ 		ret = ath12k_wmi_send_peer_flush_tids_cmd(arvif->ar,
