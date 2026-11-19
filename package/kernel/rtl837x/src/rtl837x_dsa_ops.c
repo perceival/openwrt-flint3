@@ -2246,6 +2246,10 @@ static void rtl837x_port_stp_state_set(struct dsa_switch *ds, int port,
 	struct rtk_gsw *gsw = ds->priv;
 	int ret;
 
+	/* DSA also disables ports the chip does not have */
+	if (!rtl837x_valid_port(gsw, port))
+		return;
+
 	ret = rtl837x_set_stp_state(gsw, port, state);
 	if (ret)
 		dev_err(gsw->dev, "failed to set STP state %u on port %d: %d\n",
