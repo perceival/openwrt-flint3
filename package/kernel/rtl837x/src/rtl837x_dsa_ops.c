@@ -3285,6 +3285,23 @@ static void rtl837x_host_fdb_flush(struct rtk_gsw *gsw)
 	mutex_unlock(&rtl837x_ind_lock);
 }
 
+/* CPU frames are not learned, so drop the entry of a station now on Wi-Fi. */
+static void rtl837x_fdb_drop_dynamic(const unsigned char *addr, u32 ivl,
+				     u16 vid_fid)
+{
+	rtk_l2_ucastAddr_t l2 = { 0 };
+	rtk_mac_t mac = { 0 };
+
+	memcpy(mac.octet, addr, ETH_ALEN);
+	l2.ivl = ivl;
+	l2.vid_fid = vid_fid;
+
+	mutex_lock(&rtl837x_ind_lock);
+	if (rtk_l2_addr_get(&mac, &l2) == RT_ERR_OK && !l2.is_static)
+		rtk_l2_addr_del(&mac, &l2);
+	mutex_unlock(&rtl837x_ind_lock);
+}
+
 static int rtl837x_port_fdb_add(struct dsa_switch *ds, int port,
 				const unsigned char *addr, u16 vid,
 				struct dsa_db db)
@@ -3300,11 +3317,15 @@ static int rtl837x_port_fdb_add(struct dsa_switch *ds, int port,
 	if (!rtl837x_valid_port(gsw, port))
 		return -EINVAL;
 
-	/* Host-bound unknown unicast is already flooded to the CPU port. */
-	if (gsw->chip_id == CHIP_RTL8372N && port == gsw->cpu_port)
-		return 0;
-
 	ret = rtl837x_fdb_key(gsw, vid, db, &ivl, &vid_fid);
+
+	/* Host-bound unknown unicast is already flooded to the CPU port. */
+	if (gsw->chip_id == CHIP_RTL8372N && port == gsw->cpu_port) {
+		if (!ret)
+			rtl837x_fdb_drop_dynamic(addr, ivl, vid_fid);
+		return 0;
+	}
+
 	if (ret)
 		return ret;
 
@@ -3656,6 +3677,8 @@ int rtl837x_dsa_register(struct rtk_gsw *gsw)
 	ds->configure_vlan_while_not_filtering = true;
 	ds->untag_bridge_pvid = true;
 	ds->fdb_isolation = true;
+	/* Pass Wi-Fi-learned addresses to port_fdb_add(). */
+	ds->assisted_learning_on_cpu_port = gsw->chip_id == CHIP_RTL8372N;
 	ds->max_num_bridges = DSA_TAG_8021Q_MAX_NUM_BRIDGES;
 	ds->ageing_time_min = 14000;
 	ds->ageing_time_max = 800000;
