@@ -73,15 +73,48 @@ Throughput measured between two units over a 2.5G trunk: **~1.8–1.9 Gbit/s**.
 
 The image uses 2.4 GHz board data that is known to work with this firmware. GL's
 own firmware loads another board file for this board (`bdwlan.b12`), which has
-not yet been tried with the ath12k firmware. To try it, you need the optional
-package `ipq-wifi-glinet_gl-be9300-bdf-test`. A default build neither includes nor
-builds it, so select it first in `make menuconfig` (Firmware, ath10k Board-Specific
-Overrides): as `<*>` to put it in the image, or as `<M>` to build only the package,
-then copy the `.apk` from the build's `packages` directory to the unit and run
-`apk add --allow-untrusted` on it. It installs a `board-2.bin` container holding that board
-file, with the board name and regdb of the normal one, as
-`/lib/firmware/ath12k-test/ath12k/IPQ5332/hw1.0/board-2.bin`, which nothing loads
-unless selected. To select it until the next reboot:
+not yet been tried with the ath12k firmware. That file is not in this tree,
+because its licence is not settled, but you can build the test copy from your
+own unit's firmware. Run steps 1 and 2 from the top of this tree on a Linux PC
+with Python 3, git and squashfs-tools.
+
+1. Copy the unit's `0:WIFIFW` partition, which holds GL's Wi-Fi firmware, and
+   unpack it. Neither stock nor this build writes to that partition, so this
+   works on either:
+
+   ```sh
+   ssh root@192.168.1.1 'cat /dev/$(grep -l PARTNAME=0:WIFIFW /sys/class/block/mmcblk0p*/uevent | cut -d/ -f5)' > wifi_fw.img
+   unsquashfs -d wifi_fw wifi_fw.img
+   sha256sum wifi_fw/bdwlan.b12
+   ```
+
+   On GL's 4.9.0 and 4.10.1 firmware, `bdwlan.b12` has sha256
+   `93548746d39d8a5cbf97356c5ba44692b69ae4601cfdc36bf7440c634c3eedd2`.
+
+2. Build a `board-2.bin` container that keeps the board name and regdb of the
+   normal one and holds `bdwlan.b12` as its board data:
+
+   ```sh
+   git clone https://github.com/qca/qca-swiss-army-knife.git
+   E=$PWD/qca-swiss-army-knife/tools/scripts/ath12k/ath12k-bdencoder
+   mkdir bdf-test && cd bdf-test
+   python3 $E -e ../package/firmware/ipq-wifi/src/board-glinet_gl-be9300.ipq5332
+   cp ../wifi_fw/bdwlan.b12 'bus=ahb,qmi-chip-id=0,qmi-board-id=18.bin'
+   python3 $E -c board-2.json -o board-2.bin
+   ```
+
+   With the `bdwlan.b12` above, `board-2.bin` has sha256
+   `874f498cdde33cf1b0c791ab484e6af6455296f9b6d532bfd51337c213759f73`.
+
+3. Copy it to the unit outside the normal firmware search path, so nothing
+   loads it unless selected:
+
+   ```sh
+   ssh root@192.168.1.1 mkdir -p /lib/firmware/ath12k-test/ath12k/IPQ5332/hw1.0
+   ssh root@192.168.1.1 'cat > /lib/firmware/ath12k-test/ath12k/IPQ5332/hw1.0/board-2.bin' < board-2.bin
+   ```
+
+To select it on the unit until the next reboot:
 
 ```sh
 wifi down
@@ -93,9 +126,10 @@ sleep 30; wifi up
 
 Then check that the 2.4 GHz network comes up (`iwinfo`, and `dmesg | grep ath12k`
 shows no board-data or firmware errors), and compare `iw dev <2.4 GHz interface> info`
-(txpower) and 2.4 GHz throughput with the normal file. Nothing is changed on
-flash: if Wi-Fi does not come back, just reboot and the normal board file is
-used again. Please report the result in the issue tracker.
+(txpower) and 2.4 GHz throughput with the normal file. The selection does not
+survive a reboot: if Wi-Fi does not come back, just reboot and the normal board
+file is used again. `rm -r /lib/firmware/ath12k-test` removes the test copy.
+Please report the result in the issue tracker.
 
 ## Building
 
