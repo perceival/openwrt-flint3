@@ -1,0 +1,66 @@
+From: CoolFreeze23 <34906576+CoolFreeze23@users.noreply.github.com>
+Date: Tue, 20 Oct 2026 12:00:00 +0900
+Subject: [PATCH] wifi: ath12k: cancel reset work also on the QMI failure remove path
+
+ath12k_pci_remove() and ath12k_ahb_remove() jump straight to
+ath12k_core_deinit() when ATH12K_FLAG_QMI_FAIL is set, skipping the
+UNREGISTERING set and the reset_work cancel. QMI can also fail during a
+recovery boot, while the device's reset work is queued or in its 20 s
+wait; the work then runs from destroy_workqueue() in ath12k_core_free(),
+after ath12k_core_deinit() cleared ab->ag and the MHI controller was
+unregistered, and oopses in ath12k_core_pre_reconfigure_recovery().
+
+Set UNREGISTERING under ag->mutex and cancel reset_work before the
+QMI_FAIL test (AHB: run ath12k_ahb_remove_prepare() first).
+---
+diff --git a/drivers/net/wireless/ath/ath12k/ahb.c b/drivers/net/wireless/ath/ath12k/ahb.c
+--- a/drivers/net/wireless/ath/ath12k/ahb.c
++++ b/drivers/net/wireless/ath/ath12k/ahb.c
+@@ -1429,12 +1429,14 @@ static void ath12k_ahb_remove(struct pla
+ {
+ 	struct ath12k_base *ab = platform_get_drvdata(pdev);
+ 
++	/* also on the QMI_FAIL path: see ath12k_pci_remove() */
++	ath12k_ahb_remove_prepare(ab);
++
+ 	if (test_bit(ATH12K_FLAG_QMI_FAIL, &ab->dev_flags)) {
+ 		ath12k_ahb_power_down(ab, false);
+ 		goto qmi_fail;
+ 	}
+ 
+-	ath12k_ahb_remove_prepare(ab);
+ 	ath12k_core_hw_group_cleanup(ab->ag);
+ qmi_fail:
+ 	ath12k_core_deinit(ab);
+diff --git a/drivers/net/wireless/ath/ath12k/pci.c b/drivers/net/wireless/ath/ath12k/pci.c
+--- a/drivers/net/wireless/ath/ath12k/pci.c
++++ b/drivers/net/wireless/ath/ath12k/pci.c
+@@ -1705,17 +1705,22 @@ static void ath12k_pci_remove(struct pci
+ 
+ 	ath12k_pci_set_irq_affinity_hint(ab_pci, NULL);
+ 
++	/*
++	 * See ath12k_ahb_remove_prepare(): no reset work queued after the
++	 * cancel. Done before the QMI_FAIL test: QMI can also fail during a
++	 * recovery boot, with this device's reset work still queued or in
++	 * its 20 s wait.
++	 */
++	mutex_lock(&ab->ag->mutex);
++	set_bit(ATH12K_FLAG_UNREGISTERING, &ab->dev_flags);
++	mutex_unlock(&ab->ag->mutex);
++	cancel_work_sync(&ab->reset_work);
++
+ 	if (test_bit(ATH12K_FLAG_QMI_FAIL, &ab->dev_flags)) {
+ 		ath12k_pci_power_down(ab, false);
+ 		goto qmi_fail;
+ 	}
+ 
+-	/* see ath12k_ahb_remove_prepare(): no reset work queued after cancel */
+-	mutex_lock(&ab->ag->mutex);
+-	set_bit(ATH12K_FLAG_UNREGISTERING, &ab->dev_flags);
+-	mutex_unlock(&ab->ag->mutex);
+-
+-	cancel_work_sync(&ab->reset_work);
+ 	cancel_work_sync(&ab->dump_work);
+ 	ath12k_core_hw_group_cleanup(ab->ag);
+ 

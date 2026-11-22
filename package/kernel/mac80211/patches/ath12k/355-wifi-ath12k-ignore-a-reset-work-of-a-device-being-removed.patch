@@ -1,0 +1,42 @@
+From: CoolFreeze23 <34906576+CoolFreeze23@users.noreply.github.com>
+Date: Tue, 20 Oct 2026 12:00:00 +0900
+Subject: [PATCH] wifi: ath12k: ignore a reset work of a device being removed
+
+The MHI RDDM callback tests UNREGISTERING without ag->mutex (taking the
+mutex there could wait behind a group power-up), so a reset work it
+queues can start after remove cancelled the work. Return from such a run
+before it touches the device; nothing waits for a device being removed.
+Say so in the comment in ath12k_ahb_remove_prepare().
+---
+diff --git a/drivers/net/wireless/ath/ath12k/ahb.c b/drivers/net/wireless/ath/ath12k/ahb.c
+--- a/drivers/net/wireless/ath/ath12k/ahb.c
++++ b/drivers/net/wireless/ath/ath12k/ahb.c
+@@ -1400,7 +1400,9 @@ static void ath12k_ahb_remove_prepare(st
+ 	 * Under ag->mutex, which the group recovery paths hold while they
+ 	 * test this bit and queue reset_work, so they cannot queue it after
+ 	 * the cancel below. A reset work must not outlive the device: it
+-	 * locks ab->ag->mutex, and ath12k_core_deinit() clears ab->ag.
++	 * locks ab->ag->mutex, and ath12k_core_deinit() clears ab->ag. The
++	 * MHI RDDM callback tests the bit without the mutex; a run it queues
++	 * after the cancel returns at once (ath12k_core_reset()).
+ 	 */
+ 	mutex_lock(&ab->ag->mutex);
+ 	set_bit(ATH12K_FLAG_UNREGISTERING, &ab->dev_flags);
+diff --git a/drivers/net/wireless/ath/ath12k/core.c b/drivers/net/wireless/ath/ath12k/core.c
+--- a/drivers/net/wireless/ath/ath12k/core.c
++++ b/drivers/net/wireless/ath/ath12k/core.c
+@@ -1885,6 +1885,14 @@ static void ath12k_core_reset(struct wor
+ 		return;
+ 	}
+ 
++	/*
++	 * The MHI RDDM callback tests UNREGISTERING without ag->mutex, so a
++	 * run can be queued after remove cancelled the work. Nothing waits
++	 * for a device being removed: return without touching it further.
++	 */
++	if (test_bit(ATH12K_FLAG_UNREGISTERING, &ab->dev_flags))
++		return;
++
+ 	if (!(test_bit(ATH12K_FLAG_QMI_FW_READY_COMPLETE, &ab->dev_flags))) {
+ 		ath12k_warn(ab, "firmware crashed before QMI ready; recovery skipped (dev flags 0x%lx)\n",
+ 			    ab->dev_flags);

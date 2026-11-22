@@ -1,0 +1,226 @@
+From: CoolFreeze23 <34906576+CoolFreeze23@users.noreply.github.com>
+Date: Tue, 20 Oct 2026 12:00:00 +0900
+Subject: [PATCH] wifi: ath12k: do not strand the MLO group after a failed recovery
+
+Three gaps let a crash during AHB recovery leave every radio of the
+hardware group down until reboot:
+
+- ath12k_core_reset() ignored the result of ath12k_hif_power_up(). A
+  device that fails to power up never reports firmware ready, so the
+  group never starts, and nothing queues another reset.
+- ath12k_ahb_queue_group_recovery() skipped every device with is_reset
+  set. A userPD crash during the recovery power-up (or after it, before
+  firmware ready) was therefore dropped.
+- ath12k_ahb_power_up() cleared rootpd_crashed unconditionally and did
+  not wait for a crashed rootPD to be restarted by remoteproc. A
+  recovery power-up that ran while the rootPD dump was still being
+  collected failed, and the later QCOM_SSR_AFTER_POWERUP notifier no
+  longer knew that a recovery was owed.
+
+Queue a reset of the whole group when a recovery power-up fails
+(re-entry is bounded by fail_cont_count). Treat a userPD fatal IRQ as a
+new crash that always queues every device; ath12k_core_reset()
+serialises re-entry through reset_count/reset_complete. In
+ath12k_ahb_power_up(), wait up to 30 s for a crashed rootPD to restart
+and consume rootpd_crashed only then. The AFTER_POWERUP notifier
+re-checks the marker under ag->mutex, which recovery power-ups hold, so
+it queues a recovery only when no power-up picked the restart up.
+
+Fixes the defect introduced by 316/330/335 (queue helper, early marker
+clear) together with the ignored power-up result in upstream
+ath12k_core_reset().
+---
+diff --git a/drivers/net/wireless/ath/ath12k/ahb.c b/drivers/net/wireless/ath/ath12k/ahb.c
+--- a/drivers/net/wireless/ath/ath12k/ahb.c
++++ b/drivers/net/wireless/ath/ath12k/ahb.c
+@@ -28,7 +28,8 @@ static const char ath12k_userpd_irq[][9] = {"spawn",
+ 				     "ready",
+ 				     "stop-ack",
+ 				     "fatal"};
+-static void ath12k_ahb_queue_group_recovery(struct ath12k_base *ab);
++static void ath12k_ahb_queue_group_recovery(struct ath12k_base *ab,
++					    bool new_crash);
+ 
+ static const char *irq_name[ATH12K_IRQ_NUM_MAX] = {
+ 	"misc-pulse1",
+@@ -374,6 +375,25 @@ static int ath12k_ahb_power_up(struct ath12k_base *ab)
+ 	u32 pasid;
+ 	int ret;
+ 
++	/*
++	 * A recovery power-up can run before remoteproc has finished
++	 * restarting a crashed rootPD (for example while the rootPD dump is
++	 * still being collected). Booting the userPD then fails. Wait for the
++	 * restart and only then consume the crash marker, so the
++	 * QCOM_SSR_AFTER_POWERUP notifier still knows a recovery is owed if
++	 * this wait times out. Recovery power-ups run under ag->mutex, which
++	 * the notifier takes only after completing rootpd_ready.
++	 */
++	if (READ_ONCE(ab_ahb->rootpd_crashed)) {
++		time_left = wait_for_completion_timeout(&ab_ahb->rootpd_ready,
++							ATH12K_ROOTPD_RECOVERY_TIMEOUT);
++		if (!time_left) {
++			ath12k_err(ab, "rootPD did not restart after crash, cannot boot userPD\n");
++			return -ETIMEDOUT;
++		}
++		WRITE_ONCE(ab_ahb->rootpd_crashed, false);
++	}
++
+ 	rmem = ath12k_core_get_rmem_by_name(ab, "q6-region");
+ 	if (!rmem)
+ 		return -ENODEV;
+@@ -468,8 +488,12 @@ static int ath12k_ahb_power_up(struct ath12k_base *ab)
+ 	WRITE_ONCE(ab_ahb->userpd_ready_acked, false);
+ 	WRITE_ONCE(ab_ahb->userpd_stop_acked, false);
+ 
+-	/* Start a new UserPD boot epoch after all stale completions are gone. */
+-	WRITE_ONCE(ab_ahb->rootpd_crashed, false);
++	/*
++	 * Start a new UserPD boot epoch after all stale completions are gone.
++	 * rootpd_crashed is only cleared once the rootPD is known to be up
++	 * (above); clearing it here would hide a rootPD crash that happened
++	 * since then and suppress the recovery owed for it.
++	 */
+ 	atomic_set(&ab_ahb->userpd_crashed, 0);
+ 
+ 	if (ab_ahb->scm_auth_enabled) {
+@@ -843,7 +867,7 @@ static void ath12k_ahb_handle_userpd_crash(struct ath12k_base *ab)
+ 	ath12k_ahb_log_userpd_crash_reason(ab);
+ 	if (test_bit(ATH12K_FLAG_REGISTERED, &ab->dev_flags) &&
+ 	    !test_bit(ATH12K_FLAG_UNREGISTERING, &ab->dev_flags))
+-		ath12k_ahb_queue_group_recovery(ab);
++		ath12k_ahb_queue_group_recovery(ab, true);
+ }
+ 
+ static irqreturn_t ath12k_userpd_irq_handler(int irq, void *data)
+@@ -934,7 +958,19 @@ static void ath12k_ahb_release_crashed_userpd(struct ath12k_base *ab)
+ 			    ab_ahb->userpd_id, ret);
+ }
+ 
+-static void ath12k_ahb_queue_group_recovery(struct ath12k_base *ab)
++/*
++ * @new_crash: true for a fresh crash report (userPD fatal IRQ). A reset
++ * that is already in flight cannot absorb a crash that happens during its
++ * own power-up, so every device is (re)queued; ath12k_core_reset()
++ * serialises re-entry through reset_count/reset_complete.
++ * False when the rootPD has finished restarting. A recovery power-up that
++ * was waiting for it holds ag->mutex and consumes rootpd_crashed, so the
++ * marker is re-checked under the mutex: if it is still set, no power-up
++ * picked the restart up (none ran yet, or it timed out) and recovery is
++ * still owed. Devices whose reset work is queued or running are skipped.
++ */
++static void ath12k_ahb_queue_group_recovery(struct ath12k_base *ab,
++					    bool new_crash)
+ {
+ 	struct ath12k_hw_group *ag = ab->ag;
+ 	struct ath12k_base *partner_ab;
+@@ -944,6 +980,9 @@ static void ath12k_ahb_queue_group_recovery(struct ath12k_base *ab)
+ 		return;
+ 
+ 	mutex_lock(&ag->mutex);
++	if (!new_crash && !READ_ONCE(ath12k_ab_to_ahb(ab)->rootpd_crashed))
++		goto out;
++
+ 	for (i = 0; i < ag->num_devices; i++) {
+ 		partner_ab = ag->ab[i];
+ 		if (!partner_ab ||
+@@ -954,12 +993,12 @@ static void ath12k_ahb_queue_group_recovery(struct ath12k_base *ab)
+ 		set_bit(ATH12K_FLAG_CRASH_FLUSH, &partner_ab->dev_flags);
+ 		set_bit(ATH12K_FLAG_RECOVERY, &partner_ab->dev_flags);
+ 
+-		if (READ_ONCE(partner_ab->is_reset) ||
+-		    work_busy(&partner_ab->reset_work))
++		if (!new_crash && work_busy(&partner_ab->reset_work))
+ 			continue;
+ 
+ 		queue_work(partner_ab->workqueue_aux, &partner_ab->reset_work);
+ 	}
++out:
+ 	mutex_unlock(&ag->mutex);
+ }
+ 
+@@ -975,7 +1014,7 @@ static int ath12k_ahb_root_pd_state_notifier(struct notifier_block *nb,
+ 		ath12k_dbg(ab, ATH12K_DBG_AHB, "Root PD is UP\n");
+ 		complete(&ab_ahb->rootpd_ready);
+ 		if (READ_ONCE(ab_ahb->rootpd_crashed))
+-			ath12k_ahb_queue_group_recovery(ab);
++			ath12k_ahb_queue_group_recovery(ab, false);
+ 		return NOTIFY_OK;
+ 	case QCOM_SSR_BEFORE_SHUTDOWN:
+ 		if (!notify_data || !notify_data->crashed)
+diff --git a/drivers/net/wireless/ath/ath12k/ahb.h b/drivers/net/wireless/ath/ath12k/ahb.h
+--- a/drivers/net/wireless/ath/ath12k/ahb.h
++++ b/drivers/net/wireless/ath/ath12k/ahb.h
+@@ -19,6 +19,8 @@
+ #define ATH12K_PCI_CE_WAKE_IRQ			2
+ #define ATH12K_PCI_IRQ_CE0_OFFSET		3
+ #define ATH12K_ROOTPD_READY_TIMEOUT		(5 * HZ)
++/* rootPD restart after a crash includes remoteproc dump collection */
++#define ATH12K_ROOTPD_RECOVERY_TIMEOUT		(30 * HZ)
+ #define ATH12K_RPROC_AFTER_POWERUP		QCOM_SSR_AFTER_POWERUP
+ #define ATH12K_AHB_FW_PREFIX			"q6_fw"
+ #define ATH12K_AHB_FW_SUFFIX			".mbn"
+diff --git a/drivers/net/wireless/ath/ath12k/core.c b/drivers/net/wireless/ath/ath12k/core.c
+--- a/drivers/net/wireless/ath/ath12k/core.c
++++ b/drivers/net/wireless/ath/ath12k/core.c
+@@ -1754,11 +1754,32 @@ exit_restart:
+ 	complete(&ab->restart_completed);
+ }
+ 
++static void ath12k_core_group_queue_reset(struct ath12k_hw_group *ag)
++{
++	struct ath12k_base *partner_ab;
++	int i;
++
++	lockdep_assert_held(&ag->mutex);
++
++	for (i = 0; i < ag->num_devices; i++) {
++		partner_ab = ag->ab[i];
++		if (!partner_ab ||
++		    !test_bit(ATH12K_FLAG_REGISTERED, &partner_ab->dev_flags) ||
++		    test_bit(ATH12K_FLAG_UNREGISTERING, &partner_ab->dev_flags))
++			continue;
++
++		set_bit(ATH12K_FLAG_CRASH_FLUSH, &partner_ab->dev_flags);
++		set_bit(ATH12K_FLAG_RECOVERY, &partner_ab->dev_flags);
++		queue_work(partner_ab->workqueue_aux, &partner_ab->reset_work);
++	}
++}
++
+ static void ath12k_core_reset(struct work_struct *work)
+ {
+ 	struct ath12k_base *ab = container_of(work, struct ath12k_base, reset_work);
+ 	struct ath12k_hw_group *ag = ab->ag;
+-	int reset_count, fail_cont_count, i;
++	int reset_count, fail_cont_count, i, ret;
++	bool power_up_failed = false;
+ 	long time_left;
+ 
+ 	if (!(test_bit(ATH12K_FLAG_QMI_FW_READY_COMPLETE, &ab->dev_flags))) {
+@@ -1842,10 +1863,25 @@ static void ath12k_core_reset(struct work_struct *work)
+ 		if (!ab)
+ 			continue;
+ 
+-		ath12k_hif_power_up(ab);
++		ret = ath12k_hif_power_up(ab);
++		if (ret) {
++			ath12k_err(ab, "failed to power up during recovery: %d\n",
++				   ret);
++			power_up_failed = true;
++			continue;
++		}
+ 		ath12k_dbg(ab, ATH12K_DBG_BOOT, "reset started\n");
+ 	}
+ 
++	/*
++	 * A device that failed to power up never reports firmware ready, so
++	 * the group can never start and nothing else would queue another
++	 * reset. Reset the whole group again; re-entry is bounded by
++	 * fail_cont_count.
++	 */
++	if (power_up_failed)
++		ath12k_core_group_queue_reset(ag);
++
+ 	mutex_unlock(&ag->mutex);
+ }
+ 
