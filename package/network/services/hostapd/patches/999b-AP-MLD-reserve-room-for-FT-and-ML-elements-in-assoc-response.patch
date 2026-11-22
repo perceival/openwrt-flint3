@@ -1,0 +1,51 @@
+From: CoolFreeze23
+Subject: [PATCH] AP MLD: reserve room for FT and Multi-Link elements in
+ (Re)Association Response
+
+send_assoc_resp() allocates sizeof(struct ieee80211_mgmt) + 1024 octets
+plus a few EHT element sizes. The Basic Multi-Link element with the
+per-STA profiles of the other links is written by
+hostapd_eid_eht_ml_assoc() without any bound, and for an FT
+reassociation of a non-AP MLD (patch 992) the FTE carries MLO GTK, IGTK
+and BIGTK subelements for every link (up to 158 octets per link) and is
+fragmented (patch 997). For a three-link non-AP MLD with FT this can
+exceed the buffer and corrupt the heap.
+
+Reserve the Basic Multi-Link element length
+(hostapd_eid_eht_basic_ml_len()) for a non-AP MLD and the worst-case
+MLO group key subelements plus fragment headers for an FT
+reassociation of a non-AP MLD.
+
+Reported-by: CoolFreeze23 (GHSA-9w59-w5wx-f3w7)
+---
+diff --git a/src/ap/ieee802_11.c b/src/ap/ieee802_11.c
+index 0b1c676..30b3919 100644
+--- a/src/ap/ieee802_11.c
++++ b/src/ap/ieee802_11.c
+@@ -6587,10 +6587,25 @@ static u16 send_assoc_resp(struct hostapd_data *hapd, struct sta_info *sta,
+ 		buflen += 3 + sizeof(struct ieee80211_eht_operation);
+ 		if (hapd->iconf->punct_bitmap)
+ 			buflen += EHT_OPER_DISABLED_SUBCHAN_BITMAP_SIZE;
+-		if (ap_sta_is_mld(hapd, sta))
++		if (ap_sta_is_mld(hapd, sta)) {
+ 			buflen += hostapd_eid_eht_ml_tid_to_link_map_len(hapd);
++			/* The Basic Multi-Link element with the per-STA
++			 * profiles of the other links is written without a
++			 * bound by hostapd_eid_eht_ml_assoc(), so reserve it. */
++			buflen += hostapd_eid_eht_basic_ml_len(hapd, sta, false,
++							       true);
++		}
+ 	}
+ #endif /* CONFIG_IEEE80211BE */
++#if defined(CONFIG_IEEE80211R_AP) && defined(CONFIG_IEEE80211BE)
++	/* FT reassociation of a non-AP MLD: the FTE carries MLO GTK, IGTK and
++	 * BIGTK subelements for every link (up to 54 + 52 + 52 octets) and is
++	 * then fragmented. This does not fit in the generic headroom above
++	 * together with the Basic Multi-Link element. */
++	if (sta && sta->auth_alg == WLAN_AUTH_FT && ap_sta_is_mld(hapd, sta))
++		buflen += MAX_NUM_MLD_LINKS * (54 + 52 + 52) +
++			2 * (MAX_NUM_MLD_LINKS * (54 + 52 + 52) / 255 + 1);
++#endif /* CONFIG_IEEE80211R_AP && CONFIG_IEEE80211BE */
+ 
+ 	buf = os_zalloc(buflen);
+ 	if (!buf) {
