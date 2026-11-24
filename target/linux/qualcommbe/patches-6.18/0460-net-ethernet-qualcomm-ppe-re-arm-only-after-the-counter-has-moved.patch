@@ -1,0 +1,80 @@
+From: Benoit Masson <yahoo@perenite.com>
+Subject: [PATCH] net: ethernet: qualcomm: ppe: re-arm only after the flow
+ count has moved
+
+A refresh from the flowtable means software is still forwarding the
+cookie. ppe_offload_flow_stale() takes a hit counter that has not moved
+since the previous refresh as the sign that the hardware entry stopped
+matching, and answers -EEXIST so the refresh re-programs the flow. A
+freshly programmed entry can be refreshed several times before the first
+packet is counted, so two consecutive refreshes both read zero and the
+identical entry is re-programmed for nothing.
+
+Treat a frozen counter as stale only once the counter has been seen to
+move. An entry that has never matched is not re-armed; the case the
+check exists for, a counter that moved and then froze, is unchanged.
+
+Measured on TP-Link Archer BE800 (IPQ9574): the re-arm lines at flow
+setup drop from a few per new flow to none, IPv4 NAT stays at 2.35
+Gbit/s with the CPU idle.
+
+Signed-off-by: Benoit Masson <yahoo@perenite.com>
+---
+--- a/drivers/net/ethernet/qualcomm/ppe/ppe_offload.c	2026-10-04 00:15:58
++++ b/drivers/net/ethernet/qualcomm/ppe/ppe_offload.c	2026-10-04 00:15:58
+@@ -271,9 +271,13 @@
+ 	unsigned long lastused;
+ 	/* Packet count at the last refresh the flowtable sent for this
+ 	 * cookie, and whether one was seen at all (ppe_offload_flow_stale()).
++	 * refresh_moving records that the count was once seen to advance, so
++	 * a frozen count only counts as stale for an entry that has actually
++	 * matched before.
+ 	 */
+ 	u64 refresh_packets;
+ 	bool refresh_seen;
++	bool refresh_moving;
+ 	/* Re-points within the current PPE_OFFLOAD_FDB_FLAP_WINDOW, see
+ 	 * ppe_offload_fdb_move_work().
+ 	 */
+@@ -912,7 +916,10 @@
+  * frozen, conntrack still marked offloaded). Answering -EEXIST forever
+  * keeps such a zombie; dropping it lets this very refresh program the flow
+  * afresh. An entry superseded in the table (flow_valid clear) is stale by
+- * definition. The first refresh only takes the baseline.
++ * definition. The first refresh only takes the baseline, and a frozen
++ * count is only stale once the count has been seen to move at least once,
++ * so the refreshes a fresh cookie gets before its first packet is counted
++ * do not re-arm it.
+  */
+ static bool ppe_offload_flow_stale(struct ppe_offload_priv *priv,
+ 				   struct ppe_offload_flow_entry *entry)
+@@ -933,10 +940,21 @@
+ 
+ 	if (ppe_offload_counter_delta(packets, entry->refresh_packets,
+ 				      PPE_IN_FLOW_CNT_TBL_PKT_MAX)) {
++		entry->refresh_moving = true;
+ 		entry->refresh_packets = packets;
+ 		return false;
+ 	}
+ 
++	/* A frozen count only means the entry stopped matching if it was
++	 * ever matching. The flowtable can refresh a freshly programmed
++	 * cookie a few times before its first packet is counted, and a
++	 * direction that has simply not carried a packet yet would
++	 * otherwise be "re-armed" with the identical key, which changes
++	 * nothing. Require the count to have moved at least once first.
++	 */
++	if (!entry->refresh_moving)
++		return false;
++
+ 	return true;
+ }
+ 
+@@ -1973,6 +1991,7 @@
+ 	entry->dsa_index = dp->index;
+ 	entry->stats_packets = 0;
+ 	entry->refresh_seen = false;
++	entry->refresh_moving = false;
+ 	entry->stats_bytes = 0;
+ 
+ 	return 0;
