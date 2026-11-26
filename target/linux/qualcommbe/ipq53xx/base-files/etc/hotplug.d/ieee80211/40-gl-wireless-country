@@ -2,12 +2,14 @@
 #
 # Keep the regulatory country populated as PHYs appear.
 #
-# 95-gl-wireless-country runs once from uci-defaults and sets the country from
-# the ART partition. That is too early on this board: the AHB radio can finish
-# probing after netifd's first wireless pass ("PHY is undefined for device"),
-# so a wifi-device section created later ends up with no country. Without one
-# hostapd refuses to start on 6 GHz ("Invalid country_code '00'") and the radio
-# stays down, which presents to the user as "Wi-Fi is broken".
+# On the GL-BE9300 board.d (02_network) puts the ART country into board.json,
+# and wifi config writes it into every radio section it creates. This handler
+# is the safety net for the GL-BE6500, which has no such board.d entry, and for
+# a wireless config kept from an image that left a radio without a country.
+# The radios register long after uci-defaults run, so it has to happen here.
+# Without a country hostapd refuses to start on 6 GHz ("Invalid country_code
+# '00'") and the radio stays down, which presents to the user as "Wi-Fi is
+# broken".
 #
 # This runs on every ieee80211 add event and fills in any radio that is still
 # missing a valid country. It is idempotent and silent when there is nothing to
