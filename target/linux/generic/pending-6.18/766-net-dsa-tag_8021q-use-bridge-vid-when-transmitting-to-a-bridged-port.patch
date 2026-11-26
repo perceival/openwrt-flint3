@@ -34,11 +34,15 @@ narrowed to a single port. VLAN-aware bridges are untouched as well --
 there every frame carries one of the bridge's own VLANs and tag_8021q
 does not decide the egress port.
 
-Link-local traffic (STP, LLDP, EAPOL, PTP peer-delay) is excluded from
-the new case, because it is addressed to one specific link and must keep
-the precise targeting the standalone VID gives it, the way tag_sja1105.c
-tests skb->offload_fwd_mark first and only then carves link-local frames
-out of its own imprecise path. For that to work the standalone VLAN has
+Only unicast takes the new case. Multicast and broadcast are excluded:
+link-local traffic (STP, LLDP, EAPOL, PTP peer-delay) is addressed to one
+specific link and must keep the precise targeting the standalone VID gives
+it, the way tag_sja1105.c tests skb->offload_fwd_mark first and only then
+carves link-local frames out of its own imprecise path; and the bridge
+sends IGMP/MLD to every port as its own unmarked copy
+(nbp_switchdev_can_offload_tx_fwd() refuses them), so tagging those copies
+with the bridge VID would have the switch flood each of them to all
+members. For that to work the standalone VLAN has
 to stay present in hardware while the port is bridged; the rtl837x driver
 keeps it (the port's PVID is the bridge VLAN, so ingress classification
 and isolation are unchanged).
@@ -55,7 +59,7 @@ Signed-off-by: Kamil Bienkiewicz <perceivalpercy@gmail.com>
  
  #include "tag.h"
  #include "tag_8021q.h"
-@@ -13,17 +14,40 @@
+@@ -13,17 +14,43 @@ vsc73xx_xmit(struct sk_buff *skb, struct
  {
  	struct dsa_port *dp = dsa_user_to_port(netdev);
  	u16 queue_mapping = skb_get_queue_mapping(skb);
@@ -78,7 +82,7 @@ Signed-off-by: Kamil Bienkiewicz <perceivalpercy@gmail.com>
  
  		tx_vid = dsa_tag_8021q_bridge_vid(bridge_num);
 +	} else if (bridge_num && br && !br_vlan_enabled(br) &&
-+		   !is_link_local_ether_addr(eth_hdr(skb)->h_dest)) {
++		   is_unicast_ether_addr(eth_hdr(skb)->h_dest)) {
 +		/* An unmarked frame bypassed bridge forwarding and was
 +		 * transmitted straight onto the user port -- the netfilter
 +		 * flowtable's direct transmit path does exactly this. Joining
@@ -88,12 +92,15 @@ Signed-off-by: Kamil Bienkiewicz <perceivalpercy@gmail.com>
 +		 * dropped. Use the bridge VID and let the switch pick the
 +		 * egress port from its own FDB.
 +		 *
-+		 * Link-local traffic (STP, LLDP, EAPOL, PTP peer-delay) is
-+		 * excluded: it is addressed to one specific link and keeps the
-+		 * precise targeting the standalone VID gives it, the way
-+		 * tag_sja1105.c carves link-local frames out of its own
-+		 * imprecise path. The driver keeps that VLAN present in
-+		 * hardware while the port is bridged.
++		 * Only unicast takes this path. Multicast and broadcast --
++		 * link-local traffic (STP, LLDP, EAPOL, PTP peer-delay), and
++		 * the IGMP/MLD the bridge deliberately sends to each port
++		 * as its own unmarked copy -- keep the precise targeting the
++		 * standalone VID gives them, the way tag_sja1105.c carves
++		 * link-local frames out of its own imprecise path; with the
++		 * bridge VID every per-port copy would be flooded to all
++		 * members. The driver keeps that VLAN present in hardware
++		 * while the port is bridged.
 +		 */
 +		tx_vid = dsa_tag_8021q_bridge_vid(bridge_num);
  	}
