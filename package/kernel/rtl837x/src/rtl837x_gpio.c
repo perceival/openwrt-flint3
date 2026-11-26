@@ -107,6 +107,7 @@ int rtl837x_gpiochip_init(struct rtk_gsw *gsw)
     struct device_node *np = dev->of_node;
 
     struct rtl837x_gpio *gpio;
+    int ret;
 
     int base = 0;
     if (of_property_read_u32(np, "base", &base))
@@ -121,5 +122,23 @@ int rtl837x_gpiochip_init(struct rtk_gsw *gsw)
     gpio->gp.base = base;
     gpio->gp.parent = dev;
 
-	return devm_gpiochip_add_data(dev, &gpio->gp, gpio);
+	/* Not devm: the chip must be gone before rtl837x_dsa_remove() clears
+	 * rtl_gbl_priv, which every SDK GPIO accessor dereferences, and devm
+	 * actions only run after .remove has returned.
+	 */
+	ret = gpiochip_add_data(&gpio->gp, gpio);
+	if (ret)
+		return ret;
+
+	gsw->gpio_chip = &gpio->gp;
+	return 0;
+}
+
+void rtl837x_gpiochip_exit(struct rtk_gsw *gsw)
+{
+	if (!gsw->gpio_chip)
+		return;
+
+	gpiochip_remove(gsw->gpio_chip);
+	gsw->gpio_chip = NULL;
 }

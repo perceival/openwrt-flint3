@@ -1,6 +1,6 @@
 ccflags-y += -DMDC_MDIO_OPERATION
 
-ccflags-y += -I$(src)/rtk-api -I$(src)/rtk-api/dal/rtl8373 -Iinclude/linux/
+ccflags-y += -I$(src)/rtk-api -I$(src)/rtk-api/dal/rtl8373
 
 obj-$(CONFIG_RTL837X_DSA) += rtl837x_dsa.o
 
