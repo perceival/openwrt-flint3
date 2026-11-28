@@ -1,0 +1,114 @@
+From: CoolFreeze23 <34906576+CoolFreeze23@users.noreply.github.com>
+Subject: [PATCH] net: ethernet: qualcomm: ppe: define flow forget outside the DSA block
+
+ppe_offload_flow_replace() calls ppe_offload_flow_forget() on its stale
+re-arm path (0452), but forget() is defined inside the
+NET_DSA && NET_SWITCHDEV block that follows bridge FDB moves. QCOM_PPE
+allows NET_DSA=n, and with it the driver no longer links.
+
+Move forget() above that block. It uses nothing defined inside it.
+
+Signed-off-by: CoolFreeze23 <34906576+CoolFreeze23@users.noreply.github.com>
+---
+--- a/drivers/net/ethernet/qualcomm/ppe/ppe_offload.c
++++ b/drivers/net/ethernet/qualcomm/ppe/ppe_offload.c
+@@ -1795,6 +1795,49 @@
+ 	return 0;
+ }
+ 
++/* Drop a tracked flow: delete its hardware entry, release its table
++ * entries and forget its cookie, so that a later refresh from the
++ * flowtable re-offers it as a new flow. Called under priv->lock.
++ *
++ * The hardware entry must go first. Left valid it would keep forwarding and
++ * translating with no flow behind it, and the host, nexthop and public IP
++ * slots released below can be handed to another flow, so the orphan would
++ * apply the old flow's translation to the new one's slot contents. As in
++ * ppe_offload_flow_destroy(), a superseded entry (flow_valid false)
++ * is skipped: its slot already belongs to the flow that overwrote it.
++ *
++ * Return: 0 once the flow is dropped. If the hardware delete fails the entry
++ * is left tracked, with its references, and the error is returned, so that
++ * nothing it still points at can be reused.
++ */
++static int ppe_offload_flow_forget(struct ppe_offload_priv *priv,
++				   struct ppe_offload_flow_entry *entry)
++{
++	int ret;
++
++	if (entry->flow_valid) {
++		ret = ppe_flow_entry_del(priv->ppe_dev, entry->flow_index);
++		if (ret)
++			return ret;
++		entry->flow_valid = false;
++	}
++
++	rhashtable_remove_fast(&priv->flow_table, &entry->node, ppe_offload_flow_ht_params);
++	if (entry->dsa_fixed) {
++		spin_lock_bh(&priv->dsa_fixed_lock);
++		hash_del(&entry->dsa_fixed_hnode);
++		spin_unlock_bh(&priv->dsa_fixed_lock);
++	}
++	ppe_offload_flow_disown(priv, entry);
++	ppe_host_pool_deref(priv->ppe_dev, &priv->host_pool, entry->host_index);
++	ppe_nexthop_pool_deref(priv->ppe_dev, &priv->nexthop_pool, entry->nexthop_index);
++	if (entry->pub_ip_valid)
++		ppe_pub_ip_pool_deref(priv->ppe_dev, &priv->pub_ip_pool, entry->pub_ip_index);
++	kfree(entry);
++
++	return 0;
++}
++
+ #if IS_ENABLED(CONFIG_NET_DSA) && IS_ENABLED(CONFIG_NET_SWITCHDEV)
+ /* Following bridge FDB moves for flows that name a switch port outright.
+  *
+@@ -1857,49 +1900,6 @@
+ 	u8 addr[ETH_ALEN];
+ };
+ 
+-/* Drop a tracked flow: delete its hardware entry, release its table
+- * entries and forget its cookie, so that a later refresh from the
+- * flowtable re-offers it as a new flow. Called under priv->lock.
+- *
+- * The hardware entry must go first. Left valid it would keep forwarding and
+- * translating with no flow behind it, and the host, nexthop and public IP
+- * slots released below can be handed to another flow, so the orphan would
+- * apply the old flow's translation to the new one's slot contents. As in
+- * ppe_offload_flow_destroy(), a superseded entry (flow_valid false)
+- * is skipped: its slot already belongs to the flow that overwrote it.
+- *
+- * Return: 0 once the flow is dropped. If the hardware delete fails the entry
+- * is left tracked, with its references, and the error is returned, so that
+- * nothing it still points at can be reused.
+- */
+-static int ppe_offload_flow_forget(struct ppe_offload_priv *priv,
+-				   struct ppe_offload_flow_entry *entry)
+-{
+-	int ret;
+-
+-	if (entry->flow_valid) {
+-		ret = ppe_flow_entry_del(priv->ppe_dev, entry->flow_index);
+-		if (ret)
+-			return ret;
+-		entry->flow_valid = false;
+-	}
+-
+-	rhashtable_remove_fast(&priv->flow_table, &entry->node, ppe_offload_flow_ht_params);
+-	if (entry->dsa_fixed) {
+-		spin_lock_bh(&priv->dsa_fixed_lock);
+-		hash_del(&entry->dsa_fixed_hnode);
+-		spin_unlock_bh(&priv->dsa_fixed_lock);
+-	}
+-	ppe_offload_flow_disown(priv, entry);
+-	ppe_host_pool_deref(priv->ppe_dev, &priv->host_pool, entry->host_index);
+-	ppe_nexthop_pool_deref(priv->ppe_dev, &priv->nexthop_pool, entry->nexthop_index);
+-	if (entry->pub_ip_valid)
+-		ppe_pub_ip_pool_deref(priv->ppe_dev, &priv->pub_ip_pool, entry->pub_ip_index);
+-	kfree(entry);
+-
+-	return 0;
+-}
+-
+ /* Re-point one fixed-port flow at @dp. Called under priv->lock.
+  *
+  * The key of the flow entry is unchanged, so it belongs in the slot
