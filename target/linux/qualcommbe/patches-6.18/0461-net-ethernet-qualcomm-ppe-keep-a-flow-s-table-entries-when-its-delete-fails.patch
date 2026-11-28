@@ -1,0 +1,88 @@
+From: CoolFreeze23 <34906576+CoolFreeze23@users.noreply.github.com>
+Subject: [PATCH] net: ethernet: qualcomm: ppe: keep a flow's table entries when its delete fails
+
+ppe_offload_flow_destroy() releases a flow's host, nexthop and public IP
+entries even when the hardware delete of its flow entry fails. So do two
+unwind paths of ppe_offload_flow_replace(): the IPv6 odd-index check, and
+del_flow after a failed kzalloc() or rhashtable insert. The flow entry may
+then still be live, and the pools hand the released indexes to other
+flows, so it would apply its translation to another client's entries,
+the same problem 0457 fixes for forget().
+
+When the delete fails, keep those entries and their references and warn
+instead. They leak until the driver is unloaded, which is the safe
+direction. As in 0457, nothing is released that a live entry may still
+point at.
+
+Signed-off-by: CoolFreeze23 <34906576+CoolFreeze23@users.noreply.github.com>
+---
+--- a/drivers/net/ethernet/qualcomm/ppe/ppe_offload.c
++++ b/drivers/net/ethernet/qualcomm/ppe/ppe_offload.c
+@@ -898,6 +898,19 @@
+ static int ppe_offload_flow_forget(struct ppe_offload_priv *priv,
+ 				   struct ppe_offload_flow_entry *entry);
+ 
++/* The hardware delete of flow entry @flow_index failed, so the entry may
++ * still be live and still point at its host, nexthop and public IP
++ * entries. Those are kept, references and all, rather than released: the
++ * pools would hand them to other flows, and the old entry would then
++ * apply its translation to their contents. They leak until the driver is
++ * unloaded. Called under priv->lock.
++ */
++static void ppe_offload_flow_index_kept(u32 flow_index)
++{
++	pr_warn("ppe_offload: flow entry %u not deleted, its table entries are kept\n",
++		flow_index);
++}
++
+ /* Whether a flow the flowtable re-offers (flow_offload_refresh(), about
+  * once a second for as long as its packets cross the software path) has
+  * stopped matching in hardware. Called under priv->lock.
+@@ -1644,9 +1657,13 @@
+ 	if (ipv6 && (flow_index & 1)) {
+ 		pr_warn_once("ppe_offload: ipv6 flow landed at odd index %u: not in slot units, ipv6 stays in software\n",
+ 			     flow_index);
+-		ppe_flow_entry_del(priv->ppe_dev, flow_index);
+ 		ret = -EOPNOTSUPP;
+ 		stage = "flow";
++		/* See ppe_offload_flow_index_kept(). */
++		if (ppe_flow_entry_del(priv->ppe_dev, flow_index)) {
++			ppe_offload_flow_index_kept(flow_index);
++			goto unlock;
++		}
+ 		goto deref_host;
+ 	}
+ 
+@@ -1715,7 +1732,11 @@
+ free_entry:
+ 	kfree(entry);
+ del_flow:
+-	ppe_flow_entry_del(priv->ppe_dev, flow_index);
++	/* See ppe_offload_flow_index_kept(). */
++	if (ppe_flow_entry_del(priv->ppe_dev, flow_index)) {
++		ppe_offload_flow_index_kept(flow_index);
++		goto unlock;
++	}
+ deref_host:
+ 	ppe_host_pool_deref(priv->ppe_dev, &priv->host_pool, host_index);
+ deref_nexthop:
+@@ -1781,13 +1802,17 @@
+ 	 * overwrote its slot.
+ 	 */
+ 	ppe_offload_flow_disown(priv, entry);
+-	if (entry->flow_valid)
+-		ppe_flow_entry_del(priv->ppe_dev, entry->flow_index);
++	if (entry->flow_valid && ppe_flow_entry_del(priv->ppe_dev, entry->flow_index)) {
++		/* See ppe_offload_flow_index_kept(). */
++		ppe_offload_flow_index_kept(entry->flow_index);
++		goto unlock;
++	}
+ 	ppe_host_pool_deref(priv->ppe_dev, &priv->host_pool, entry->host_index);
+ 	ppe_nexthop_pool_deref(priv->ppe_dev, &priv->nexthop_pool, entry->nexthop_index);
+ 	if (entry->pub_ip_valid)
+ 		ppe_pub_ip_pool_deref(priv->ppe_dev, &priv->pub_ip_pool, entry->pub_ip_index);
+ 
++unlock:
+ 	mutex_unlock(&priv->lock);
+ 
+ 	kfree(entry);
